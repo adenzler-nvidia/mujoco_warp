@@ -292,14 +292,18 @@ class IOTest(absltest.TestCase):
   def test_model_batching(self):
     mjm, mjd, _, _ = test_util.fixture("humanoid/humanoid.xml")
 
-    m = mjwarp.put_model(mjm, nworld=2, expand_fields={"dof_damping"})
+    m = mjwarp.put_model(mjm, nworld=2)
     d = mjwarp.put_data(mjm, mjd, nworld=2)
 
     self.assertEqual(m.nworld, 2)
 
-    # randomize dof_damping
-    dof_damping = m.dof_damping.numpy()
-    dof_damping[1, :] *= 0.5
+    # manually create a batch of damping values
+    damping_orig = mjm.dof_damping
+    dof_damping = np.zeros((2, len(damping_orig)), dtype=np.float32)
+    dof_damping[0, :] = damping_orig
+    dof_damping[1, :] = damping_orig * 0.5
+    
+    # set the batched damping values
     m.dof_damping = wp.from_numpy(dof_damping, dtype=wp.float32)
 
     mjwarp.passive(m, d)
