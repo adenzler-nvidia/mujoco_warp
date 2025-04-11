@@ -30,7 +30,7 @@ from .types import vec10
 from .warp_util import event_scope
 from .warp_util import kernel
 from .warp_util import kernel_copy
-
+from .warp_util import index_with_modulo
 
 @event_scope
 def kinematics(m: Model, d: Data):
@@ -56,8 +56,8 @@ def kinematics(m: Model, d: Data):
     if jntnum == 0:
       # no joints - apply fixed translation and rotation relative to parent
       pid = m.body_parentid[bodyid]
-      xpos = (d.xmat[worldid, pid] * m.body_pos[worldid, bodyid]) + d.xpos[worldid, pid]
-      xquat = math.mul_quat(d.xquat[worldid, pid], m.body_quat[worldid, bodyid])
+      xpos = (d.xmat[worldid, pid] * index_with_modulo(m.body_pos, worldid, bodyid)) + d.xpos[worldid, pid]
+      xquat = math.mul_quat(d.xquat[worldid, pid], index_with_modulo(m.body_quat, worldid, bodyid))
     elif jntnum == 1 and m.jnt_type[jntadr] == wp.static(JointType.FREE.value):
       # free joint
       qadr = m.jnt_qposadr[jntadr]
@@ -69,14 +69,14 @@ def kinematics(m: Model, d: Data):
       # regular or no joints
       # apply fixed translation and rotation relative to parent
       pid = m.body_parentid[bodyid]
-      xpos = (d.xmat[worldid, pid] * m.body_pos[worldid, bodyid]) + d.xpos[worldid, pid]
-      xquat = math.mul_quat(d.xquat[worldid, pid], m.body_quat[worldid, bodyid])
+      xpos = (d.xmat[worldid, pid] * index_with_modulo(m.body_pos, worldid, bodyid)) + d.xpos[worldid, pid]
+      xquat = math.mul_quat(d.xquat[worldid, pid], index_with_modulo(m.body_quat, worldid, bodyid))
 
       for _ in range(jntnum):
         qadr = m.jnt_qposadr[jntadr]
         jnt_type = m.jnt_type[jntadr]
         jnt_axis = m.jnt_axis[jntadr]
-        xanchor = math.rot_vec_quat(m.jnt_pos[jntadr], xquat) + xpos
+        xanchor = math.rot_vec_quat(index_with_modulo(m.jnt_pos, worldid, jntadr), xquat) + xpos
         xaxis = math.rot_vec_quat(jnt_axis, xquat)
 
         if jnt_type == wp.static(JointType.BALL.value):
@@ -90,13 +90,13 @@ def kinematics(m: Model, d: Data):
           # correct for off-center rotation
           xpos = xanchor - math.rot_vec_quat(m.jnt_pos[jntadr], xquat)
         elif jnt_type == wp.static(JointType.SLIDE.value):
-          xpos += xaxis * (qpos[qadr] - m.qpos0[worldid, qadr])
+          xpos += xaxis * (qpos[qadr] - index_with_modulo(m.qpos0, worldid, qadr))
         elif jnt_type == wp.static(JointType.HINGE.value):
-          qpos0 = m.qpos0[worldid, qadr]
+          qpos0 = index_with_modulo(m.qpos0, worldid, qadr)
           qloc = math.axis_angle_to_quat(jnt_axis, qpos[qadr] - qpos0)
           xquat = math.mul_quat(xquat, qloc)
           # correct for off-center rotation
-          xpos = xanchor - math.rot_vec_quat(m.jnt_pos[jntadr], xquat)
+          xpos = xanchor - math.rot_vec_quat(index_with_modulo(m.jnt_pos, worldid, jntadr), xquat)
 
         d.xanchor[worldid, jntadr] = xanchor
         d.xaxis[worldid, jntadr] = xaxis
@@ -107,10 +107,10 @@ def kinematics(m: Model, d: Data):
     d.xquat[worldid, bodyid] = xquat
     d.xmat[worldid, bodyid] = math.quat_to_mat(xquat)
     d.xipos[worldid, bodyid] = xpos + math.rot_vec_quat(
-      m.body_ipos[worldid, bodyid], xquat
+      index_with_modulo(m.body_ipos, worldid, bodyid), xquat
     )
     d.ximat[worldid, bodyid] = math.quat_to_mat(
-      math.mul_quat(xquat, m.body_iquat[worldid, bodyid])
+      math.mul_quat(xquat, index_with_modulo(m.body_iquat, worldid, bodyid))
     )
 
   @kernel
@@ -120,10 +120,10 @@ def kinematics(m: Model, d: Data):
     xpos = d.xpos[worldid, bodyid]
     xquat = d.xquat[worldid, bodyid]
     d.geom_xpos[worldid, geomid] = xpos + math.rot_vec_quat(
-      m.geom_pos[worldid, geomid], xquat
+      index_with_modulo(m.geom_pos, worldid, geomid), xquat
     )
     d.geom_xmat[worldid, geomid] = math.quat_to_mat(
-      math.mul_quat(xquat, m.geom_quat[worldid, geomid])
+      math.mul_quat(xquat, index_with_modulo(m.geom_quat, worldid, geomid))
     )
 
   @kernel
@@ -133,10 +133,10 @@ def kinematics(m: Model, d: Data):
     xpos = d.xpos[worldid, bodyid]
     xquat = d.xquat[worldid, bodyid]
     d.site_xpos[worldid, siteid] = xpos + math.rot_vec_quat(
-      m.site_pos[worldid, siteid], xquat
+      index_with_modulo(m.site_pos, worldid, siteid), xquat
     )
     d.site_xmat[worldid, siteid] = math.quat_to_mat(
-      math.mul_quat(xquat, m.site_quat[worldid, siteid])
+      math.mul_quat(xquat, index_with_modulo(m.site_quat, worldid, siteid))
     )
 
   wp.launch(_root, dim=(m.nworld), inputs=[m, d])
@@ -162,7 +162,7 @@ def com_pos(m: Model, d: Data):
   def subtree_com_init(m: Model, d: Data):
     worldid, bodyid = wp.tid()
     d.subtree_com[worldid, bodyid] = (
-      d.xipos[worldid, bodyid] * m.body_mass[worldid, bodyid]
+      d.xipos[worldid, bodyid] * index_with_modulo(m.body_mass, worldid, bodyid)
     )
 
   @kernel
@@ -175,14 +175,14 @@ def com_pos(m: Model, d: Data):
   @kernel
   def subtree_div(m: Model, d: Data):
     worldid, bodyid = wp.tid()
-    d.subtree_com[worldid, bodyid] /= m.subtree_mass[worldid, bodyid]
+    d.subtree_com[worldid, bodyid] /= index_with_modulo(m.subtree_mass, worldid, bodyid)
 
   @kernel
   def cinert(m: Model, d: Data):
     worldid, bodyid = wp.tid()
     mat = d.ximat[worldid, bodyid]
-    inert = m.body_inertia[worldid, bodyid]
-    mass = m.body_mass[worldid, bodyid]
+    inert = index_with_modulo(m.body_inertia, worldid, bodyid)
+    mass = index_with_modulo(m.body_mass, worldid, bodyid)
     dif = d.xipos[worldid, bodyid] - d.subtree_com[worldid, m.body_rootid[bodyid]]
     # express inertia in com-based frame (mju_inertCom)
 
@@ -268,10 +268,10 @@ def camlight(m: Model, d: Data):
     xpos = d.xpos[worldid, bodyid]
     xquat = d.xquat[worldid, bodyid]
     d.cam_xpos[worldid, camid] = xpos + math.rot_vec_quat(
-      m.cam_pos[worldid, camid], xquat
+      index_with_modulo(m.cam_pos, worldid, camid), xquat
     )
     d.cam_xmat[worldid, camid] = math.quat_to_mat(
-      math.mul_quat(xquat, m.cam_quat[worldid, camid])
+      math.mul_quat(xquat, index_with_modulo(m.cam_quat, worldid, camid))
     )
 
   @kernel
@@ -285,10 +285,10 @@ def camlight(m: Model, d: Data):
       return
     elif m.cam_mode[camid] == wp.static(CamLightType.TRACK.value):
       body_xpos = d.xpos[worldid, m.cam_bodyid[camid]]
-      d.cam_xpos[worldid, camid] = body_xpos + m.cam_pos0[worldid, camid]
+      d.cam_xpos[worldid, camid] = body_xpos + index_with_modulo(m.cam_pos0, worldid, camid)
     elif m.cam_mode[camid] == wp.static(CamLightType.TRACKCOM.value):
       d.cam_xpos[worldid, camid] = (
-        d.subtree_com[worldid, m.cam_bodyid[camid]] + m.cam_poscom0[worldid, camid]
+        d.subtree_com[worldid, m.cam_bodyid[camid]] + index_with_modulo(m.cam_poscom0, worldid, camid)
       )
     elif m.cam_mode[camid] == wp.static(CamLightType.TARGETBODY.value) or m.cam_mode[
       camid
@@ -317,10 +317,10 @@ def camlight(m: Model, d: Data):
     xpos = d.xpos[worldid, bodyid]
     xquat = d.xquat[worldid, bodyid]
     d.light_xpos[worldid, lightid] = xpos + math.rot_vec_quat(
-      m.light_pos[worldid, lightid], xquat
+      index_with_modulo(m.light_pos, worldid, lightid), xquat
     )
     d.light_xdir[worldid, lightid] = math.rot_vec_quat(
-      m.light_dir[worldid, lightid], xquat
+      index_with_modulo(m.light_dir, worldid, lightid), xquat
     )
 
   @kernel
@@ -334,11 +334,11 @@ def camlight(m: Model, d: Data):
       return
     elif m.light_mode[lightid] == wp.static(CamLightType.TRACK.value):
       body_xpos = d.xpos[worldid, m.light_bodyid[lightid]]
-      d.light_xpos[worldid, lightid] = body_xpos + m.light_pos0[worldid, lightid]
+      d.light_xpos[worldid, lightid] = body_xpos + index_with_modulo(m.light_pos0, worldid, lightid)
     elif m.light_mode[lightid] == wp.static(CamLightType.TRACKCOM.value):
       d.light_xpos[worldid, lightid] = (
         d.subtree_com[worldid, m.light_bodyid[lightid]]
-        + m.light_poscom0[worldid, lightid]
+        + index_with_modulo(m.light_poscom0, worldid, lightid)
       )
     elif m.light_mode[lightid] == wp.static(
       CamLightType.TARGETBODY.value
@@ -379,7 +379,7 @@ def crb(m: Model, d: Data):
     bodyid = m.dof_bodyid[dofid]
 
     # init M(i,i) with armature inertia
-    d.qM[worldid, 0, madr_ij] = m.dof_armature[worldid, dofid]
+    d.qM[worldid, 0, madr_ij] = index_with_modulo(m.dof_armature, worldid, dofid)
 
     # precompute buf = crb_body_i * cdof_i
     buf = math.inert_vec(d.crb[worldid, bodyid], d.cdof[worldid, dofid])
@@ -396,7 +396,7 @@ def crb(m: Model, d: Data):
     bodyid = m.dof_bodyid[dofid]
 
     # init M(i,i) with armature inertia
-    M = m.dof_armature[worldid, dofid]
+    M = index_with_modulo(m.dof_armature, worldid, dofid)
 
     # precompute buf = crb_body_i * cdof_i
     buf = math.inert_vec(d.crb[worldid, bodyid], d.cdof[worldid, dofid])
@@ -649,7 +649,7 @@ def transmission(m: Model, d: Data):
     qadr = m.jnt_qposadr[jntid]
     vadr = m.jnt_dofadr[jntid]
     trntype = m.actuator_trntype[actid]
-    gear = m.actuator_gear[worldid, actid]
+    gear = index_with_modulo(m.actuator_gear, worldid, actid)
     if trntype == wp.static(TrnType.JOINT.value) or trntype == wp.static(
       TrnType.JOINTINPARENT.value
     ):
@@ -916,7 +916,7 @@ def tendon(m: Model, d: Data):
       wrap_jnt_adr = m.wrap_jnt_adr[wrapid]
 
       wrap_objid = m.wrap_objid[wrap_jnt_adr]
-      prm = m.wrap_prm[worldid, wrap_jnt_adr]
+      prm = index_with_modulo(m.wrap_prm, worldid, wrap_jnt_adr)
 
       # add to length
       L = prm * d.qpos[worldid, m.jnt_qposadr[wrap_objid]]

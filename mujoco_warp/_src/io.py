@@ -30,7 +30,7 @@ def tile(x, nworld):
 
 
 def put_model(
-  mjm: mujoco.MjModel, nworld: int = 1
+  mjm: mujoco.MjModel, nworld: int = 1, expand_fields: set[str] = set()
 ) -> types.Model:
   # check supported features
   for field, field_types, field_str in (

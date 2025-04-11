@@ -21,11 +21,13 @@ from .types import Model
 from .types import SensorType
 from .warp_util import event_scope
 from .warp_util import kernel
+from .warp_util import index_with_modulo
 
 
 @wp.func
 def _joint_pos(m: Model, d: Data, worldid: int, objid: int) -> wp.float32:
-  return d.qpos[worldid, m.jnt_qposadr[objid]]
+  qpos_adr = m.jnt_qposadr[objid]
+  return index_with_modulo(d.qpos, worldid, qpos_adr)
 
 
 @event_scope
@@ -51,7 +53,8 @@ def sensor_pos(m: Model, d: Data):
 
 @wp.func
 def _joint_vel(m: Model, d: Data, worldid: int, objid: int) -> wp.float32:
-  return d.qvel[worldid, m.jnt_dofadr[objid]]
+  dof_adr = m.jnt_dofadr[objid]
+  return index_with_modulo(d.qvel, worldid, dof_adr)
 
 
 @event_scope
@@ -77,7 +80,7 @@ def sensor_vel(m: Model, d: Data):
 
 @wp.func
 def _actuator_force(m: Model, d: Data, worldid: int, objid: int) -> wp.float32:
-  return d.actuator_force[worldid, objid]
+  return index_with_modulo(d.actuator_force, worldid, objid)
 
 
 @event_scope

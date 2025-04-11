@@ -16,7 +16,7 @@
 import warp as wp
 
 from . import types
-from .warp_util import event_scope
+from .warp_util import event_scope, index_with_modulo
 
 
 @wp.func
@@ -109,9 +109,9 @@ def _efc_limit_slide_hinge(
   jntid = m.jnt_limited_slide_hinge_adr[jntlimitedid]
 
   qpos = d.qpos[worldid, m.jnt_qposadr[jntid]]
-  jnt_range = m.jnt_range[worldid, jntid]
+  jnt_range = index_with_modulo(m.jnt_range, worldid, jntid)
   dist_min, dist_max = qpos - jnt_range[0], jnt_range[1] - qpos
-  pos = wp.min(dist_min, dist_max) - m.jnt_margin[worldid, jntid]
+  pos = wp.min(dist_min, dist_max) - index_with_modulo(m.jnt_margin, worldid, jntid)
   active = pos < 0
 
   if active:
@@ -130,10 +130,10 @@ def _efc_limit_slide_hinge(
       efcid,
       pos,
       pos,
-      m.dof_invweight0[worldid, dofadr],
-      m.jnt_solref[worldid, jntid],
-      m.jnt_solimp[worldid, jntid],
-      m.jnt_margin[worldid, jntid],
+      index_with_modulo(m.dof_invweight0, worldid, dofadr),
+      index_with_modulo(m.jnt_solref, worldid, jntid),
+      index_with_modulo(m.jnt_solimp, worldid, jntid),
+      index_with_modulo(m.jnt_margin, worldid, jntid),
       refsafe,
       Jqvel,
     )
@@ -180,7 +180,8 @@ def _efc_contact_pyramidal(
 
     # pyramidal has common invweight across all edges
     invweight = (
-      m.body_invweight0[worldid, body1, 0] + m.body_invweight0[worldid, body2, 0]
+      index_with_modulo(m.body_invweight0, worldid, body1)
+      + index_with_modulo(m.body_invweight0, worldid, body2)
     )
 
     if condim > 1:
@@ -288,7 +289,8 @@ def _efc_contact_elliptic(
       Jqvel += J * d.qvel[worldid, i]
 
     invweight = (
-      m.body_invweight0[worldid, body1, 0] + m.body_invweight0[worldid, body2, 0]
+      index_with_modulo(m.body_invweight0, worldid, body1)
+      + index_with_modulo(m.body_invweight0, worldid, body2)
     )
 
     ref = d.contact.solref[conid]
