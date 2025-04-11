@@ -344,7 +344,7 @@ def put_model(
   m.jnt_axis = wp.array(
     mjm.jnt_axis, dtype=wp.vec3
   )  # should that be varying per-world?
-  m.jnt_pos = wp.array(mjm.jnt_pos, dtype=wp.vec3)  # should that be varying per-world?
+  m.jnt_pos = create_nworld_array(mjm.jnt_pos, wp.vec3)  # should that be varying per-world?
   m.jnt_range = create_nworld_array(mjm.jnt_range, wp.float32)
   m.jnt_margin = create_nworld_array(mjm.jnt_margin, wp.float32)
   m.jnt_stiffness = create_nworld_array(mjm.jnt_stiffness, wp.float32)

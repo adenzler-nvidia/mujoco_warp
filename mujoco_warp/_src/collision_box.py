@@ -24,7 +24,6 @@ from .math import make_frame
 from .types import Data
 from .types import GeomType
 from .types import Model
-from .warp_util import index_with_modulo
 
 BOX_BOX_BLOCK_DIM = 32
 
@@ -307,8 +306,8 @@ def box_box_kernel(
       for i in range(4):
         pos[i] = pos[idx]
 
-    margin_a = index_with_modulo(m.geom_margin, worldid, ga)
-    margin_b = index_with_modulo(m.geom_margin, worldid, gb)
+    margin_a = m.geom_margin[worldid % m.geom_margin.shape[0], ga]
+    margin_b = m.geom_margin[worldid % m.geom_margin.shape[0], gb]
     margin = wp.max(margin_a, margin_b)
     for i in range(4):
       pos_glob = b_mat @ pos[i] + b_pos

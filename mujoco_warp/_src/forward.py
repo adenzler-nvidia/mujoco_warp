@@ -39,7 +39,6 @@ from .types import array3df
 from .warp_util import event_scope
 from .warp_util import kernel
 from .warp_util import kernel_copy
-from .warp_util import index_with_modulo
 
 def _advance(
   m: Model, d: Data, act_dot: wp.array, qacc: wp.array, qvel: Optional[wp.array] = None
@@ -58,8 +57,8 @@ def _advance(
 
     # get the high/low range for each actuator state
     limited = m.actuator_actlimited[actid]
-    range_low = wp.where(limited, index_with_modulo(m.actuator_actrange, worldid, actid)[0], -wp.inf)
-    range_high = wp.where(limited, index_with_modulo(m.actuator_actrange, worldid, actid)[1], wp.inf)
+    range_low = wp.where(limited, m.actuator_actrange[worldid % m.actuator_actrange.shape[0], actid][0], -wp.inf)
+    range_high = wp.where(limited, m.actuator_actrange[worldid % m.actuator_actrange.shape[0], actid][1], wp.inf)
 
     # get the actual actuation - skip if -1 (means stateless actuator)
     act_adr = m.actuator_actadr[actid]
@@ -74,7 +73,7 @@ def _advance(
 
     # check dynType
     dyn_type = m.actuator_dyntype[actid]
-    dyn_prm = index_with_modulo(m.actuator_dynprm, worldid, actid)[0]
+    dyn_prm = m.actuator_dynprm[worldid % m.actuator_dynprm.shape[0], actid][0]
 
     # advance the actuation
     if dyn_type == wp.static(DynType.FILTEREXACT.value):
@@ -176,7 +175,7 @@ def euler(m: Model, d: Data):
 
       dof_Madr = m.dof_Madr[tid]
       d.qM_integration[worldid, 0, dof_Madr] += (
-        m.opt.timestep * index_with_modulo(m.dof_damping, worldid, tid)
+        m.opt.timestep * m.dof_damping[worldid % m.dof_damping.shape[0], tid]
       )
 
       d.qfrc_integration[worldid, tid] = (
@@ -289,10 +288,10 @@ def implicit(m: Model, d: Data):
     actuator_dyntype = m.actuator_dyntype[actid]
 
     if actuator_biastype == wp.static(BiasType.AFFINE.value):
-      bias_vel = index_with_modulo(m.actuator_biasprm, worldid, actid, 2)
+      bias_vel = m.actuator_biasprm[worldid % m.actuator_biasprm.shape[0], actid][2]
 
     if actuator_gaintype == wp.static(GainType.AFFINE.value):
-      gain_vel = index_with_modulo(m.actuator_gainprm, worldid, actid, 2)
+      gain_vel = m.actuator_gainprm[worldid % m.actuator_gainprm.shape[0], actid][2]
     
     ctrl = d.ctrl[worldid, actid]
 
@@ -526,22 +525,22 @@ def fwd_actuation(m: Model, d: Data):
     actuator_length = d.actuator_length[worldid, uid]
     actuator_velocity = d.actuator_velocity[worldid, uid]
 
-    gain = index_with_modulo(m.actuator_gainprm, worldid, uid, 0)
-    gain += index_with_modulo(m.actuator_gainprm, worldid, uid, 1) * actuator_length
-    gain += index_with_modulo(m.actuator_gainprm, worldid, uid, 2) * actuator_velocity
+    gain = m.actuator_gainprm[worldid % m.actuator_gainprm.shape[0], uid][0]
+    gain += m.actuator_gainprm[worldid % m.actuator_gainprm.shape[0], uid][1] * actuator_length
+    gain += m.actuator_gainprm[worldid % m.actuator_gainprm.shape[0], uid][2] * actuator_velocity
 
-    bias = index_with_modulo(m.actuator_biasprm, worldid, uid, 0)
-    bias += index_with_modulo(m.actuator_biasprm, worldid, uid, 1) * actuator_length
-    bias += index_with_modulo(m.actuator_biasprm, worldid, uid, 2) * actuator_velocity
+    bias = m.actuator_biasprm[worldid % m.actuator_biasprm.shape[0], uid][0]
+    bias += m.actuator_biasprm[worldid % m.actuator_biasprm.shape[0], uid][1] * actuator_length
+    bias += m.actuator_biasprm[worldid % m.actuator_biasprm.shape[0], uid][2] * actuator_velocity
 
     ctrl = d.ctrl[worldid, uid]
     disable_clampctrl = m.opt.disableflags & wp.static(DisableBit.CLAMPCTRL.value)
     if m.actuator_ctrllimited[uid] and not disable_clampctrl:
-      r = index_with_modulo(m.actuator_ctrlrange, worldid, uid)
+      r = m.actuator_ctrlrange[worldid % m.actuator_ctrlrange.shape[0], uid]
       ctrl = wp.clamp(ctrl, r[0], r[1])
     f = gain * ctrl + bias
     if m.actuator_forcelimited[uid]:
-      r = index_with_modulo(m.actuator_forcerange, worldid, uid)
+      r = m.actuator_forcerange[worldid % m.actuator_forcerange.shape[0], uid]
       f = wp.clamp(f, r[0], r[1])
     force[worldid, uid] = f
 
@@ -552,8 +551,8 @@ def fwd_actuation(m: Model, d: Data):
     if m.jnt_actfrclimited[jntid]:
       d.qfrc_actuator[worldid, dofid] = wp.clamp(
         d.qfrc_actuator[worldid, dofid],
-        index_with_modulo(m.jnt_actfrcrange, worldid, jntid)[0],
-        index_with_modulo(m.jnt_actfrcrange, worldid, jntid)[1],
+        m.jnt_actfrcrange[worldid % m.jnt_actfrcrange.shape[0], jntid][0],
+        m.jnt_actfrcrange[worldid % m.jnt_actfrcrange.shape[0], jntid][1],
       )
 
   if m.opt.is_sparse:
@@ -568,7 +567,7 @@ def fwd_actuation(m: Model, d: Data):
         s += moment[worldid, uid, vid] * force[worldid, uid]
       jntid = m.dof_jntid[vid]
       if m.jnt_actfrclimited[jntid]:
-        r = index_with_modulo(m.jnt_actfrcrange, worldid, jntid)
+        r = m.jnt_actfrcrange[worldid % m.jnt_actfrcrange.shape[0], jntid]
         s = wp.clamp(s, r[0], r[1])
       qfrc[worldid, vid] = s
 

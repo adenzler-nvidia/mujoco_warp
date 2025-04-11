@@ -246,32 +246,3 @@ def kernel_copy(dest: wp.array, src: wp.array):
 
   wp.launch(kernel=kernel, dim=src.shape, inputs=[dest, src])
 
-@wp.func
-def index_with_modulo(arr: Any, world_id: wp.int32, idx: wp.int32):
-    """Access an array with modular indexing on the first dimension.
-    
-    Args:
-        arr: The array to access (any dtype)
-        world_id: The world ID (will be moduloed by shape[0])
-        idx: The index for other dimensions
-        
-    Returns:
-        The value at the modular index
-    """
-    mod_world_id = world_id % arr.shape[0]
-    return arr[mod_world_id, idx]
-
-@wp.func
-def index_with_modulo(arr: Any, world_id: wp.int32, idx: wp.int32, idx2: wp.int32):
-    """Access an array with modular indexing on the first dimension.
-    
-    Args:
-        arr: The array to access (any dtype)
-        world_id: The world ID (will be moduloed by shape[0])
-        idx: The index for other dimensions
-        
-    Returns:
-        The value at the modular index
-    """
-    mod_world_id = world_id % arr.shape[0]
-    return arr[mod_world_id, idx, idx2]
