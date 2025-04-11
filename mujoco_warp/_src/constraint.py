@@ -109,9 +109,10 @@ def _efc_limit_slide_hinge(
   jntid = m.jnt_limited_slide_hinge_adr[jntlimitedid]
 
   qpos = d.qpos[worldid, m.jnt_qposadr[jntid]]
-  jnt_range = index_with_modulo(m.jnt_range, worldid, jntid)
-  dist_min, dist_max = qpos - jnt_range[0], jnt_range[1] - qpos
-  pos = wp.min(dist_min, dist_max) - index_with_modulo(m.jnt_margin, worldid, jntid)
+  jnt_range0 = index_with_modulo(m.jnt_range, worldid, jntid, 0)
+  jnt_range1 = index_with_modulo(m.jnt_range, worldid, jntid, 1)
+  dist_min, dist_max = qpos - jnt_range0, jnt_range1 - qpos
+  pos = wp.min(dist_min, dist_max) - m.jnt_margin[worldid % m.jnt_margin.shape[0], jntid]
   active = pos < 0
 
   if active:
@@ -130,10 +131,10 @@ def _efc_limit_slide_hinge(
       efcid,
       pos,
       pos,
-      index_with_modulo(m.dof_invweight0, worldid, dofadr),
+      m.dof_invweight0[worldid % m.dof_invweight0.shape[0], dofadr],
       index_with_modulo(m.jnt_solref, worldid, jntid),
       index_with_modulo(m.jnt_solimp, worldid, jntid),
-      index_with_modulo(m.jnt_margin, worldid, jntid),
+      m.jnt_margin[worldid % m.jnt_margin.shape[0], jntid],
       refsafe,
       Jqvel,
     )
@@ -179,9 +180,10 @@ def _efc_contact_pyramidal(
     frame = d.contact.frame[conid]
 
     # pyramidal has common invweight across all edges
+    iv0 = index_with_modulo(m.body_invweight0, worldid, body1, 0)
+    iv1 = index_with_modulo(m.body_invweight0, worldid, body2, 0)
     invweight = (
-      index_with_modulo(m.body_invweight0, worldid, body1)
-      + index_with_modulo(m.body_invweight0, worldid, body2)
+      iv0 + iv1
     )
 
     if condim > 1:
@@ -288,9 +290,10 @@ def _efc_contact_elliptic(
       d.efc.J[efcid, i] = J
       Jqvel += J * d.qvel[worldid, i]
 
+    iv0 = index_with_modulo(m.body_invweight0, worldid, body1, 0)
+    iv1 = index_with_modulo(m.body_invweight0, worldid, body2, 0)
     invweight = (
-      index_with_modulo(m.body_invweight0, worldid, body1)
-      + index_with_modulo(m.body_invweight0, worldid, body2)
+      iv0 + iv1
     )
 
     ref = d.contact.solref[conid]
