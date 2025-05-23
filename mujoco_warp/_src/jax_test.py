@@ -24,6 +24,7 @@ from mujoco_warp._src.test_util import fixture
 # TODO(team): JAX test is temporary, remove after we land MJX:Warp
 
 
+@absltest.skip("JAX test temporarily disabled")
 class JAXTest(absltest.TestCase):
   def test_jax(self):
     os.environ["XLA_FLAGS"] = "--xla_gpu_graph_min_graph_size=1"

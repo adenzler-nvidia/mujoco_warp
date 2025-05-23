@@ -1279,6 +1279,7 @@ class Data:
   nf: wp.array(dtype=int)
   nl: wp.array(dtype=int)
   nefc: wp.array(dtype=int)
+  nefc_nv: wp.array(dtype=int)  # warp only
   time: wp.array(dtype=float)
   energy: wp.array(dtype=wp.vec2)
   qpos: wp.array2d(dtype=float)

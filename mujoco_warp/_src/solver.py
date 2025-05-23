@@ -1054,9 +1054,6 @@ def linesearch_zero_jv(
 ):
   efcid = wp.tid()
 
-  if efcid >= nefc_in[0]:
-    return
-
   if efc_done_in[efc_worldid_in[efcid]]:
     return
 
@@ -1075,9 +1072,6 @@ def linesearch_init_jv(
   efc_jv_out: wp.array(dtype=float),
 ):
   efcid, dofid = wp.tid()
-
-  if efcid >= nefc_in[0]:
-    return
 
   worldid = efc_worldid_in[efcid]
 
@@ -1266,18 +1260,35 @@ def _linesearch(m: types.Model, d: types.Data):
   # mv = qM @ search
   support.mul_m(m, d, d.efc.mv, d.efc.search, d.efc.done)
 
+  @wp.kernel
+  def update_nefc_nv(
+    nefc_in: wp.array(dtype=int),
+    nefc_nv_out: wp.array(dtype=int),
+  ):
+    nefc_nv_out[0] = nefc_in[0]
+
+  wp.launch(
+    update_nefc_nv,
+    dim=1,
+    inputs=[d.nefc],
+    outputs=[d.nefc_nv],
+  )
+
+  print(d.nefc_nv)
+  print(d.nefc)
+
   # jv = efc_J @ search
   # TODO(team): is there a better way of doing batched matmuls with dynamic array sizes?
-  wp.launch(
+  wp.launch_indirect(
     linesearch_zero_jv,
-    dim=(d.njmax),
+    dim=d.nefc,
     inputs=[d.nefc, d.efc.worldid, d.efc.done],
     outputs=[d.efc.jv],
   )
 
-  wp.launch(
+  wp.launch_indirect(
     linesearch_init_jv,
-    dim=(d.njmax, m.nv),
+    dim=d.nefc_nv,
     inputs=[d.nefc, d.efc.worldid, d.efc.J, d.efc.search, d.efc.done],
     outputs=[d.efc.jv],
   )

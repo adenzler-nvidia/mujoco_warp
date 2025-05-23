@@ -165,13 +165,14 @@ def benchmark(
 
   with warp_util.EventTracer(enabled=event_trace) as tracer:
     # capture the whole function as a CUDA graph
-    with wp.ScopedCapture() as capture:
-      fn(m, d)
-    graph = capture.graph
+    #with wp.ScopedCapture() as capture:
+    #  fn(m, d)
+    #graph = capture.graph
 
     run_beg = time.perf_counter()
     for _ in range(nstep):
-      wp.capture_launch(graph)
+      #wp.capture_launch(graph)
+      fn(m, d)
       if trace:
         trace = _sum(trace, tracer.trace())
       else:
