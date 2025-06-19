@@ -479,10 +479,13 @@ def collision(m: Model, d: Data):
   if (dsbl_flgs & DisableBit.CONSTRAINT) | (dsbl_flgs & DisableBit.CONTACT):
     return
 
+
   if m.opt.broadphase == int(BroadphaseType.NXN):
     nxn_broadphase(m, d)
   else:
     sap_broadphase(m, d)
+
+  dim_handle = wp.launch_indirect_prepare(d.ncollision)
 
   # Process heightfield collisions
   if m.nhfield > 0:
@@ -491,5 +494,5 @@ def collision(m: Model, d: Data):
   # TODO(team): we should reject far-away contacts in the narrowphase instead of constraint
   #             partitioning because we can move some pressure of the atomics
   # TODO(team) switch between collision functions and GJK/EPA here
-  gjk_narrowphase(m, d)
-  primitive_narrowphase(m, d)
+  gjk_narrowphase(m, d, dim_handle)
+  primitive_narrowphase(m, d, dim_handle)

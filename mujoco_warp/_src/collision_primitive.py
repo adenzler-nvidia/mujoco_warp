@@ -2454,9 +2454,6 @@ def _primitive_narrowphase(
 ):
   tid = wp.tid()
 
-  if tid >= ncollision_in[0]:
-    return
-
   worldid = collision_worldid_in[tid]
 
   geoms, margin, gap, condim, friction, solref, solreffriction, solimp = contact_params(
@@ -2856,12 +2853,12 @@ def _primitive_narrowphase(
     )
 
 
-def primitive_narrowphase(m: Model, d: Data):
+def primitive_narrowphase(m: Model, d: Data, dim_handle):
   # we need to figure out how to keep the overhead of this small - not launching anything
   # for pair types without collisions, as well as updating the launch dimensions.
-  wp.launch(
+  wp.launch_indirect(
     _primitive_narrowphase,
-    dim=d.nconmax,
+    dim=dim_handle,
     inputs=[
       m.geom_type,
       m.geom_condim,

@@ -826,8 +826,6 @@ def _gjk_epa_pipeline(
     contact_worldid_out: wp.array(dtype=int),
   ):
     tid = wp.tid()
-    if tid >= ncollision_in[0]:
-      return
 
     worldid = collision_worldid_in[tid]
     geoms, margin, gap, condim, friction, solref, solreffriction, solimp = contact_params(
@@ -963,7 +961,7 @@ def _gjk_epa_pipeline(
 _collision_kernels = {}
 
 
-def gjk_narrowphase(m: Model, d: Data):
+def gjk_narrowphase(m: Model, d: Data, dim_handle):
   if len(_collision_kernels) == 0:
     for types in _CONVEX_COLLISION_FUNC:
       t1 = types[0]
@@ -978,9 +976,9 @@ def gjk_narrowphase(m: Model, d: Data):
       )
 
   for collision_kernel in _collision_kernels.values():
-    wp.launch(
+    wp.launch_indirect(
       collision_kernel,
-      dim=d.nconmax,
+      dim=dim_handle,
       inputs=[
         m.ngeom,
         m.geom_type,

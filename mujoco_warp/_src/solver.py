@@ -1802,7 +1802,7 @@ def update_constraint_gauss_cost(
   wp.atomic_add(efc_cost_out, worldid, gauss_cost)
 
 
-def _update_constraint(m: types.Model, d: types.Data):
+def _update_constraint(m: types.Model, d: types.Data, dim_handle_nefc = None):
   """Update constraint arrays after each solve iteration."""
 
   disable_floss = m.opt.disableflags & types.DisableBit.FRICTIONLOSS
@@ -1815,9 +1815,9 @@ def _update_constraint(m: types.Model, d: types.Data):
   )
 
   if m.opt.cone == types.ConeType.PYRAMIDAL:
-    wp.launch(
+    wp.launch_indirect(
       update_constraint_efc_pyramidal,
-      dim=(d.njmax,),
+      dim=dim_handle_nefc,
       inputs=[
         d.ne,
         d.nf,
@@ -1865,9 +1865,9 @@ def _update_constraint(m: types.Model, d: types.Data):
       ],
       outputs=[d.efc.active],
     )
-    wp.launch(
+    wp.launch_indirect(
       update_constraint_efc_elliptic0,
-      dim=(d.njmax),
+      dim=dim_handle_nefc,
       inputs=[
         d.ne,
         d.nf,
@@ -1911,9 +1911,9 @@ def _update_constraint(m: types.Model, d: types.Data):
     outputs=[d.qfrc_constraint],
   )
 
-  wp.launch(
+  wp.launch_indirect(
     update_constraint_init_qfrc_constraint,
-    dim=(d.njmax),
+    dim=dim_handle_nefc,
     inputs=[m.nv, d.nefc, d.efc.worldid, d.efc.J, d.efc.force, d.efc.done],
     outputs=[d.qfrc_constraint],
   )
@@ -2257,7 +2257,7 @@ def update_gradient_cholesky_blocked(tile_size: int):
   return kernel
 
 
-def _update_gradient(m: types.Model, d: types.Data):
+def _update_gradient(m: types.Model, d: types.Data, dim_handle_nefc = None):
   # grad = Ma - qfrc_smooth - qfrc_constraint
   wp.launch(update_gradient_zero_grad_dot, dim=(d.nworld), inputs=[d.efc.done], outputs=[d.efc.grad_dot])
 
@@ -2549,6 +2549,7 @@ def solve_done(
 def _solver_iteration(
   m: types.Model,
   d: types.Data,
+  dim_handle_nefc = None,
 ):
   _linesearch(m, d)
 
@@ -2560,8 +2561,8 @@ def _solver_iteration(
       outputs=[d.efc.prev_grad, d.efc.prev_Mgrad],
     )
 
-  _update_constraint(m, d)
-  _update_gradient(m, d)
+  _update_constraint(m, d, dim_handle_nefc)
+  _update_gradient(m, d, dim_handle_nefc)
 
   # polak-ribiere
   if m.opt.solver == types.SolverType.CG:
@@ -2612,7 +2613,7 @@ def _solver_iteration(
   )
 
 
-def create_context(m: types.Model, d: types.Data, grad: bool = True):
+def create_context(m: types.Model, d: types.Data, grad: bool = True, dim_handle_nefc = None):
   # initialize some efc arrays
   wp.launch(
     solve_init_efc,
@@ -2621,9 +2622,9 @@ def create_context(m: types.Model, d: types.Data, grad: bool = True):
   )
 
   # jaref = d.efc_J @ d.qacc - d.efc_aref
-  wp.launch(
+  wp.launch_indirect(
     solve_init_jaref,
-    dim=(d.njmax),
+    dim=dim_handle_nefc,
     inputs=[m.nv, d.nefc, d.qacc, d.efc.worldid, d.efc.J, d.efc.aref],
     outputs=[d.efc.Jaref],
   )
@@ -2631,10 +2632,10 @@ def create_context(m: types.Model, d: types.Data, grad: bool = True):
   # Ma = qM @ qacc
   support.mul_m(m, d, d.efc.Ma, d.qacc, d.efc.done)
 
-  _update_constraint(m, d)
+  _update_constraint(m, d, dim_handle_nefc)
 
   if grad:
-    _update_gradient(m, d)
+    _update_gradient(m, d, dim_handle_nefc)
 
 
 def _copy_acc(m: types.Model, d: types.Data):
@@ -2659,8 +2660,10 @@ def _solve(m: types.Model, d: types.Data):
   # warmstart
   wp.copy(d.qacc, d.qacc_warmstart)
 
+  dim_handle_nefc = wp.launch_indirect_prepare(d.nefc)
+
   # create context
-  create_context(m, d, grad=True)
+  create_context(m, d, grad=True, dim_handle_nefc=dim_handle_nefc)
 
   # search = -Mgrad
   wp.launch(
@@ -2684,12 +2687,13 @@ def _solve(m: types.Model, d: types.Data):
       while_body=_solver_iteration,
       m=m,
       d=d,
+      dim_handle_nefc=dim_handle_nefc,
     )
   else:
     # This branch is mostly for when JAX is used as it is currently not compatible
     # with CUDA graph conditional.
     # It should be removed when JAX becomes compatible.
     for i in range(m.opt.iterations):
-      _solver_iteration(m, d)
+      _solver_iteration(m, d, dim_handle_nefc)
 
   wp.copy(d.qacc_warmstart, d.qacc)
