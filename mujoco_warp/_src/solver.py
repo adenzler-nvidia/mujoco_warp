@@ -761,7 +761,7 @@ def linesearch_iterative_swap(
   efc_alpha_out[worldid] = alpha
 
 
-def _linesearch_iterative(m: types.Model, d: types.Data):
+def _linesearch_iterative(m: types.Model, d: types.Data, dim_handle_nefc = None):
   """Iterative linesearch."""
   d.efc.ls_done.zero_()
 
@@ -784,9 +784,9 @@ def _linesearch_iterative(m: types.Model, d: types.Data):
     outputs=[d.efc.p0])  # fmt: skip
 
   if m.opt.cone == types.ConeType.ELLIPTIC:
-    wp.launch(
+    wp.launch_indirect(
       linesearch_iterative_init_p0_elliptic0,
-      dim=(d.njmax,),
+      dim=dim_handle_nefc,
       inputs=[
         d.ne, d.nf, d.nl, d.nefc, d.efc.worldid, d.efc.Jaref, d.efc.quad, d.efc.done,
         d.efc.condim
@@ -802,9 +802,9 @@ def _linesearch_iterative(m: types.Model, d: types.Data):
       ],
       outputs=[d.efc.p0])  # fmt: skip
   else:
-    wp.launch(
+    wp.launch_indirect(
       linesearch_iterative_init_p0_pyramidal,
-      dim=(d.njmax,),
+      dim=dim_handle_nefc,
       inputs=[
         d.ne, d.nf, d.nefc, d.efc.worldid, d.efc.Jaref, d.efc.quad, d.efc.done
       ], outputs=[d.efc.p0])  # fmt: skip
@@ -818,9 +818,9 @@ def _linesearch_iterative(m: types.Model, d: types.Data):
     outputs=[d.efc.lo, d.efc.lo_alpha])  # fmt: skip
 
   if m.opt.cone == types.ConeType.ELLIPTIC:
-    wp.launch(
+    wp.launch_indirect(
       linesearch_iterative_init_lo_elliptic0,
-      dim=(d.njmax,),
+      dim=dim_handle_nefc,
       inputs=[
         d.ne, d.nf, d.nl, d.nefc, d.efc.worldid, d.efc.Jaref, d.efc.jv, d.efc.quad,
         d.efc.done, d.efc.lo_alpha, d.efc.condim
@@ -836,9 +836,9 @@ def _linesearch_iterative(m: types.Model, d: types.Data):
       ],
       outputs=[d.efc.lo])  # fmt: skip
   else:
-    wp.launch(
+    wp.launch_indirect(
       linesearch_iterative_init_lo_pyramidal,
-      dim=(d.njmax,),
+      dim=dim_handle_nefc,
       inputs=[
         d.ne, d.nf, d.nefc, d.efc.worldid, d.efc.Jaref, d.efc.jv,
         d.efc.quad, d.efc.done, d.efc.lo_alpha
@@ -868,9 +868,9 @@ def _linesearch_iterative(m: types.Model, d: types.Data):
       ])  # fmt: skip
 
     if m.opt.cone == types.ConeType.ELLIPTIC:
-      wp.launch(
+      wp.launch_indirect(
         linesearch_iterative_next_quad_elliptic0,
-        dim=(d.njmax,),
+        dim=dim_handle_nefc,
         inputs=[
           d.ne, d.nf, d.nl, d.nefc, d.efc.worldid, d.efc.Jaref, d.efc.jv, d.efc.quad, d.efc.done, d.efc.ls_done,
           d.efc.lo_next_alpha, d.efc.hi_next_alpha, d.efc.mid_alpha, d.efc.condim
@@ -886,9 +886,9 @@ def _linesearch_iterative(m: types.Model, d: types.Data):
         ],
         outputs=[d.efc.lo_next, d.efc.hi_next, d.efc.mid])  # fmt: skip
     else:
-      wp.launch(
+      wp.launch_indirect(
         linesearch_iterative_next_quad_pyramidal,
-        dim=(d.njmax,),
+        dim=dim_handle_nefc,
         inputs=[
           d.ne, d.nf, d.nefc, d.efc.worldid, d.efc.Jaref, d.efc.jv, d.efc.quad, d.efc.done, d.efc.ls_done,
           d.efc.lo_next_alpha, d.efc.hi_next_alpha, d.efc.mid_alpha
@@ -1269,7 +1269,7 @@ def linesearch_jaref(
 
 
 @event_scope
-def _linesearch(m: types.Model, d: types.Data):
+def _linesearch(m: types.Model, d: types.Data, dim_handle_nefc):
   # mv = qM @ search
   support.mul_m(m, d, d.efc.mv, d.efc.search, d.efc.done)
 
@@ -1289,7 +1289,7 @@ def _linesearch(m: types.Model, d: types.Data):
   if threads_per_efc > 1:
     wp.launch(
       linesearch_zero_jv,
-      dim=(d.njmax),
+      dim=dim_handle_nefc,
       inputs=[d.nefc, d.efc.worldid, d.efc.done],
       outputs=[d.efc.jv],
     )
@@ -1313,9 +1313,9 @@ def _linesearch(m: types.Model, d: types.Data):
   # quad = [0.5 * Jaref * Jaref * efc_D, jv * Jaref * efc_D, 0.5 * jv * jv * efc_D]
 
   disable_floss = m.opt.disableflags & types.DisableBit.FRICTIONLOSS
-  wp.launch(
+  wp.launch_indirect(
     linesearch_init_quad,
-    dim=(d.njmax),
+    dim=dim_handle_nefc,
     inputs=[
       d.nefc,
       d.efc.worldid,
@@ -1351,7 +1351,7 @@ def _linesearch(m: types.Model, d: types.Data):
   if m.opt.ls_parallel:
     _linesearch_parallel(m, d)
   else:
-    _linesearch_iterative(m, d)
+    _linesearch_iterative(m, d, dim_handle_nefc)
 
   wp.launch(
     linesearch_qacc_ma,
@@ -1360,9 +1360,9 @@ def _linesearch(m: types.Model, d: types.Data):
     outputs=[d.qacc, d.efc.Ma],
   )
 
-  wp.launch(
+  wp.launch_indirect(
     linesearch_jaref,
-    dim=(d.njmax,),
+    dim=dim_handle_nefc,
     inputs=[d.nefc, d.efc.worldid, d.efc.jv, d.efc.alpha, d.efc.done],
     outputs=[d.efc.Jaref],
   )
@@ -2543,7 +2543,7 @@ def _solver_iteration(
   d: types.Data,
   dim_handle_nefc = None,
 ):
-  _linesearch(m, d)
+  _linesearch(m, d, dim_handle_nefc)
 
   if m.opt.solver == types.SolverType.CG:
     wp.launch(
