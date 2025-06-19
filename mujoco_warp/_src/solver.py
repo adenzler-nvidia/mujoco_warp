@@ -1398,9 +1398,6 @@ def solve_init_jaref(
 ):
   efcid = wp.tid()
 
-  if efcid >= nefc_in[0]:
-    return
-
   worldid = efc_worldid_in[efcid]
   jaref = float(0.0)
   for i in range(nv):
@@ -1461,9 +1458,6 @@ def update_constraint_efc_pyramidal(
   efc_active_out: wp.array(dtype=bool),
 ):
   efcid = wp.tid()
-
-  if efcid >= nefc_in[0]:
-    return
 
   worldid = efc_worldid_in[efcid]
   efc_D = efc_D_in[efcid]
@@ -1615,9 +1609,6 @@ def update_constraint_efc_elliptic0(
 ):
   efcid = wp.tid()
 
-  if efcid >= nefc_in[0]:
-    return
-
   if efc_done_in[efc_worldid_in[efcid]]:
     return
 
@@ -1758,9 +1749,6 @@ def update_constraint_init_qfrc_constraint(
   qfrc_constraint_out: wp.array2d(dtype=float),
 ):
   efcid = wp.tid()
-
-  if efcid >= nefc_in[0]:
-    return
 
   worldid = efc_worldid_in[efcid]
 
@@ -2044,33 +2032,26 @@ def update_gradient_JTDAJ(
   # Data out:
   efc_h_out: wp.array3d(dtype=float),
 ):
-  efcid_temp, elementid = wp.tid()
+  efcid, elementid = wp.tid()
 
-  nefc = nefc_in[0]
 
-  for i in range(nblocks_perblock):
-    efcid = efcid_temp + i * dim_x
+  worldid = efc_worldid_in[efcid]
+  if efc_done_in[worldid]:
+    return
 
-    if efcid >= min(nefc, njmax_in):
-      return
+  efc_D = efc_D_in[efcid]
+  active = efc_active_in[efcid]
 
-    worldid = efc_worldid_in[efcid]
-    if efc_done_in[worldid]:
-      continue
+  if efc_D == 0.0 or not active:
+    return
 
-    efc_D = efc_D_in[efcid]
-    active = efc_active_in[efcid]
+  dofi = dof_tri_row[elementid]
+  dofj = dof_tri_col[elementid]
 
-    if efc_D == 0.0 or not active:
-      continue
-
-    dofi = dof_tri_row[elementid]
-    dofj = dof_tri_col[elementid]
-
-    # TODO(team): sparse efc_J
-    value = efc_J_in[efcid, dofi] * efc_J_in[efcid, dofj] * efc_D
-    if value != 0.0:
-      wp.atomic_add(efc_h_out[worldid, dofi], dofj, value)
+  # TODO(team): sparse efc_J
+  value = efc_J_in[efcid, dofi] * efc_J_in[efcid, dofj] * efc_D
+  if value != 0.0:
+    wp.atomic_add(efc_h_out[worldid, dofi], dofj, value)
 
 
 @wp.kernel
@@ -2317,9 +2298,20 @@ def _update_gradient(m: types.Model, d: types.Data, dim_handle_nefc = None):
 
     nblocks_perblock = int((d.njmax + dim_x - 1) / dim_x)
 
-    wp.launch(
+    jtdaj_dims = wp.array([dim_x, m.dof_tri_row.size], device=d.nefc.device, dtype=int)
+
+    @wp.kernel
+    def kernel_copy(in_array: wp.array(dtype=int), out_array: wp.array(dtype=int)):
+      out_array[0] = in_array[0]
+
+
+    wp.launch(kernel_copy, dim=(1,), inputs=[d.nefc, jtdaj_dims])
+
+    dim_handle_jtdaj = wp.launch_indirect_prepare(jtdaj_dims)
+
+    wp.launch_indirect(
       update_gradient_JTDAJ,
-      dim=(dim_x, m.dof_tri_row.size),
+      dim=dim_handle_jtdaj,
       inputs=[
         m.dof_tri_row,
         m.dof_tri_col,
