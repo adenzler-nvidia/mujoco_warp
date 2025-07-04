@@ -355,6 +355,10 @@ def put_model(mjm: mujoco.MjModel) -> types.Model:
     minlength=len(types.GeomType) * (len(types.GeomType) + 1) // 2,
   )
 
+  # Filter arrays to only include pairs with nxn_pairid > -2
+  valid_mask = nxn_pairid > -2
+  nxn_geom_pair = nxn_geom_pair[valid_mask]
+
   def create_nmodel_batched_array(mjm_array, dtype, expand_dim=True):
     array = wp.array(mjm_array, dtype=dtype)
     # add private attribute for JAX to determine which fields are batched
