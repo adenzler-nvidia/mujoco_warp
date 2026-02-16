@@ -1031,7 +1031,7 @@ def linesearch_iterative(ls_iterations: int, cone_type: types.ConeType, fuse_jv:
     snorm = wp.sqrt(ctx_search_dot_in[worldid])
     meaninertia = stat_meaninertia[worldid % stat_meaninertia.shape[0]]
     scale = meaninertia * wp.float(nv)
-    gtol = tolerance * ls_tolerance * snorm * scale
+    gtol = wp.max(tolerance * ls_tolerance * snorm * scale, 1e-6)
 
     # p0 via parallel reduction
     local_p0 = wp.vec3(0.0)
@@ -1164,8 +1164,8 @@ def linesearch_iterative(ls_iterations: int, cone_type: types.ConeType, fuse_jv:
     lo_in_sum = wp.tile_reduce(wp.add, lo_in_tile)
     lo_in = _eval_pt(ctx_quad_gauss, lo_alpha_in) + lo_in_sum[0]
 
-    # check for initial convergence: if |derivative| < gtol, accept Newton step immediately
-    initial_converged = wp.abs(lo_in[1]) < gtol
+    # accept Newton step if derivative is small and cost improved
+    initial_converged = wp.abs(lo_in[1]) < gtol and lo_in[0] < p0[0]
 
     # main iterative loop - skip if already converged
     if not initial_converged:
