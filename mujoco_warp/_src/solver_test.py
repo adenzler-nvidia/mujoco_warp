@@ -552,6 +552,100 @@ class SolverTest(parameterized.TestCase):
     mjw.step(m, d)
 
 
+  def test_incremental_vs_full_hessian(self):
+    """Tests that incremental Hessian updates produce same result as full recomputation.
+
+    Runs the Newton solver twice on the same problem: once with full Hessian
+    recomputation every iteration, once with incremental H updates (applying
+    deltas for changed constraints then re-factorizing). Compares qacc.
+    """
+    total_any_changes = False
+    for keyframe in range(3):
+      mjm, mjd, m, d = test_data.fixture(
+        "humanoid/humanoid.xml",
+        keyframe=keyframe,
+        overrides={
+          "opt.cone": ConeType.PYRAMIDAL,
+          "opt.solver": SolverType.NEWTON,
+          "opt.iterations": 5,
+          "opt.ls_iterations": 10,
+        },
+      )
+
+      # Run with full Hessian recomputation (original path)
+      d_full = mjw.put_data(mjm, mjd)
+      d_full.qacc.zero_()
+      d_full.qfrc_constraint.zero_()
+      d_full.efc.force.zero_()
+      ctx_full = solver.create_solver_context(m, d_full)
+      # Force full path by using _update_gradient (not incremental)
+      solver.init_context(m, d_full, ctx_full, grad=True)
+      wp.launch(
+        solver.solve_init_search,
+        dim=(d_full.nworld, m.nv),
+        inputs=[ctx_full.Mgrad],
+        outputs=[ctx_full.search, ctx_full.search_dot],
+      )
+      step_size_cost = wp.empty((d_full.nworld, 0), dtype=float)
+      nsolving = wp.full(shape=(1,), value=d_full.nworld, dtype=int)
+      for _ in range(m.opt.iterations):
+        # Use the original _update_gradient (full H every iteration)
+        solver._linesearch(m, d_full, ctx_full, step_size_cost)
+        solver._update_constraint(m, d_full, ctx_full)
+        solver._update_gradient(m, d_full, ctx_full)
+        wp.launch(solver.solve_zero_search_dot, dim=(d_full.nworld), inputs=[ctx_full.done], outputs=[ctx_full.search_dot])
+        wp.launch(
+          solver.solve_search_update,
+          dim=(d_full.nworld, m.nv),
+          inputs=[m.opt.solver, ctx_full.Mgrad, ctx_full.search, ctx_full.beta, ctx_full.done],
+          outputs=[ctx_full.search, ctx_full.search_dot],
+        )
+
+      qacc_full = d_full.qacc.numpy().copy()
+
+      # Run with incremental path (Hessian delta updates)
+      d_inc = mjw.put_data(mjm, mjd)
+      d_inc.qacc.zero_()
+      d_inc.qfrc_constraint.zero_()
+      d_inc.efc.force.zero_()
+      ctx_inc = solver.create_solver_context(m, d_inc)
+      # init_context calls _update_gradient (full H recomputation on first call)
+      solver.init_context(m, d_inc, ctx_inc, grad=True)
+      wp.launch(
+        solver.solve_init_search,
+        dim=(d_inc.nworld, m.nv),
+        inputs=[ctx_inc.Mgrad],
+        outputs=[ctx_inc.search, ctx_inc.search_dot],
+      )
+      step_size_cost = wp.empty((d_inc.nworld, 0), dtype=float)
+      any_changes = False
+      for _ in range(m.opt.iterations):
+        solver._linesearch(m, d_inc, ctx_inc, step_size_cost)
+        ctx_inc.changed_efc_count.zero_()
+        solver._update_constraint(m, d_inc, ctx_inc, track_changes=True)
+        wp.synchronize()
+        if np.any(ctx_inc.changed_efc_count.numpy() > 0):
+          any_changes = True
+        solver._update_gradient_incremental(m, d_inc, ctx_inc)
+        wp.launch(solver.solve_zero_search_dot, dim=(d_inc.nworld), inputs=[ctx_inc.done], outputs=[ctx_inc.search_dot])
+        wp.launch(
+          solver.solve_search_update,
+          dim=(d_inc.nworld, m.nv),
+          inputs=[m.opt.solver, ctx_inc.Mgrad, ctx_inc.search, ctx_inc.beta, ctx_inc.done],
+          outputs=[ctx_inc.search, ctx_inc.search_dot],
+        )
+
+      total_any_changes = total_any_changes or any_changes
+
+      qacc_inc = d_inc.qacc.numpy().copy()
+
+      _assert_eq(qacc_inc, qacc_full, f"qacc keyframe={keyframe}")
+
+    # Verify the incremental path was actually exercised (at least one keyframe
+    # should produce state changes during the solver iterations).
+    self.assertTrue(total_any_changes, "no state changes detected across any keyframe")
+
+
 if __name__ == "__main__":
   wp.init()
   absltest.main()
