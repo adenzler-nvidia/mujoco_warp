@@ -892,14 +892,15 @@ def put_data(
 
   efc = types.Constraint(**efc_kwargs)
 
+  if mjd.nefc == 0:
+    efc_j = np.zeros((0, mjm.nv))
+  elif mujoco.mj_isSparse(mjm):
+    efc_j = np.zeros((mjd.nefc, mjm.nv))
+    mujoco.mju_sparse2dense(efc_j, mjd.efc_J, mjd.efc_J_rownnz, mjd.efc_J_rowadr, mjd.efc_J_colind)
+  else:
+    efc_j = mjd.efc_J.reshape((mjd.nefc, mjm.nv))
   efc.J = np.zeros((nworld, sizes["njmax_pad"], sizes["nv_pad"]), dtype=f.type.dtype)
-  if mjd.nefc > 0:
-    if mujoco.mj_isSparse(mjm):
-      efc_j = np.zeros((mjd.nefc, mjm.nv))
-      mujoco.mju_sparse2dense(efc_j, mjd.efc_J, mjd.efc_J_rownnz, mjd.efc_J_rowadr, mjd.efc_J_colind)
-    else:
-      efc_j = mjd.efc_J.reshape((mjd.nefc, mjm.nv))
-    efc.J[:, : mjd.nefc, : mjm.nv] = np.tile(efc_j, (nworld, 1, 1))
+  efc.J[:, : mjd.nefc, : mjm.nv] = np.tile(efc_j, (nworld, 1, 1))
   efc.J = wp.array(efc.J, dtype=float)
 
   # create data
