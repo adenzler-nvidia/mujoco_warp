@@ -25,6 +25,7 @@ from absl.testing import parameterized
 
 import mujoco_warp as mjwarp
 from mujoco_warp import test_data
+from mujoco_warp._src.io import set_length_range
 
 
 def _assert_eq(a, b, name):
@@ -1269,18 +1270,18 @@ class IOTest(parameterized.TestCase):
       xml="""
     <mujoco>
       <worldbody>
-        <body name="link1">
+        <body>
           <joint name="j1" type="hinge" axis="0 0 1"/>
-          <geom name="g1" type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
-          <body name="link2" pos="0.5 0 0">
+          <geom type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
+          <body pos="0.5 0 0">
             <joint name="j2" type="hinge" axis="0 0 1"/>
-            <geom name="g2" type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
+            <geom type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
           </body>
         </body>
       </worldbody>
       <actuator>
-        <position name="pos1" joint="j1" kp="100" dampratio="1.0"/>
-        <position name="pos2" joint="j2" kp="50" dampratio="0.5"/>
+        <position joint="j1" kp="100" dampratio="1.0"/>
+        <position joint="j2" kp="50" dampratio="0.5"/>
       </actuator>
     </mujoco>
     """
@@ -1312,13 +1313,13 @@ class IOTest(parameterized.TestCase):
       xml="""
     <mujoco>
       <worldbody>
-        <body name="link1">
+        <body>
           <joint name="j1" type="hinge" axis="0 0 1"/>
-          <geom name="g1" type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
+          <geom type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
         </body>
       </worldbody>
       <actuator>
-        <general name="gen1" joint="j1" gainprm="100"
+        <general joint="j1" gainprm="100"
                  biastype="affine" biasprm="0 -100 -10"/>
       </actuator>
     </mujoco>
@@ -1341,19 +1342,17 @@ class IOTest(parameterized.TestCase):
       xml="""
     <mujoco>
       <worldbody>
-        <body name="link1">
+        <body>
           <joint name="j1" type="hinge" axis="0 0 1" limited="true" range="-90 90"/>
-          <geom name="g1" type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
+          <geom type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
         </body>
       </worldbody>
       <actuator>
-        <motor name="motor1" joint="j1" gear="2"/>
+        <motor joint="j1" gear="2"/>
       </actuator>
     </mujoco>
     """
     )
-
-    from mujoco_warp._src.io import set_length_range
 
     set_length_range(m, d)
 
@@ -1370,31 +1369,29 @@ class IOTest(parameterized.TestCase):
       xml="""
     <mujoco>
       <worldbody>
-        <body name="link1">
-          <joint name="j1" type="hinge" axis="0 0 1"/>
-          <geom name="g1" type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
+        <body>
+          <joint type="hinge" axis="0 0 1"/>
+          <geom type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
           <site name="s1" pos="0.1 0 0"/>
-          <body name="link2" pos="0.5 0 0">
-            <joint name="j2" type="hinge" axis="0 0 1"/>
-            <geom name="g2" type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
+          <body pos="0.5 0 0">
+            <joint type="hinge" axis="0 0 1"/>
+            <geom type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
             <site name="s2" pos="0.4 0 0"/>
           </body>
         </body>
       </worldbody>
       <tendon>
-        <spatial name="tendon1" limited="true" range="0.1 0.5">
+        <spatial name="t1" limited="true" range="0.1 0.5">
           <site site="s1"/>
           <site site="s2"/>
         </spatial>
       </tendon>
       <actuator>
-        <motor name="motor1" tendon="tendon1" gear="1"/>
+        <motor tendon="t1" gear="1"/>
       </actuator>
     </mujoco>
     """
     )
-
-    from mujoco_warp._src.io import set_length_range
 
     set_length_range(m, d)
 
@@ -1411,13 +1408,13 @@ class IOTest(parameterized.TestCase):
       xml="""
     <mujoco>
       <worldbody>
-        <body name="link1">
+        <body>
           <joint name="j1" type="hinge" axis="0 0 1"/>
-          <geom name="g1" type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
+          <geom type="capsule" size="0.05" fromto="0 0 0 0.5 0 0" mass="1.0"/>
         </body>
       </worldbody>
       <actuator>
-        <motor name="motor1" joint="j1" gear="1"/>
+        <motor joint="j1" gear="1"/>
       </actuator>
     </mujoco>
     """

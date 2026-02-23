@@ -27,6 +27,8 @@ from mujoco_warp._src import render_util
 from mujoco_warp._src import smooth
 from mujoco_warp._src import types
 from mujoco_warp._src import warp_util
+from mujoco_warp._src.types import MJ_MINVAL
+from mujoco_warp._src.types import BiasType
 from mujoco_warp._src.types import TrnType
 from mujoco_warp._src.types import vec10
 
@@ -1773,16 +1775,16 @@ def _compute_dof_M0(
 def _resolve_dampratio(
   actuator_biastype: wp.array(dtype=int),
   actuator_gainprm: wp.array2d(dtype=types.vec10f),
-  actuator_biasprm: wp.array2d(dtype=types.vec10f),
   actuator_moment_in: wp.array3d(dtype=float),
   dof_M0_in: wp.array2d(dtype=float),
   nv: int,
+  actuator_biasprm: wp.array2d(dtype=types.vec10f),
 ):
   worldid, actid = wp.tid()
   biastype = actuator_biastype[actid]
 
   # only affine bias (position actuators)
-  if biastype != 1:  # BiasType.AFFINE
+  if biastype != BiasType.AFFINE:
     return
 
   gainprm_id = worldid % actuator_gainprm.shape[0]
@@ -1791,7 +1793,7 @@ def _resolve_dampratio(
 
   biasprm = actuator_biasprm[biasprm_id, actid]
   # dampratio condition: gainprm[0] == -biasprm[1] and biasprm[2] > 0
-  if wp.abs(kp + biasprm[1]) > 1e-12:
+  if wp.abs(kp + biasprm[1]) > MJ_MINVAL:
     return
   if biasprm[2] <= 0.0:
     return
@@ -1802,10 +1804,9 @@ def _resolve_dampratio(
   mass = float(0.0)
   for j in range(nv):
     moment = actuator_moment_in[worldid, actid, j]
-    if wp.abs(moment) > 1e-12:
+    if wp.abs(moment) > MJ_MINVAL:
       mass += dof_M0_in[worldid, j] / (moment * moment)
 
-  # damping = dampratio * 2 * sqrt(kp * mass)
   damping = dampratio * 2.0 * wp.sqrt(kp * mass)
 
   # write -damping to biasprm[2]
@@ -2043,11 +2044,11 @@ def set_const_0(m: types.Model, d: types.Data):
       inputs=[
         m.actuator_biastype,
         m.actuator_gainprm,
-        m.actuator_biasprm,
         d.actuator_moment,
         dof_M0,
         m.nv,
       ],
+      outputs=[m.actuator_biasprm],
     )
 
   wp.copy(d.qpos, qpos_saved)
