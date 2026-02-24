@@ -603,6 +603,9 @@ def _equality_flex(
   opt_disableflags: int,
   flexedge_length0: wp.array(dtype=float),
   flexedge_invweight0: wp.array(dtype=float),
+  flexedge_J_rownnz: wp.array(dtype=int),
+  flexedge_J_rowadr: wp.array(dtype=int),
+  flexedge_J_colind: wp.array(dtype=int),
   eq_solref: wp.array2d(dtype=wp.vec2),
   eq_solimp: wp.array2d(dtype=vec5),
   is_sparse: bool,
@@ -643,21 +646,19 @@ def _equality_flex(
 
   Jqvel = float(0.0)
 
-  # TODO(team): sparse flexedge_J
-  if is_sparse:
-    rowadr = efcid * nv
-    efc_J_rownnz_out[worldid, efcid] = nv
-    efc_J_rowadr_out[worldid, efcid] = rowadr
-
-  for i in range(nv):
-    # TODO(team): sparse flexedge_J
-    J = flexedge_J_in[worldid, edgeid, i]
-    if is_sparse:
-      efc_J_colind_out[worldid, 0, rowadr + i] = i
-      efc_J_out[worldid, 0, rowadr + i] = J
-    else:
-      efc_J_out[worldid, efcid, i] = J
-    Jqvel += J * qvel_in[worldid, i]
+  rownnz = flexedge_J_rownnz[edgeid]
+  flex_rowadr = flexedge_J_rowadr[edgeid]
+  efc_J_rownnz_out[worldid, efcid] = rownnz
+  efc_rowadr = efcid * nv
+  efc_J_rowadr_out[worldid, efcid] = efc_rowadr
+  for i in range(rownnz):
+    flex_sparseid = flex_rowadr + i
+    efc_sparseid = efc_rowadr + i
+    colind = flexedge_J_colind[flex_sparseid]
+    J = flexedge_J_in[worldid, 0, flex_sparseid]
+    efc_J_colind_out[worldid, 0, efc_sparseid] = colind
+    efc_J_out[worldid, 0, efc_sparseid] = J
+    Jqvel += J * qvel_in[worldid, colind]
 
   _efc_row(
     opt_disableflags,
@@ -1635,8 +1636,18 @@ def _contact_pyramidal(
 
     if is_sparse:
       rownnz = int(0)
+      dofid = int(da)
+    else:
+      dofid = int(nv - 1)
 
-    for dofid in range(nv - 1, -1, -1):
+    while True:
+      if is_sparse:
+        if da1 < 0 and da2 < 0:
+          break
+      else:
+        if dofid < 0:
+          break
+
       if dofid == da:
         # TODO(team): contact_jacobian
         jac1p, jac1r = support.jac_dof(
@@ -1698,9 +1709,14 @@ def _contact_pyramidal(
         if da2 == da:
           da2 = dof_parentid[da2]
         da = wp.max(da1, da2)
+        if is_sparse:
+          dofid = da
+        else:
+          dofid -= 1
       else:
         if not is_sparse:
           efc_J_out[worldid, efcid, dofid] = 0.0
+          dofid -= 1
 
     if is_sparse:
       efc_J_rownnz_out[worldid, efcid] = rownnz
@@ -1840,8 +1856,18 @@ def _contact_elliptic(
 
     if is_sparse:
       rownnz = int(0)
+      dofid = int(da)
+    else:
+      dofid = int(nv - 1)
 
-    for dofid in range(nv - 1, -1, -1):
+    while True:
+      if is_sparse:
+        if da1 < 0 and da2 < 0:
+          break
+      else:
+        if dofid < 0:
+          break
+
       if dofid == da:
         # TODO(team): contact jacobian
         jac1p, jac1r = support.jac_dof(
@@ -1891,9 +1917,14 @@ def _contact_elliptic(
         if da2 == da:
           da2 = dof_parentid[da2]
         da = wp.max(da1, da2)
+        if is_sparse:
+          dofid = da
+        else:
+          dofid -= 1
       else:
         if not is_sparse:
           efc_J_out[worldid, efcid, dofid] = 0.0
+          dofid -= 1
 
     if is_sparse:
       efc_J_rownnz_out[worldid, efcid] = rownnz
@@ -2155,6 +2186,9 @@ def make_constraint(m: types.Model, d: types.Data):
           m.opt.disableflags,
           m.flexedge_length0,
           m.flexedge_invweight0,
+          m.flexedge_J_rownnz,
+          m.flexedge_J_rowadr,
+          m.flexedge_J_colind,
           m.eq_solref,
           m.eq_solimp,
           m.is_sparse,
