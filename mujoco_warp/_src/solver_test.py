@@ -39,14 +39,18 @@ def _assert_eq(a, b, name):
 
 
 class SolverTest(parameterized.TestCase):
-  @parameterized.product(cone=tuple(ConeType), solver_=tuple(SolverType))
-  def test_constraint_update(self, cone, solver_):
+  @parameterized.product(
+    cone=tuple(ConeType),
+    solver_=tuple(SolverType),
+    jacobian=(mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE),
+  )
+  def test_constraint_update(self, cone, solver_, jacobian):
     """Tests _update_constraint function is correct."""
     for keyframe in range(3):
       mjm, mjd, m, d = test_data.fixture(
         "constraints.xml",
         keyframe=keyframe,
-        overrides={"opt.solver": solver_, "opt.cone": cone, "opt.iterations": 0},
+        overrides={"opt.solver": solver_, "opt.cone": cone, "opt.jacobian": jacobian, "opt.iterations": 0},
       )
 
       def cost(qacc):
@@ -90,8 +94,12 @@ class SolverTest(parameterized.TestCase):
       _assert_eq(ctx_cost, mjd_cost, "cost")
       _assert_eq(qfrc_constraint, mjd.qfrc_constraint, "qfrc_constraint")
 
-  @parameterized.product(ls_parallel=(True, False), cone=(ConeType.PYRAMIDAL, ConeType.ELLIPTIC))
-  def test_init_linesearch(self, ls_parallel, cone):
+  @parameterized.product(
+    ls_parallel=(True, False),
+    cone=(ConeType.PYRAMIDAL, ConeType.ELLIPTIC),
+    jacobian=(mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE),
+  )
+  def test_init_linesearch(self, ls_parallel, cone, jacobian):
     """Test linesearch initialization.
 
     Parallel linesearch has separate prep kernels that write quad, quad_gauss, jv.
@@ -107,6 +115,7 @@ class SolverTest(parameterized.TestCase):
           "opt.ls_iterations": 1,
           "opt.ls_parallel": ls_parallel,
           "opt.cone": cone,
+          "opt.jacobian": jacobian,
         },
       )
 
@@ -120,7 +129,17 @@ class SolverTest(parameterized.TestCase):
       # Calculate target values
       nefc = d.nefc.numpy()[0]
       ctx_search_np = ctx.search.numpy()[0]
-      efc_J_np = d.efc.J.numpy()[0][:nefc, : m.nv]
+      if m.is_sparse:
+        efc_J_np = np.zeros((nefc, m.nv))
+        mujoco.mju_sparse2dense(
+          efc_J_np,
+          d.efc.J.numpy()[0, 0],
+          d.efc.J_rownnz.numpy()[0, :nefc],
+          d.efc.J_rowadr.numpy()[0, :nefc],
+          d.efc.J_colind.numpy()[0, 0],
+        )
+      else:
+        efc_J_np = d.efc.J.numpy()[0, :nefc, : m.nv]
       ctx_gauss_np = ctx.gauss.numpy()[0]
       efc_Ma_np = d.efc.Ma.numpy()[0]
       ctx_Jaref_np = ctx.Jaref.numpy()[0][:nefc]
@@ -195,13 +214,16 @@ class SolverTest(parameterized.TestCase):
     ctx_Mgrad = ctx.Mgrad.numpy()[0, : mjm.nv]
     _assert_eq(ctx_Mgrad, mj_Mgrad[0], name="Mgrad")
 
-  @parameterized.parameters(ConeType.PYRAMIDAL, ConeType.ELLIPTIC)
-  def test_parallel_linesearch(self, cone):
+  @parameterized.product(
+    cone=(ConeType.PYRAMIDAL, ConeType.ELLIPTIC),
+    jacobian=(mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE),
+  )
+  def test_parallel_linesearch(self, cone, jacobian):
     """Test that iterative and parallel linesearch leads to equivalent results."""
     _, _, m, d = test_data.fixture(
       "humanoid/humanoid.xml",
       qpos_noise=0.01,
-      overrides={"opt.cone": cone, "opt.iterations": 50, "opt.ls_iterations": 50},
+      overrides={"opt.cone": cone, "opt.jacobian": jacobian, "opt.iterations": 50, "opt.ls_iterations": 50},
     )
 
     # One step to obtain more non-zeros results
@@ -248,8 +270,12 @@ class SolverTest(parameterized.TestCase):
   @parameterized.parameters(
     (ConeType.PYRAMIDAL, SolverType.CG, 10, 5, mujoco.mjtJacobian.mjJAC_DENSE, False),
     (ConeType.ELLIPTIC, SolverType.CG, 10, 5, mujoco.mjtJacobian.mjJAC_DENSE, False),
+    (ConeType.PYRAMIDAL, SolverType.CG, 10, 5, mujoco.mjtJacobian.mjJAC_SPARSE, False),
+    (ConeType.ELLIPTIC, SolverType.CG, 10, 5, mujoco.mjtJacobian.mjJAC_SPARSE, False),
     (ConeType.PYRAMIDAL, SolverType.NEWTON, 5, 10, mujoco.mjtJacobian.mjJAC_DENSE, False),
     (ConeType.ELLIPTIC, SolverType.NEWTON, 5, 10, mujoco.mjtJacobian.mjJAC_DENSE, False),
+    (ConeType.PYRAMIDAL, SolverType.NEWTON, 5, 10, mujoco.mjtJacobian.mjJAC_SPARSE, False),
+    (ConeType.ELLIPTIC, SolverType.NEWTON, 5, 10, mujoco.mjtJacobian.mjJAC_SPARSE, False),
     (ConeType.PYRAMIDAL, SolverType.NEWTON, 5, 64, mujoco.mjtJacobian.mjJAC_SPARSE, True),
     (ConeType.ELLIPTIC, SolverType.NEWTON, 5, 64, mujoco.mjtJacobian.mjJAC_SPARSE, True),
   )
@@ -382,10 +408,10 @@ class SolverTest(parameterized.TestCase):
     efc_J1 = mjd1.efc_J.reshape((mjd1.nefc, mjm1.nv))
     efc_J2 = mjd2.efc_J.reshape((mjd2.nefc, mjm2.nv))
 
-    efc_J_fill = np.zeros((3, d.njmax, m.nv))
-    efc_J_fill[0, : mjd0.nefc, :] = efc_J0
-    efc_J_fill[1, : mjd1.nefc, :] = efc_J1
-    efc_J_fill[2, : mjd2.nefc, :] = efc_J2
+    efc_J_fill = np.zeros((3, d.njmax_pad, m.nv_pad))
+    efc_J_fill[0, : mjd0.nefc, : mjm0.nv] = efc_J0
+    efc_J_fill[1, : mjd1.nefc, : mjm1.nv] = efc_J1
+    efc_J_fill[2, : mjd2.nefc, : mjm2.nv] = efc_J2
 
     # Similarly for D and aref values
     efc_D0 = mjd0.efc_D[: mjd0.nefc]
@@ -487,10 +513,14 @@ class SolverTest(parameterized.TestCase):
       world2_forces = np.concatenate([world2_eq_forces, world2_ineq_forces])
       _assert_eq(world2_forces, mjd2.efc_force, "efc_force2")
 
-  def test_frictionloss(self):
+  @parameterized.parameters(
+    mujoco.mjtJacobian.mjJAC_DENSE,
+    mujoco.mjtJacobian.mjJAC_SPARSE,
+  )
+  def test_frictionloss(self, jacobian):
     """Tests solver with frictionloss."""
     for keyframe in range(3):
-      _, mjd, m, d = test_data.fixture("constraints.xml", keyframe=keyframe)
+      _, mjd, m, d = test_data.fixture("constraints.xml", keyframe=keyframe, overrides={"opt.jacobian": jacobian})
       mjw.solve(m, d)
 
       _assert_eq(d.nf.numpy()[0], mjd.nf, "nf")

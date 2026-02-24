@@ -2207,6 +2207,7 @@ def _transmission_body_moment(
   dof_bodyid: wp.array(dtype=int),
   geom_bodyid: wp.array(dtype=int),
   actuator_trnid: wp.array(dtype=wp.vec2i),
+  is_sparse: bool,
   actuator_trntype_body_adr: wp.array(dtype=int),
   # Data in:
   subtree_com_in: wp.array2d(dtype=wp.vec3),
@@ -2219,6 +2220,9 @@ def _transmission_body_moment(
   contact_geom_in: wp.array(dtype=wp.vec2i),
   contact_efc_address_in: wp.array2d(dtype=int),
   contact_worldid_in: wp.array(dtype=int),
+  efc_J_rownnz_in: wp.array2d(dtype=int),
+  efc_J_rowadr_in: wp.array2d(dtype=int),
+  efc_J_colind_in: wp.array3d(dtype=int),
   efc_J_in: wp.array3d(dtype=float),
   nacon_in: wp.array(dtype=int),
   # Data out:
@@ -2263,17 +2267,37 @@ def _transmission_body_moment(
     contact_efc_address = contact_efc_address_in[conid]
 
     if contact_dim == 1 or opt_cone == ConeType.ELLIPTIC:
-      efc_force = 1.0
       efcid0 = contact_efc_address[0]
-      wp.atomic_add(actuator_moment_out[worldid, actid], dofid, efc_J_in[worldid, efcid0, dofid] * efc_force)
-
+      if is_sparse:
+        rownnz = efc_J_rownnz_in[worldid, efcid0]
+        if dofid < rownnz:
+          rowadr = efc_J_rowadr_in[worldid, efcid0]
+          sparseid = rowadr + dofid
+          colind = efc_J_colind_in[worldid, 0, sparseid]
+          # TODO(team): sparse actuator_moment
+          wp.atomic_add(actuator_moment_out[worldid, actid], colind, efc_J_in[worldid, 0, sparseid])
+        else:
+          return
+      else:
+        wp.atomic_add(actuator_moment_out[worldid, actid], dofid, efc_J_in[worldid, efcid0, dofid])
     else:
       npyramid = contact_dim - 1  # number of frictional directions
       efc_force = 0.5 / float(npyramid)
 
       for j in range(2 * npyramid):
         efcid = contact_efc_address[j]
-        wp.atomic_add(actuator_moment_out[worldid, actid], dofid, efc_J_in[worldid, efcid, dofid] * efc_force)
+        if is_sparse:
+          rownnz = efc_J_rownnz_in[worldid, efcid]
+          if dofid < rownnz:
+            rowadr = efc_J_rowadr_in[worldid, efcid]
+            sparseid = rowadr + dofid
+            colind = efc_J_colind_in[worldid, 0, sparseid]
+            # TODO(team): sparse actuator_moment
+            wp.atomic_add(actuator_moment_out[worldid, actid], colind, efc_J_in[worldid, 0, sparseid] * efc_force)
+          else:
+            return
+        else:
+          wp.atomic_add(actuator_moment_out[worldid, actid], dofid, efc_J_in[worldid, efcid, dofid] * efc_force)
 
   # excluded contact in gap: get Jacobian, accumulate
   elif contact_exclude == 1:
@@ -2281,13 +2305,38 @@ def _transmission_body_moment(
     contact_frame = contact_frame_in[conid]
     normal = wp.vec3(contact_frame[0, 0], contact_frame[0, 1], contact_frame[0, 2])
 
-    # get Jacobian difference
-    jacp1, _ = support.jac_dof(body_parentid, body_rootid, dof_bodyid, subtree_com_in, cdof_in, contact_pos, b1, dofid, worldid)
-    jacp2, _ = support.jac_dof(body_parentid, body_rootid, dof_bodyid, subtree_com_in, cdof_in, contact_pos, b2, dofid, worldid)
-    jacdif = jacp2 - jacp1
+    if is_sparse:
+      # get Jacobian difference
+      efcid0 = contact_efc_address_in[conid][0]
+      if dofid >= efc_J_rownnz_in[worldid, efcid0]:
+        return
+      sparseid = efc_J_rowadr_in[worldid, efcid0] + dofid
+      colind = efc_J_colind_in[worldid, 0, sparseid]
 
-    # project Jacobian along the normal of the contact frame
-    wp.atomic_add(actuator_moment_out[worldid, actid], dofid, wp.dot(normal, jacdif))
+      jacp1, _ = support.jac_dof(
+        body_parentid, body_rootid, dof_bodyid, subtree_com_in, cdof_in, contact_pos, b1, colind, worldid
+      )
+      jacp2, _ = support.jac_dof(
+        body_parentid, body_rootid, dof_bodyid, subtree_com_in, cdof_in, contact_pos, b2, colind, worldid
+      )
+
+      jacdif = jacp2 - jacp1
+
+      # project Jacobian along the normal of the contact frame
+      wp.atomic_add(actuator_moment_out[worldid, actid], colind, wp.dot(normal, jacdif))
+    else:
+      # get Jacobian difference
+      jacp1, _ = support.jac_dof(
+        body_parentid, body_rootid, dof_bodyid, subtree_com_in, cdof_in, contact_pos, b1, dofid, worldid
+      )
+      jacp2, _ = support.jac_dof(
+        body_parentid, body_rootid, dof_bodyid, subtree_com_in, cdof_in, contact_pos, b2, dofid, worldid
+      )
+
+      jacdif = jacp2 - jacp1
+
+      # project Jacobian along the normal of the contact frame
+      wp.atomic_add(actuator_moment_out[worldid, actid], dofid, wp.dot(normal, jacdif))
 
 
 @wp.kernel
@@ -2356,6 +2405,7 @@ def transmission(m: Model, d: Data):
   if m.nacttrnbody:
     # compute moments
     ncon = wp.zeros((d.nworld, m.nacttrnbody), dtype=int)
+
     wp.launch(
       _transmission_body_moment,
       dim=(m.nacttrnbody, d.naconmax, m.nv),
@@ -2366,6 +2416,7 @@ def transmission(m: Model, d: Data):
         m.dof_bodyid,
         m.geom_bodyid,
         m.actuator_trnid,
+        m.is_sparse,
         m.actuator_trntype_body_adr,
         d.subtree_com,
         d.cdof,
@@ -2377,6 +2428,9 @@ def transmission(m: Model, d: Data):
         d.contact.geom,
         d.contact.efc_address,
         d.contact.worldid,
+        d.efc.J_rownnz,
+        d.efc.J_rowadr,
+        d.efc.J_colind,
         d.efc.J,
         d.nacon,
       ],
