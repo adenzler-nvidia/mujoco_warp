@@ -285,7 +285,7 @@ def _euler_damp_qfrc_sparse(
   timestep = opt_timestep[worldid % opt_timestep.shape[0]]
 
   adr = dof_Madr[tid]
-  qM_integration_out[worldid, 0, adr] += timestep * dof_damping[worldid, tid]
+  qM_integration_out[worldid, 0, adr] += timestep * dof_damping[worldid % dof_damping.shape[0], tid]
 
 
 @cache_kernel
