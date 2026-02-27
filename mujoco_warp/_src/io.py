@@ -31,7 +31,6 @@ from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import SPARSE_CONSTRAINT_JACOBIAN
 from mujoco_warp._src.types import BiasType
 from mujoco_warp._src.types import TrnType
-from mujoco_warp._src.types import SPARSE_CONSTRAINT_JACOBIAN
 from mujoco_warp._src.types import vec10
 from mujoco_warp._src.util_pkg import check_version
 
