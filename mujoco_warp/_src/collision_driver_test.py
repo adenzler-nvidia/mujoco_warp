@@ -1,4 +1,6 @@
 # Copyright 2025 The Newton Developers
+from mujoco_warp._src.warp_util import launch
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -678,7 +680,7 @@ class CollisionTest(parameterized.TestCase):
     convex.vert = wp.array(verts, dtype=wp.vec3)
 
     dist = wp.empty(1, dtype=wp.vec4)
-    wp.launch(plane_convex_test, inputs=[convex], outputs=[dist], dim=1)
+    launch(plane_convex_test, inputs=[convex], outputs=[dist], dim=1)
     self.assertTrue((dist.numpy() > 0.05).all())
 
   @parameterized.parameters(list(BroadphaseType))

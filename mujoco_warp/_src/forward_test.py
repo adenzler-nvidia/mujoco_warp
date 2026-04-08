@@ -1,4 +1,6 @@
 # Copyright 2025 The Newton Developers
+from mujoco_warp._src.warp_util import launch
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -582,7 +584,7 @@ class ForwardTest(parameterized.TestCase):
       ctrl_out[worldid, 0] = 2.0
 
     def my_control(m, d):
-      wp.launch(_set_ctrl, dim=(d.nworld,), outputs=[d.ctrl])
+      launch(_set_ctrl, dim=(d.nworld,), outputs=[d.ctrl])
 
     _, _, m, d = test_data.fixture(xml=xml)
     m.callback.control = my_control
@@ -614,7 +616,7 @@ class ForwardTest(parameterized.TestCase):
       act_dot_out[worldid, 1] = act_in[worldid, 0] * frequency
 
     def oscillator(m, d):
-      wp.launch(
+      launch(
         _oscillator_act_dot,
         dim=(d.nworld,),
         inputs=[d.act, d.ctrl],

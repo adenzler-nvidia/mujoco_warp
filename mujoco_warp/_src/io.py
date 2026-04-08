@@ -32,6 +32,7 @@ from mujoco_warp._src.types import BiasType
 from mujoco_warp._src.types import TrnType
 from mujoco_warp._src.types import vec10
 from mujoco_warp._src.util_pkg import check_version
+from mujoco_warp._src.warp_util import launch
 
 
 def _is_array_spec(typ) -> bool:
@@ -1632,8 +1633,8 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
 
   reset_input = reset or wp.ones(d.nworld, dtype=bool)
 
-  wp.launch(reset_xfrc_applied, dim=(d.nworld, m.nbody, 6), inputs=[reset_input], outputs=[d.xfrc_applied])
-  wp.launch(
+  launch(reset_xfrc_applied, dim=(d.nworld, m.nbody, 6), inputs=[reset_input], outputs=[d.xfrc_applied])
+  launch(
     reset_qM,
     dim=(d.nworld, d.qM.shape[1], d.qM.shape[2]),
     inputs=[reset_input],
@@ -1641,7 +1642,7 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
   )
 
   # set mocap_pos/quat = body_pos/quat for mocap bodies
-  wp.launch(
+  launch(
     reset_mocap,
     dim=(d.nworld, m.nbody),
     inputs=[m.body_mocapid, m.body_pos, m.body_quat, reset_input],
@@ -1649,7 +1650,7 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
   )
 
   # clear contacts
-  wp.launch(
+  launch(
     reset_contact,
     dim=d.naconmax,
     inputs=[d.nacon, reset_input, d.contact.efc_address.shape[1]],
@@ -1673,7 +1674,7 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
     ],
   )
 
-  wp.launch(
+  launch(
     reset_nworld,
     dim=d.nworld,
     inputs=[m.nq, m.nv, m.nu, m.na, m.neq, m.nsensordata, m.qpos0, m.eq_active0, d.nworld, reset_input],
@@ -2205,10 +2206,10 @@ def set_const_fixed(m: types.Model, d: types.Data):
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
   """
-  wp.launch(_init_subtreemass, dim=(d.nworld, m.nbody), inputs=[m.body_mass], outputs=[m.body_subtreemass])
+  launch(_init_subtreemass, dim=(d.nworld, m.nbody), inputs=[m.body_mass], outputs=[m.body_subtreemass])
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
-    wp.launch(
+    launch(
       _accumulate_subtreemass,
       dim=(d.nworld, body_tree.size),
       inputs=[m.body_parentid, m.body_subtreemass, body_tree],
@@ -2240,7 +2241,7 @@ def set_const_0(m: types.Model, d: types.Data):
   """
   qpos_saved = wp.clone(d.qpos)
 
-  wp.launch(_copy_qpos0_to_qpos, dim=(d.nworld, m.nq), inputs=[m.qpos0], outputs=[d.qpos])
+  launch(_copy_qpos0_to_qpos, dim=(d.nworld, m.nq), inputs=[m.qpos0], outputs=[d.qpos])
 
   smooth.kinematics(m, d)
   smooth.com_pos(m, d)
@@ -2253,14 +2254,14 @@ def set_const_0(m: types.Model, d: types.Data):
   smooth.transmission(m, d)
 
   # Compute meaninertia from qM diagonal at qpos0
-  wp.launch(
+  launch(
     _compute_meaninertia,
     dim=d.nworld,
     inputs=[m.nv, m.is_sparse, m.dof_Madr, d.qM],
     outputs=[m.stat.meaninertia],
   )
 
-  wp.launch(_copy_tendon_length0, dim=(d.nworld, m.ntendon), inputs=[d.ten_length], outputs=[m.tendon_length0])
+  launch(_copy_tendon_length0, dim=(d.nworld, m.ntendon), inputs=[d.ten_length], outputs=[m.tendon_length0])
 
   # dof_invweight0: computed per joint with averaging for multi-DOF joints
   # FREE: 6 DOFs, trans gets mean(A[0:3]), rot gets mean(A[3:6])
@@ -2273,11 +2274,11 @@ def set_const_0(m: types.Model, d: types.Data):
 
     # TODO(team): more efficient approach instead of looping over nv?
     for dofid in range(m.nv):
-      wp.launch(_set_unit_vector, dim=d.nworld, inputs=[dofid], outputs=[unit_vec])
+      launch(_set_unit_vector, dim=d.nworld, inputs=[dofid], outputs=[unit_vec])
       smooth.solve_m(m, d, result_vec, unit_vec)
-      wp.launch(_extract_dof_A_diag, dim=d.nworld, inputs=[dofid, result_vec], outputs=[dof_A_diag])
+      launch(_extract_dof_A_diag, dim=d.nworld, inputs=[dofid, result_vec], outputs=[dof_A_diag])
 
-    wp.launch(
+    launch(
       _finalize_dof_invweight0,
       dim=(d.nworld, m.nv),
       inputs=[m.dof_jntid, m.jnt_type, m.jnt_dofadr, dof_A_diag],
@@ -2294,7 +2295,7 @@ def set_const_0(m: types.Model, d: types.Data):
     # TODO(team): more efficient approach instead of nested iterations?
     for bodyid in range(1, m.nbody):
       for row_idx in range(6):
-        wp.launch(
+        launch(
           _compute_body_jac_row,
           dim=d.nworld,
           inputs=[
@@ -2313,14 +2314,14 @@ def set_const_0(m: types.Model, d: types.Data):
           outputs=[body_jac_row],
         )
         smooth.solve_m(m, d, body_result_vec, body_jac_row)
-        wp.launch(
+        launch(
           _compute_body_A_diag_entry,
           dim=d.nworld,
           inputs=[m.nv, bodyid, row_idx, body_jac_row, body_result_vec],
           outputs=[body_A_diag],
         )
 
-    wp.launch(
+    launch(
       _finalize_body_invweight0,
       dim=(d.nworld, m.nbody),
       inputs=[m.body_weldid, body_A_diag],
@@ -2336,28 +2337,28 @@ def set_const_0(m: types.Model, d: types.Data):
 
     for tenid in range(m.ntendon):
       ten_J_vec.zero_()
-      wp.launch(
+      launch(
         _copy_tendon_jacobian,
         dim=d.nworld,
         inputs=[tenid, m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, d.ten_J],
         outputs=[ten_J_vec],
       )
       smooth.solve_m(m, d, ten_result_vec, ten_J_vec)
-      wp.launch(
+      launch(
         _compute_tendon_dot_product,
         dim=d.nworld,
         inputs=[m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, tenid, d.ten_J, ten_result_vec],
         outputs=[m.tendon_invweight0],
       )
 
-  wp.launch(
+  launch(
     _compute_cam_pos0,
     dim=(d.nworld, m.ncam),
     inputs=[m.cam_bodyid, m.cam_targetbodyid, d.cam_xpos, d.cam_xmat, d.xpos, d.subtree_com],
     outputs=[m.cam_pos0, m.cam_poscom0, m.cam_mat0],
   )
 
-  wp.launch(
+  launch(
     _compute_light_pos0,
     dim=(d.nworld, m.nlight),
     inputs=[m.light_bodyid, m.light_targetbodyid, d.light_xpos, d.light_xdir, d.xpos, d.subtree_com],
@@ -2370,25 +2371,25 @@ def set_const_0(m: types.Model, d: types.Data):
     act_result_vec = wp.zeros((d.nworld, m.nv), dtype=float)
 
     for actid in range(m.nu):
-      wp.launch(
+      launch(
         _copy_actuator_moment,
         dim=d.nworld,
         inputs=[actid, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
         outputs=[act_moment_vec],
       )
       smooth.solve_m(m, d, act_result_vec, act_moment_vec)
-      wp.launch(_compute_actuator_acc0, dim=d.nworld, inputs=[actid, m.nv, act_result_vec], outputs=[m.actuator_acc0])
+      launch(_compute_actuator_acc0, dim=d.nworld, inputs=[actid, m.nv, act_result_vec], outputs=[m.actuator_acc0])
 
   # resolve dampratio: compute dof_M0, then convert dampratio to damping
   if m.nu > 0 and m.nv > 0:
     dof_M0 = wp.zeros((d.nworld, m.nv), dtype=float)
-    wp.launch(
+    launch(
       _compute_dof_M0,
       dim=(d.nworld, m.nv),
       inputs=[m.dof_bodyid, m.dof_armature, d.cdof, d.crb],
       outputs=[dof_M0],
     )
-    wp.launch(
+    launch(
       _resolve_dampratio,
       dim=(d.nworld, m.nu),
       inputs=[
@@ -2478,7 +2479,7 @@ def set_length_range(m: types.Model, d: types.Data, index: int = -1):
   if m.nu == 0:
     return
 
-  wp.launch(
+  launch(
     _set_length_range,
     dim=(d.nworld, m.nu),
     inputs=[
@@ -2830,7 +2831,7 @@ def create_render_context(
   for idx, cam_id in enumerate(active_cam_indices):
     img_w = cam_res_np[idx][0]
     img_h = cam_res_np[idx][1]
-    wp.launch(
+    launch(
       kernel=_build_rays,
       dim=(img_w, img_h),
       inputs=[

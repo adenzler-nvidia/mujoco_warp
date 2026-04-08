@@ -44,6 +44,7 @@ from mujoco_warp._src.types import mat43
 from mujoco_warp._src.types import vec5
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -1485,7 +1486,7 @@ def primitive_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_ta
       _PRIMITIVE_COLLISION_TYPES.append(types)
       _PRIMITIVE_COLLISION_FUNC.append(func)
 
-  wp.launch(
+  launch(
     _primitive_narrowphase(_PRIMITIVE_COLLISION_TYPES, _PRIMITIVE_COLLISION_FUNC),
     dim=d.naconmax,
     inputs=[

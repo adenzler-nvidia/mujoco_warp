@@ -18,6 +18,7 @@ import warp as wp
 
 from mujoco_warp._src.types import ProjectionType
 from mujoco_warp._src.types import RenderContext
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -54,7 +55,7 @@ def create_warp_texture(mjm: mujoco.MjModel, tex_id: int) -> wp.array:
   nchannel = mjm.tex_nchannel[tex_id]
   tex_data = wp.zeros((tex_height, tex_width, 4), dtype=float)
 
-  wp.launch(
+  launch(
     _convert_texture_data,
     dim=(tex_width, tex_height),
     inputs=[tex_width, tex_adr, nchannel, wp.array(mjm.tex_data, dtype=wp.uint8)],
@@ -182,7 +183,7 @@ def get_rgb(rc: RenderContext, camera_index: int, rgb_out: wp.array3d[wp.vec3]):
     camera_index: The index of the camera to get the RGB data for.
     rgb_out: The output array to store the RGB data in, with shape (nworld, height, width).
   """
-  wp.launch(
+  launch(
     unpack_rgb_kernel,
     dim=(rgb_out.shape[0], rgb_out.shape[1] * rgb_out.shape[2]),
     inputs=[rc.rgb_data, rc.rgb_adr, camera_index],
@@ -200,7 +201,7 @@ def get_depth(rc: RenderContext, camera_index: int, depth_scale: float, depth_ou
     depth_out: The output array to store the scaled and clamped depth data in
       with shape (nworld, height, width).
   """
-  wp.launch(
+  launch(
     extract_depth_kernel,
     dim=(depth_out.shape[0], depth_out.shape[1] * depth_out.shape[2]),
     inputs=[rc.depth_data, rc.depth_adr, camera_index, depth_scale],
@@ -238,7 +239,7 @@ def get_segmentation(rc: RenderContext, camera_index: int, seg_out: wp.array3d[i
     seg_out: The output array to store the geom IDs in, with shape
       (nworld, height, width).
   """
-  wp.launch(
+  launch(
     _extract_seg_kernel,
     dim=(seg_out.shape[0], seg_out.shape[1] * seg_out.shape[2]),
     inputs=[rc.seg_data, rc.seg_adr, camera_index],

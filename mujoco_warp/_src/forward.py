@@ -44,6 +44,7 @@ from mujoco_warp._src.types import TrnType
 from mujoco_warp._src.types import vec10f
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -215,7 +216,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   # TODO(team): can we assume static timesteps?
 
   # advance activations
-  wp.launch(
+  launch(
     _next_activation,
     dim=(d.nworld, m.nu),
     inputs=[
@@ -234,7 +235,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
     outputs=[d.act],
   )
 
-  wp.launch(
+  launch(
     _next_velocity,
     dim=(d.nworld, m.nv),
     inputs=[m.opt.timestep, d.qvel, qacc, 1.0],
@@ -244,14 +245,14 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   # advance positions with qvel if given, d.qvel otherwise (semi-implicit)
   qvel_in = qvel or d.qvel
 
-  wp.launch(
+  launch(
     _next_position,
     dim=(d.nworld, m.njnt),
     inputs=[m.opt.timestep, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, d.qpos, qvel_in, 1.0],
     outputs=[d.qpos],
   )
 
-  wp.launch(
+  launch(
     _next_time,
     dim=d.nworld,
     inputs=[
@@ -333,7 +334,7 @@ def euler(m: Model, d: Data):
       qM = wp.clone(d.qM)
       qLD = wp.empty((d.nworld, 1, m.nC), dtype=float)
       qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
-      wp.launch(
+      launch(
         _euler_damp_qfrc_sparse,
         dim=(d.nworld, m.nv),
         inputs=[m.opt.timestep, m.dof_Madr, m.dof_damping],
@@ -363,7 +364,7 @@ def _rk_perturb_state(
   act_t0: Optional[wp.array] = None,
 ):
   # position
-  wp.launch(
+  launch(
     _next_position,
     dim=(d.nworld, m.njnt),
     inputs=[m.opt.timestep, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, qpos_t0, d.qvel, scale],
@@ -371,7 +372,7 @@ def _rk_perturb_state(
   )
 
   # velocity
-  wp.launch(
+  launch(
     _next_velocity,
     dim=(d.nworld, m.nv),
     inputs=[m.opt.timestep, qvel_t0, d.qacc, scale],
@@ -380,7 +381,7 @@ def _rk_perturb_state(
 
   # activation
   if m.na and act_t0 is not None:
-    wp.launch(
+    launch(
       _next_activation,
       dim=(d.nworld, m.nu),
       inputs=[
@@ -438,7 +439,7 @@ def _rk_accumulate(
   act_dot_rk: Optional[wp.array] = None,
 ):
   """Computes one term of 1/6 k_1 + 1/3 k_2 + 1/3 k_3 + 1/6 k_4."""
-  wp.launch(
+  launch(
     _rk_accumulate_velocity_acceleration,
     dim=(d.nworld, m.nv),
     inputs=[d.qvel, d.qacc, scale],
@@ -446,7 +447,7 @@ def _rk_accumulate(
   )
 
   if m.na and act_dot_rk is not None:
-    wp.launch(
+    launch(
       _rk_accumulate_activation_velocity,
       dim=(d.nworld, m.na),
       inputs=[d.act_dot, scale],
@@ -592,7 +593,7 @@ def _tendon_velocity(
 @event_scope
 def fwd_velocity(m: Model, d: Data):
   """Velocity-dependent computations."""
-  wp.launch(
+  launch(
     _actuator_velocity,
     dim=(d.nworld, m.nu),
     inputs=[d.qvel, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
@@ -600,7 +601,7 @@ def fwd_velocity(m: Model, d: Data):
     block_dim=m.block_dim.actuator_velocity,
   )
 
-  wp.launch(
+  launch(
     _tendon_velocity,
     dim=(d.nworld, m.ntendon),
     inputs=[m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, d.qvel, d.ten_J],
@@ -841,7 +842,7 @@ def fwd_actuation(m: Model, d: Data):
     d.qfrc_actuator.zero_()
     return
 
-  wp.launch(
+  launch(
     _actuator_force,
     dim=(d.nworld, m.nu),
     inputs=[
@@ -883,14 +884,14 @@ def fwd_actuation(m: Model, d: Data):
   if m.ntendon:
     # total actuator force at tendon
     ten_actfrc = wp.zeros((d.nworld, m.ntendon), dtype=float)
-    wp.launch(
+    launch(
       _tendon_actuator_force,
       dim=(d.nworld, m.nu),
       inputs=[m.actuator_trntype, m.actuator_trnid, d.actuator_force],
       outputs=[ten_actfrc],
     )
 
-    wp.launch(
+    launch(
       _tendon_actuator_force_clamp,
       dim=(d.nworld, m.nu),
       inputs=[m.tendon_actfrclimited, m.tendon_actfrcrange, m.actuator_trntype, m.actuator_trnid, ten_actfrc],
@@ -899,7 +900,7 @@ def fwd_actuation(m: Model, d: Data):
 
   # TODO(team): optimize performance
   d.qfrc_actuator.zero_()
-  wp.launch(
+  launch(
     _qfrc_actuator,
     dim=(d.nworld, m.nu),
     inputs=[
@@ -911,7 +912,7 @@ def fwd_actuation(m: Model, d: Data):
     ],
     outputs=[d.qfrc_actuator],
   )
-  wp.launch(
+  launch(
     _qfrc_actuator_gravcomp_limits,
     dim=(d.nworld, m.nv),
     inputs=[
@@ -955,7 +956,7 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize inertia matrix.
   """
-  wp.launch(
+  launch(
     _qfrc_smooth,
     dim=(d.nworld, m.nv),
     inputs=[d.qfrc_applied, d.qfrc_bias, d.qfrc_passive, d.qfrc_actuator],

@@ -20,6 +20,7 @@ from mujoco_warp._src.types import ConstraintType
 from mujoco_warp._src.types import EqType
 from mujoco_warp._src.types import ObjType
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 
 @wp.kernel
@@ -154,7 +155,7 @@ def _tree_edges(
 def tree_edges(m: types.Model, d: types.Data, tree_tree: wp.array3d[int]):
   """Compute tree-tree adjacency matrix."""
   tree_tree.zero_()
-  wp.launch(
+  launch(
     kernel=_tree_edges,
     dim=(d.nworld, d.njmax),
     inputs=[
@@ -257,7 +258,7 @@ def island(m: types.Model, d: types.Data):
   d.tree_island.fill_(-1)
   stack_scratch = wp.empty((d.nworld, m.ntree * m.ntree), dtype=int)
 
-  wp.launch(
+  launch(
     _flood_fill,
     dim=d.nworld,
     inputs=[m.ntree, tree_tree, d.tree_island, stack_scratch],

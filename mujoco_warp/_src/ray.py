@@ -25,6 +25,7 @@ from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import RenderContext
 from mujoco_warp._src.types import vec6
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -1281,7 +1282,7 @@ def rays(
       block_dim=m.block_dim.ray,
     )
   else:
-    wp.launch(
+    launch(
       _ray_bvh,
       dim=(d.nworld, pnt.shape[1]),
       inputs=[

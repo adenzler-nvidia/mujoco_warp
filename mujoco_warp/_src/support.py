@@ -29,6 +29,7 @@ from mujoco_warp._src.types import vec5
 from mujoco_warp._src.types import vec10f
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -155,7 +156,7 @@ def mul_m(
     M = d.qM
 
   if m.is_sparse:
-    wp.launch(
+    launch(
       mul_m_sparse(check_skip),
       dim=(d.nworld, m.nv),
       inputs=[m.qM_mulm_rowadr, m.qM_mulm_col, m.qM_mulm_madr, M, vec, skip],
@@ -163,7 +164,7 @@ def mul_m(
     )
 
   else:
-    wp.launch(
+    launch(
       mul_m_dense(m.nv, check_skip),
       dim=(d.nworld, m.nv),
       inputs=[M, vec, skip],
@@ -217,7 +218,7 @@ def _apply_ft(
 
 
 def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool):
-  wp.launch(
+  launch(
     kernel=_apply_ft,
     dim=(d.nworld, m.nv),
     inputs=[m.nbody, m.body_parentid, m.body_rootid, m.dof_bodyid, d.xipos, d.subtree_com, d.cdof, ft, flg_add],
@@ -361,7 +362,7 @@ def contact_force(m: Model, d: Data, contact_ids: wp.array[int], to_world_frame:
     to_world_frame: If True, map force from contact to world frame.
     force: Contact forces.
   """
-  wp.launch(
+  launch(
     contact_force_kernel,
     dim=contact_ids.size,
     inputs=[
@@ -493,7 +494,7 @@ def jac(
   jacp_arr = jacp or wp.empty((0, 0, 0), dtype=float)
   jacr_arr = jacr or wp.empty((0, 0, 0), dtype=float)
 
-  wp.launch(
+  launch(
     kernel,
     dim=(d.nworld, m.nv),
     inputs=[m.body_parentid, m.body_rootid, m.dof_bodyid, d.subtree_com, d.cdof, point, body],
@@ -679,7 +680,7 @@ def get_state(m: Model, d: Data, state: wp.array2d[float], sig: int, active: Opt
             state_out[worldid, adr + 3] = quat[3]
             adr += 4
 
-  wp.launch(
+  launch(
     _get_state,
     dim=d.nworld,
     inputs=[
@@ -823,7 +824,7 @@ def set_state(m: Model, d: Data, state: wp.array2d[float], sig: int, active: Opt
             mocap_quat_out[worldid, j] = quat
             adr += 4
 
-  wp.launch(
+  launch(
     _set_state,
     dim=d.nworld,
     inputs=[

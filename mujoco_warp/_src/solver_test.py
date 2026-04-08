@@ -1,4 +1,6 @@
 # Copyright 2025 The Newton Developers
+from mujoco_warp._src.warp_util import launch
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -626,7 +628,7 @@ class SolverTest(parameterized.TestCase):
         d.efc.force.zero_()
         ctx = solver.create_solver_context(m, d)
         solver.init_context(m, d, ctx, grad=True)
-        wp.launch(solver.solve_init_search, dim=(d.nworld, m.nv), inputs=[ctx.Mgrad], outputs=[ctx.search, ctx.search_dot])
+        launch(solver.solve_init_search, dim=(d.nworld, m.nv), inputs=[ctx.Mgrad], outputs=[ctx.search, ctx.search_dot])
         step_size_cost = wp.empty((d.nworld, 0), dtype=float)
         any_changes = False
         for _ in range(m.opt.iterations):
@@ -639,8 +641,8 @@ class SolverTest(parameterized.TestCase):
             if np.any(ctx.changed_efc_count.numpy() > 0):
               any_changes = True
           update_fn(m, d, ctx)
-          wp.launch(solver.solve_zero_search_dot, dim=(d.nworld), inputs=[ctx.done], outputs=[ctx.search_dot])
-          wp.launch(
+          launch(solver.solve_zero_search_dot, dim=(d.nworld), inputs=[ctx.done], outputs=[ctx.search_dot])
+          launch(
             solver.solve_search_update,
             dim=(d.nworld, m.nv),
             inputs=[m.opt.solver, ctx.Mgrad, ctx.search, ctx.beta, ctx.done],

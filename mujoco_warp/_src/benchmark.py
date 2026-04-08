@@ -1,4 +1,6 @@
 # Copyright 2025 The Newton Developers
+from mujoco_warp._src.warp_util import launch
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -141,7 +143,7 @@ def benchmark(
       with wp.ScopedStream(wp.get_stream()):
         if ctrls is not None:
           center = wp.array(ctrls[i], dtype=wp.float32)
-        wp.launch(
+        launch(
           ctrl_noise,
           dim=(d.nworld, m.nu),
           inputs=[m.opt.timestep, m.actuator_ctrllimited, m.actuator_ctrlrange, d.ctrl, center, i, 0.01, 0.1],

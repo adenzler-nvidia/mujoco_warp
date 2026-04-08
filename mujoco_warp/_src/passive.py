@@ -24,6 +24,7 @@ from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import JointType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -503,7 +504,7 @@ def _fluid_force(
 def _fluid(m: Model, d: Data):
   fluid_applied = wp.empty((d.nworld, m.nbody), dtype=wp.spatial_vector)
 
-  wp.launch(
+  launch(
     _fluid_force,
     dim=(d.nworld, m.nbody),
     inputs=[
@@ -739,7 +740,7 @@ def passive(m: Model, d: Data):
     d.qfrc_passive.zero_()
     return
 
-  wp.launch(
+  launch(
     _spring_damper_dof_passive,
     dim=(d.nworld, m.njnt),
     inputs=[
@@ -757,7 +758,7 @@ def passive(m: Model, d: Data):
   )
 
   if m.ntendon:
-    wp.launch(
+    launch(
       _spring_damper_tendon_passive,
       dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
       inputs=[
@@ -780,7 +781,7 @@ def passive(m: Model, d: Data):
     )
 
   if not dsbl_spring:
-    wp.launch(
+    launch(
       _flex_elasticity,
       dim=(d.nworld, m.nflexelem),
       inputs=[
@@ -807,7 +808,7 @@ def passive(m: Model, d: Data):
       ],
       outputs=[d.qfrc_spring],
     )
-    wp.launch(
+    launch(
       _flex_bending,
       dim=(d.nworld, m.nflexedge),
       inputs=[
@@ -830,7 +831,7 @@ def passive(m: Model, d: Data):
 
   if gravcomp:
     d.qfrc_gravcomp.zero_()
-    wp.launch(
+    launch(
       _gravity_force,
       dim=(d.nworld, m.nbody - 1, m.nv),
       inputs=[
@@ -850,7 +851,7 @@ def passive(m: Model, d: Data):
   if m.has_fluid:
     _fluid(m, d)
 
-  wp.launch(
+  launch(
     _qfrc_passive,
     dim=(d.nworld, m.nv),
     inputs=[

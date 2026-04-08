@@ -29,6 +29,7 @@ from mujoco_warp._src.collision_gjk import support
 from mujoco_warp._src.types import MJ_MAX_EPAFACES
 from mujoco_warp._src.types import MJ_MAX_EPAHORIZON
 from mujoco_warp._src.types import mat63
+from mujoco_warp._src.warp_util import launch
 
 
 def _geom_dist(
@@ -233,7 +234,7 @@ def _geom_dist(
   dist_out = wp.array(shape=(1,), dtype=float)
   ncon_out = wp.array(shape=(1,), dtype=int)
   pos_out = wp.array(shape=(2,), dtype=wp.vec3)
-  wp.launch(
+  launch(
     _ccd_kernel,
     dim=1,
     inputs=[
@@ -858,7 +859,7 @@ class GJKTest(parameterized.TestCase):
 
     support_point = wp.empty(4, dtype=wp.vec3)
 
-    wp.launch(
+    launch(
       _support_kernel,
       dim=1,
       inputs=[prism, eps],

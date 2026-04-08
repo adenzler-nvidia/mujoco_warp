@@ -44,6 +44,7 @@ from mujoco_warp._src.types import mat63
 from mujoco_warp._src.types import vec5
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 # TODO(team): improve compile time to enable backward pass
 wp.set_module_options({"enable_backward": False})
@@ -1180,7 +1181,7 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
     g2 = geom_pair[1].value
     count, geomgeomid = _pair_count(g1, g2)
     if (g1 == GeomType.HFIELD or g2 == GeomType.HFIELD) and count:
-      wp.launch(
+      launch(
         ccd_hfield_kernel_builder(g1, g2, m.opt.ccd_iterations, epa_iterations, geomgeomid),
         dim=d.naconmax,
         inputs=[
@@ -1272,7 +1273,7 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
     g2 = geom_pair[1].value
     count, geomgeomid = _pair_count(g1, g2)
     if g1 != GeomType.HFIELD and g2 != GeomType.HFIELD and count:
-      wp.launch(
+      launch(
         ccd_kernel_builder(g1, g2, m.opt.ccd_iterations, epa_iterations, use_multiccd, geomgeomid),
         dim=d.naconmax,
         inputs=[

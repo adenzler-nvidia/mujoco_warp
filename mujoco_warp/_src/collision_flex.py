@@ -24,6 +24,7 @@ from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import vec5
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -688,7 +689,7 @@ def flex_narrowphase(m: Model, d: Data):
   if m.nflex == 0:
     return
 
-  wp.launch(
+  launch(
     _flex_narrowphase_dim2,
     dim=(d.nworld, m.nflexelem),
     inputs=[
@@ -739,7 +740,7 @@ def flex_narrowphase(m: Model, d: Data):
     ],
   )
 
-  wp.launch(
+  launch(
     _flex_narrowphase_dim3,
     dim=(d.nworld, m.nflexshelldata // 3),
     inputs=[
@@ -789,7 +790,7 @@ def flex_narrowphase(m: Model, d: Data):
     ],
   )
 
-  wp.launch(
+  launch(
     _flex_plane_narrowphase,
     dim=(d.nworld, m.nflexvert),
     inputs=[

@@ -1,4 +1,6 @@
 # Copyright 2025 The Newton Developers
+from mujoco_warp._src.warp_util import launch
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -885,7 +887,7 @@ class SensorTest(parameterized.TestCase):
 
     def my_sensor(m, d, stage):
       if stage == 1:  # VEL
-        wp.launch(_set_sensordata, dim=(d.nworld,), outputs=[d.sensordata])
+        launch(_set_sensordata, dim=(d.nworld,), outputs=[d.sensordata])
 
     m.callback.sensor = my_sensor
     mjw.forward(m, d)

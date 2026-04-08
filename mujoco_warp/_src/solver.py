@@ -27,6 +27,7 @@ from mujoco_warp._src.block_cholesky import create_blocked_cholesky_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 from mujoco_warp._src.warp_util import scoped_mathdx_gemm_disabled
 
 wp.set_module_options({"enable_backward": False})
@@ -487,7 +488,7 @@ def _linesearch_parallel(m: types.Model, d: types.Data, ctx: SolverContext, cost
   if threads_per_efc > 1:
     ctx.quad_gauss.zero_()
 
-  wp.launch(
+  launch(
     linesearch_prepare_gauss(m.nv, dofs_per_thread),
     dim=(d.nworld, threads_per_efc),
     inputs=[d.qfrc_smooth, d.efc.Ma, ctx.search, ctx.gauss, ctx.mv, ctx.done],
@@ -496,7 +497,7 @@ def _linesearch_parallel(m: types.Model, d: types.Data, ctx: SolverContext, cost
 
   # quad = [0.5 * Jaref * Jaref * efc_D, jv * Jaref * efc_D, 0.5 * jv * jv * efc_D]
 
-  wp.launch(
+  launch(
     linesearch_prepare_quad,
     dim=(d.nworld, d.njmax),
     inputs=[
@@ -516,7 +517,7 @@ def _linesearch_parallel(m: types.Model, d: types.Data, ctx: SolverContext, cost
     outputs=[ctx.quad],
   )
 
-  wp.launch(
+  launch(
     linesearch_parallel_fused,
     dim=(d.nworld, m.opt.ls_iterations),
     inputs=[
@@ -543,7 +544,7 @@ def _linesearch_parallel(m: types.Model, d: types.Data, ctx: SolverContext, cost
     outputs=[cost],
   )
 
-  wp.launch(
+  launch(
     linesearch_parallel_best_alpha,
     dim=(d.nworld),
     inputs=[m.opt.ls_iterations, m.opt.ls_parallel_min_step, ctx.done, cost],
@@ -551,14 +552,14 @@ def _linesearch_parallel(m: types.Model, d: types.Data, ctx: SolverContext, cost
   )
 
   # Teardown: update qacc, Ma, Jaref
-  wp.launch(
+  launch(
     linesearch_qacc_ma,
     dim=(d.nworld, m.nv),
     inputs=[ctx.search, ctx.mv, ctx.alpha, ctx.done],
     outputs=[d.qacc, d.efc.Ma],
   )
 
-  wp.launch(
+  launch(
     linesearch_jaref,
     dim=(d.nworld, d.njmax),
     inputs=[d.nefc, ctx.jv, ctx.alpha, ctx.done],
@@ -1683,14 +1684,14 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, cost: wp.arra
     threads_per_efc = ceil(m.nv / dofs_per_thread)
 
     if threads_per_efc > 1:
-      wp.launch(
+      launch(
         linesearch_zero_jv,
         dim=(d.nworld, d.njmax),
         inputs=[d.nefc, ctx.done],
         outputs=[ctx.jv],
       )
 
-    wp.launch(
+    launch(
       linesearch_jv_fused(m.is_sparse, m.nv, dofs_per_thread),
       dim=(d.nworld, d.njmax, threads_per_efc),
       inputs=[d.nefc, d.efc.J_rownnz, d.efc.J_rowadr, d.efc.J_colind, d.efc.J, ctx.search, ctx.done],
@@ -2153,7 +2154,7 @@ def update_gradient_h_incremental_sparse(
 
 def _update_constraint(m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, track_changes: bool = False):
   """Update constraint arrays after each solve iteration."""
-  wp.launch(
+  launch(
     update_constraint_init_cost,
     dim=(d.nworld),
     inputs=[ctx.cost, ctx.done],
@@ -2177,7 +2178,7 @@ def _update_constraint(m: types.Model, d: types.Data, ctx: SolverContext | Inver
     ctx.done,
   ]
 
-  wp.launch(
+  launch(
     update_constraint_efc(track_changes),
     dim=(d.nworld, d.njmax),
     inputs=efc_inputs,
@@ -2187,14 +2188,14 @@ def _update_constraint(m: types.Model, d: types.Data, ctx: SolverContext | Inver
   # qfrc_constraint = efc_J.T @ efc_force
   if m.is_sparse:
     d.qfrc_constraint.zero_()
-    wp.launch(
+    launch(
       update_constraint_init_qfrc_constraint_sparse,
       dim=(d.nworld, d.njmax),
       inputs=[d.nefc, d.efc.J_rownnz, d.efc.J_rowadr, d.efc.J_colind, d.efc.J, d.efc.force, ctx.done],
       outputs=[d.qfrc_constraint],
     )
   else:
-    wp.launch(
+    launch(
       update_constraint_init_qfrc_constraint_dense,
       dim=(d.nworld, m.nv),
       inputs=[d.nefc, d.efc.J, d.efc.force, d.njmax, ctx.done],
@@ -2211,7 +2212,7 @@ def _update_constraint(m: types.Model, d: types.Data, ctx: SolverContext | Inver
   threads_per_efc = ceil(m.nv / dofs_per_thread)
 
   # gauss = 0.5 * (Ma - qfrc_smooth).T @ (qacc - qacc_smooth)
-  wp.launch(
+  launch(
     update_constraint_gauss_cost(m.nv, dofs_per_thread),
     dim=(d.nworld, threads_per_efc),
     inputs=[d.qacc, d.qfrc_smooth, d.qacc_smooth, d.efc.Ma, ctx.done],
@@ -2807,7 +2808,7 @@ def _cholesky_factorize_solve(m: types.Model, d: types.Data, ctx: SolverContext)
       block_dim=m.block_dim.update_gradient_cholesky,
     )
   else:
-    wp.launch(
+    launch(
       padding_h,
       dim=(d.nworld, m.nv_pad - m.nv),
       inputs=[m.nv, ctx.done],
@@ -2878,9 +2879,9 @@ def _JTDAJ_sparse(
 
 def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext):
   # grad = Ma - qfrc_smooth - qfrc_constraint
-  wp.launch(update_gradient_zero_grad_dot, dim=(d.nworld), inputs=[ctx.done], outputs=[ctx.grad_dot])
+  launch(update_gradient_zero_grad_dot, dim=(d.nworld), inputs=[ctx.done], outputs=[ctx.grad_dot])
 
-  wp.launch(
+  launch(
     update_gradient_grad,
     dim=(d.nworld, m.nv),
     inputs=[d.qfrc_smooth, d.qfrc_constraint, d.efc.Ma, ctx.done],
@@ -2893,14 +2894,14 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext):
     # h = qM + (efc_J.T * efc_D * active) @ efc_J
     if m.is_sparse:
       ctx.h.zero_()
-      wp.launch(
+      launch(
         _JTDAJ_sparse,
         dim=(d.nworld, d.njmax),
         inputs=[d.nefc, d.efc.J_rownnz, d.efc.J_rowadr, d.efc.J_colind, d.efc.J, d.efc.D, d.efc.state, ctx.done],
         outputs=[ctx.h],
       )
 
-      wp.launch(
+      launch(
         update_gradient_set_h_qM_lower_sparse,
         dim=(d.nworld, m.qM_fullm_i.size),
         inputs=[m.qM_fullm_i, m.qM_fullm_j, d.qM, ctx.done],
@@ -2948,7 +2949,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext):
       nblocks_perblock = int((d.naconmax + dim_block - 1) / dim_block)
 
       if m.is_sparse:
-        wp.launch(
+        launch(
           update_gradient_JTCJ_sparse,
           dim=(dim_block, m.dof_tri_row.size),
           inputs=[
@@ -2977,7 +2978,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext):
           outputs=[ctx.h],
         )
       else:
-        wp.launch(
+        launch(
           update_gradient_JTCJ_dense,
           dim=(dim_block, m.dof_tri_row.size),
           inputs=[
@@ -3014,9 +3015,9 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
   Skips the full J^T*D*J rebuild by applying only the delta from constraints
   that changed QUADRATIC state, then re-factorizes and solves.
   """
-  wp.launch(update_gradient_zero_grad_dot, dim=(d.nworld), inputs=[ctx.done], outputs=[ctx.grad_dot])
+  launch(update_gradient_zero_grad_dot, dim=(d.nworld), inputs=[ctx.done], outputs=[ctx.grad_dot])
 
-  wp.launch(
+  launch(
     update_gradient_grad,
     dim=(d.nworld, m.nv),
     inputs=[d.qfrc_smooth, d.qfrc_constraint, d.efc.Ma, ctx.done],
@@ -3025,7 +3026,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
 
   # Update lower triangle of H with delta from changed constraints
   if m.is_sparse:
-    wp.launch(
+    launch(
       update_gradient_h_incremental_sparse,
       dim=(d.nworld, ctx.changed_efc_ids.shape[1]),
       inputs=[
@@ -3042,7 +3043,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
     )
   else:
     lower_tri_dim = m.nv * (m.nv + 1) // 2
-    wp.launch(
+    launch(
       update_gradient_h_incremental,
       dim=(d.nworld, lower_tri_dim),
       inputs=[
@@ -3195,7 +3196,7 @@ def _solver_iteration(
   _linesearch(m, d, ctx, step_size_cost)
 
   if m.opt.solver == types.SolverType.CG:
-    wp.launch(
+    launch(
       solve_prev_grad_Mgrad,
       dim=(d.nworld, m.nv),
       inputs=[ctx.grad, ctx.Mgrad, ctx.done],
@@ -3221,23 +3222,23 @@ def _solver_iteration(
 
   # polak-ribiere
   if m.opt.solver == types.SolverType.CG:
-    wp.launch(
+    launch(
       solve_beta,
       dim=d.nworld,
       inputs=[m.nv, ctx.grad, ctx.Mgrad, ctx.prev_grad, ctx.prev_Mgrad, ctx.done],
       outputs=[ctx.beta],
     )
 
-  wp.launch(solve_zero_search_dot, dim=(d.nworld), inputs=[ctx.done], outputs=[ctx.search_dot])
+  launch(solve_zero_search_dot, dim=(d.nworld), inputs=[ctx.done], outputs=[ctx.search_dot])
 
-  wp.launch(
+  launch(
     solve_search_update,
     dim=(d.nworld, m.nv),
     inputs=[m.opt.solver, ctx.Mgrad, ctx.search, ctx.beta, ctx.done],
     outputs=[ctx.search, ctx.search_dot],
   )
 
-  wp.launch(
+  launch(
     solve_done,
     dim=d.nworld,
     inputs=[
@@ -3256,7 +3257,7 @@ def _solver_iteration(
 
 def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, grad: bool = True):
   # initialize some efc arrays
-  wp.launch(
+  launch(
     solve_init_efc,
     dim=(d.nworld),
     outputs=[d.solver_niter, ctx.search_dot, ctx.cost, ctx.done],
@@ -3277,7 +3278,7 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
   if threads_per_efc > 1:
     ctx.Jaref.zero_()
 
-  wp.launch(
+  launch(
     solve_init_jaref(m.is_sparse, m.nv, dofs_per_thread),
     dim=(d.nworld, d.njmax, threads_per_efc),
     inputs=[d.nefc, d.qacc, d.efc.J_rownnz, d.efc.J_rowadr, d.efc.J_colind, d.efc.J, d.efc.aref],
@@ -3314,7 +3315,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext):
   init_context(m, d, ctx, grad=True)
 
   # search = -Mgrad
-  wp.launch(
+  launch(
     solve_init_search,
     dim=(d.nworld, m.nv),
     inputs=[ctx.Mgrad],

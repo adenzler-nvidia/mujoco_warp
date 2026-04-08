@@ -36,6 +36,7 @@ from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import RenderContext
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -768,7 +769,7 @@ def render(m: Model, d: Data, rc: RenderContext):
       255.0,
     )
 
-  wp.launch(
+  launch(
     kernel=_render_megakernel,
     dim=(d.nworld, rc.total_rays),
     inputs=[

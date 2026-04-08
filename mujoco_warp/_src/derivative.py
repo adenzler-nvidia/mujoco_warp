@@ -24,6 +24,7 @@ from mujoco_warp._src.types import GainType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import vec10f
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -336,7 +337,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
     out.zero_()
     if m.nu > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
       vel = wp.empty((d.nworld, m.nu), dtype=float)
-      wp.launch(
+      launch(
         _qderiv_actuator_passive_vel,
         dim=(d.nworld, m.nu),
         inputs=[
@@ -362,20 +363,20 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
         outputs=[vel],
       )
       if m.is_sparse:
-        wp.launch(
+        launch(
           _qderiv_actuator_passive_actuation_sparse,
           dim=(d.nworld, m.nu),
           inputs=[m.M_rownnz, m.M_rowadr, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment, vel, qMj],
           outputs=[out],
         )
       else:
-        wp.launch(
+        launch(
           _qderiv_actuator_passive_actuation_dense,
           dim=(d.nworld, qMi.size),
           inputs=[m.nu, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment, vel, qMi, qMj],
           outputs=[out],
         )
-    wp.launch(
+    launch(
       _qderiv_actuator_passive,
       dim=(d.nworld, qMi.size),
       inputs=[
@@ -395,7 +396,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
     wp.copy(out, d.qM)
 
   if not (m.opt.disableflags & DisableBit.DAMPER):
-    wp.launch(
+    launch(
       _qderiv_tendon_damping,
       dim=(d.nworld, qMi.size),
       inputs=[

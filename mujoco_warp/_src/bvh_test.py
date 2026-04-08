@@ -1,4 +1,6 @@
 # Copyright 2026 The Newton Developers
+from mujoco_warp._src.warp_util import launch
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -75,7 +77,7 @@ class BvhTest(absltest.TestCase):
     mjm, mjd, m, d = test_data.fixture("primitives.xml")
     rc = _create_minimal_context(mjm, d.nworld)
 
-    wp.launch(
+    launch(
       kernel=bvh._compute_bvh_bounds,
       dim=(d.nworld, rc.bvh_ngeom),
       inputs=[
@@ -104,7 +106,7 @@ class BvhTest(absltest.TestCase):
     mjm, mjd, m, d = test_data.fixture("primitives.xml", nworld=4)
     rc = _create_minimal_context(mjm, d.nworld)
 
-    wp.launch(
+    launch(
       kernel=bvh._compute_bvh_bounds,
       dim=(d.nworld, rc.bvh_ngeom),
       inputs=[
@@ -225,7 +227,7 @@ class BvhTest(absltest.TestCase):
     flex_id = 0
     flexvert_norm = wp.zeros((nworld, nvert), dtype=wp.vec3)
 
-    wp.launch(
+    launch(
       kernel=bvh.accumulate_flex_vertex_normals,
       dim=(nworld, nelem),
       inputs=[1, flex_dim, flex_vertadr, flex_elemadr, flex_elemnum, flex_elemdataadr, flex_elem, flexvert_xpos],
@@ -245,7 +247,7 @@ class BvhTest(absltest.TestCase):
       dtype=wp.vec3,
     )
 
-    wp.launch(
+    launch(
       kernel=bvh.normalize_vertex_normals,
       dim=(nworld, nvert),
       inputs=[flexvert_norm],

@@ -36,6 +36,7 @@ from mujoco_warp._src.types import mat23
 from mujoco_warp._src.types import mat63
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -583,7 +584,7 @@ def sap_broadphase(m: Model, d: Data, ctx: CollisionContext):
   cumulative_sum = wp.empty((d.nworld, m.ngeom), dtype=int)
   segmented_index = wp.empty(d.nworld + 1 if m.opt.broadphase == BroadphaseType.SAP_SEGMENTED else 0, dtype=int)
 
-  wp.launch(
+  launch(
     kernel=_sap_project(m.opt.broadphase),
     dim=(d.nworld, m.ngeom),
     inputs=[m.ngeom, m.geom_rbound, m.geom_margin, d.geom_xpos, d.nworld, direction],
@@ -608,7 +609,7 @@ def sap_broadphase(m: Model, d: Data, ctx: CollisionContext):
       projection_lower.reshape((-1, m.ngeom)), sort_index.reshape((-1, m.ngeom)), nworldgeom, segmented_index
     )
 
-  wp.launch(
+  launch(
     kernel=_sap_range,
     dim=(d.nworld, m.ngeom),
     inputs=[m.ngeom, projection_lower.reshape((-1, m.ngeom)), projection_upper, sort_index.reshape((-1, m.ngeom))],
@@ -621,7 +622,7 @@ def sap_broadphase(m: Model, d: Data, ctx: CollisionContext):
   # estimate number of overlap checks
   # assumes each geom has 5 other geoms (batched over all worlds)
   nsweep = 5 * nworldgeom
-  wp.launch(
+  launch(
     kernel=_sap_broadphase(m.opt.broadphase_filter, m.geom_aabb.shape[0], m.geom_rbound.shape[0], m.geom_margin.shape[0]),
     dim=nsweep,
     inputs=[
@@ -708,7 +709,7 @@ def nxn_broadphase(m: Model, d: Data, ctx: CollisionContext):
   The initial list of pairs is filtered at model creation time to exclude pairs based on
   `contype`/`conaffinity`, parent-child relationships, and explicit `<exclude>` tags.
   """
-  wp.launch(
+  launch(
     _nxn_broadphase(m.opt.broadphase_filter, m.geom_aabb.shape[0], m.geom_rbound.shape[0], m.geom_margin.shape[0]),
     dim=(d.nworld, m.nxn_geom_pair_filtered.shape[0]),
     inputs=[
@@ -776,7 +777,7 @@ def collision(m: Model, d: Data):
   ctx = create_collision_context(d.naconmax)
 
   # zero counters
-  wp.launch(_zero_nacon_ncollision, dim=1, outputs=[d.nacon, d.ncollision])
+  launch(_zero_nacon_ncollision, dim=1, outputs=[d.nacon, d.ncollision])
 
   if m.opt.broadphase == BroadphaseType.NXN:
     nxn_broadphase(m, d, ctx)

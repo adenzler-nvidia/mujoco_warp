@@ -1,4 +1,6 @@
 # Copyright 2025 The Newton Developers
+from mujoco_warp._src.warp_util import launch
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -50,7 +52,7 @@ def _is_intersect(p1: np.array, p2: np.array, p3: np.array, p4: np.array) -> boo
   ):
     intersect_out[0] = util_misc.is_intersect(p1, p2, p3, p4)
 
-  wp.launch(
+  launch(
     is_intersect,
     dim=(1,),
     inputs=[
@@ -81,7 +83,7 @@ def _length_circle(p0: np.array, p1: np.array, ind: int, radius: float) -> float
   ):
     length_out[0] = util_misc.length_circle(p0, p1, ind, radius)
 
-  wp.launch(
+  launch(
     length_circle,
     dim=(1,),
     inputs=[wp.vec2(p0[0], p0[1]), wp.vec2(p1[0], p1[1]), ind, radius],
@@ -113,7 +115,7 @@ def _wrap_circle(end: np.array, side: np.array, radius: float) -> Tuple[float, n
     wpnt0_out[0] = wpnt0_
     wpnt1_out[0] = wpnt1_
 
-  wp.launch(
+  launch(
     wrap_circle,
     dim=(1,),
     inputs=[
@@ -150,7 +152,7 @@ def _wrap_inside(end: np.array, radius: float) -> Tuple[float, np.array, np.arra
     wpnt0_out[0] = wpnt0_
     wpnt1_out[0] = wpnt1_
 
-  wp.launch(
+  launch(
     wrap_inside,
     dim=(1,),
     inputs=[wp.vec4(end[0], end[1], end[2], end[3]), radius],
@@ -196,7 +198,7 @@ def _wrap(
     wpnt0_out[0] = wpnt0_
     wpnt1_out[0] = wpnt1_
 
-  wp.launch(
+  launch(
     wrap,
     dim=(1,),
     inputs=[
@@ -250,7 +252,7 @@ def _muscle_dynamics(ctrl, act, prm):
     dynamics_out[0] = util_misc.muscle_dynamics(control, activation, prm)
 
   output = wp.empty(1, dtype=float)
-  wp.launch(
+  launch(
     muscle_dynamics,
     dim=(1,),
     inputs=[
@@ -270,7 +272,7 @@ def _muscle_gain_length(length, lmin, lmax):
     gain_length_out[0] = util_misc.muscle_gain_length(length, lmin, lmax)
 
   output = wp.empty(1, dtype=float)
-  wp.launch(muscle_gain_length, dim=(1,), inputs=[length, lmin, lmax], outputs=[output])
+  launch(muscle_gain_length, dim=(1,), inputs=[length, lmin, lmax], outputs=[output])
 
   return output.numpy()[0]
 
@@ -283,7 +285,7 @@ def _muscle_dynamics_timescale(dctrl, tau_act, tau_deact, smooth_width):
     dynamics_timescale_out[0] = util_misc.muscle_dynamics_timescale(dctrl, tau_act, tau_deact, smooth_width)
 
   output = wp.empty(1, dtype=float)
-  wp.launch(
+  launch(
     muscle_gain_length,
     dim=(1,),
     inputs=[dctrl, tau_act, tau_deact, smooth_width],

@@ -27,6 +27,7 @@ from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.types import EnableBit
 from mujoco_warp._src.types import IntegratorType
 from mujoco_warp._src.types import Model
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -92,7 +93,7 @@ def discrete_acc(m: Model, d: Data, qacc: wp.array2d[float]):
     support.mul_m(m, d, qfrc, d.qacc)
 
     # qfrc += m.opt.timestep * m.dof_damping * d.qacc
-    wp.launch(
+    launch(
       _qfrc_eulerdamp,
       dim=(d.nworld, m.nv),
       inputs=[m.opt.timestep, m.dof_damping, d.qacc],
@@ -144,7 +145,7 @@ def inverse(m: Model, d: Data):
 
   support.mul_m(m, d, d.qfrc_inverse, d.qacc)
 
-  wp.launch(
+  launch(
     _qfrc_inverse,
     dim=(d.nworld, m.nv),
     inputs=[

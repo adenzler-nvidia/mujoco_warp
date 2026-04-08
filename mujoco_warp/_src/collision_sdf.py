@@ -32,6 +32,7 @@ from mujoco_warp._src.types import vec8i
 from mujoco_warp._src.types import vec_pluginattr
 from mujoco_warp._src.util_misc import halton
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -931,7 +932,7 @@ def _sdf_narrowphase(
 
 @event_scope
 def sdf_narrowphase(m: Model, d: Data, ctx: CollisionContext):
-  wp.launch(
+  launch(
     _sdf_narrowphase,
     dim=(m.opt.sdf_initpoints, d.naconmax),
     inputs=[

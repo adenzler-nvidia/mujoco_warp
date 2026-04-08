@@ -15,11 +15,109 @@
 
 import functools
 import inspect
+import math
 import warnings
 
 import warp as wp
 
 _STACK = None
+
+_WARP_SIZE = 32
+_WARP_DEFAULT_BLOCK_DIM = 256
+
+# Cache: (kernel_id, device_ordinal) -> (suggested_block_size, min_grid_size)
+_OCCUPANCY_CACHE: dict[tuple, tuple[int, int]] = {}
+
+# Cache: (kernel_id, device_ordinal, dim) -> block_dim
+_BLOCK_DIM_CACHE: dict[tuple, int] = {}
+
+
+def get_block_dim(
+  kernel: wp.Kernel,
+  dim: int | tuple[int, ...],
+  device: wp.DeviceLike = None,
+) -> int:
+  """Choose block_dim for wp.launch based on CUDA occupancy.
+
+  Uses ``wp.get_suggested_block_size`` to query the optimal block size and
+  the minimum grid size to fully utilize all SMs.  When the launch is large
+  enough, the suggested block size is returned directly.  For small launches
+  where the GPU would be underutilized, a smaller block size is chosen so
+  that the work is distributed as evenly as possible across SMs while
+  keeping each block as large as possible (so adjacent threads stay on the
+  same SM).
+
+  Block sizes are always a multiple of the warp size (32).
+
+  Args:
+    kernel: The Warp kernel to launch.
+    dim: The launch dimension (scalar or tuple, same as ``wp.launch``).
+    device: Target device.  ``None`` = current CUDA device.
+
+  Returns:
+    ``block_dim`` value to pass to ``wp.launch``.
+  """
+  device = wp.get_device(device)
+  if device.is_cpu:
+    return 256
+
+  # Fast path: exact (kernel, device, dim) seen before.
+  dim_key = dim if isinstance(dim, (int, tuple)) else tuple(dim)
+  full_key = (id(kernel), device.ordinal, dim_key)
+  cached = _BLOCK_DIM_CACHE.get(full_key)
+  if cached is not None:
+    return cached
+
+  # --- cached occupancy query ---
+  occ_key = (id(kernel), device.ordinal)
+  occupancy = _OCCUPANCY_CACHE.get(occ_key)
+  if occupancy is None:
+    occupancy = wp.get_suggested_block_size(kernel, device)
+    _OCCUPANCY_CACHE[occ_key] = occupancy
+  suggested_block_size, min_grid_size = occupancy
+
+  total_threads = math.prod(dim) if isinstance(dim, (tuple, list)) else int(dim)
+  if total_threads == 0:
+    _BLOCK_DIM_CACHE[full_key] = suggested_block_size
+    return suggested_block_size
+
+  num_blocks = math.ceil(total_threads / suggested_block_size)
+  if num_blocks >= min_grid_size:
+    _BLOCK_DIM_CACHE[full_key] = suggested_block_size
+    return suggested_block_size
+
+  # GPU is underutilized at the suggested block size.  Pick a smaller one
+  # that creates enough blocks to fill all SMs.
+  sm_count = device.sm_count
+  blocks_per_sm = min_grid_size // sm_count
+
+  # Target a total block count that is a multiple of sm_count so every SM
+  # gets the same number of blocks.
+  target_blocks = sm_count * blocks_per_sm
+
+  # Largest warp-aligned block_size giving >= target_blocks.
+  ideal = total_threads // target_blocks
+  result = max(_WARP_SIZE, (ideal // _WARP_SIZE) * _WARP_SIZE)
+
+  # Don't increase block_dim beyond the Warp default (256) — the default
+  # already gives more blocks (better latency hiding) in the regime where
+  # the suggested block size would underutilize the GPU.
+  result = min(result, _WARP_DEFAULT_BLOCK_DIM)
+
+  _BLOCK_DIM_CACHE[full_key] = result
+  return result
+
+
+def launch(kernel, dim, **kwargs):
+  """Wrapper around ``wp.launch`` that auto-selects ``block_dim``.
+
+  When ``block_dim`` is not given (or is ``None``), it is chosen via
+  :func:`get_block_dim`.  All other arguments are forwarded to
+  ``wp.launch`` unchanged.
+  """
+  if kwargs.get("block_dim") is None:
+    kwargs["block_dim"] = get_block_dim(kernel, dim, device=kwargs.get("device"))
+  wp.launch(kernel, dim=dim, **kwargs)
 
 
 class EventTracer:

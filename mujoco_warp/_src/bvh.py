@@ -27,6 +27,7 @@ from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import RenderContext
 from mujoco_warp._src.warp_util import event_scope
+from mujoco_warp._src.warp_util import launch
 
 wp.set_module_options({"enable_backward": False})
 
@@ -309,7 +310,7 @@ def build_scene_bvh(mjm: mujoco.MjModel, mjd: mujoco.MjData, rc: RenderContext, 
   flex_edge = wp.array(mjm.flex_edge, dtype=wp.vec2i)
   flex_radius = wp.array(mjm.flex_radius, dtype=float)
 
-  wp.launch(
+  launch(
     kernel=_compute_bvh_bounds,
     dim=(nworld, rc.bvh_ngeom),
     inputs=[
@@ -329,7 +330,7 @@ def build_scene_bvh(mjm: mujoco.MjModel, mjd: mujoco.MjData, rc: RenderContext, 
   )
 
   flexvert_xpos = wp.array(np.tile(mjd.flexvert_xpos[np.newaxis, :, :], (nworld, 1, 1)), dtype=wp.vec3)
-  wp.launch(
+  launch(
     kernel=_compute_flex_bvh_bounds,
     dim=(nworld, rc.bvh_nflexgeom),
     inputs=[
@@ -354,7 +355,7 @@ def build_scene_bvh(mjm: mujoco.MjModel, mjd: mujoco.MjData, rc: RenderContext, 
   rc.bvh = bvh
   rc.bvh_id = bvh.id
 
-  wp.launch(
+  launch(
     kernel=compute_bvh_group_roots,
     dim=nworld,
     inputs=[bvh.id],
@@ -365,7 +366,7 @@ def build_scene_bvh(mjm: mujoco.MjModel, mjd: mujoco.MjData, rc: RenderContext, 
 def refit_scene_bvh(m: Model, d: Data, rc: RenderContext):
   total_bvh_size = rc.bvh_ngeom + rc.bvh_nflexgeom
 
-  wp.launch(
+  launch(
     kernel=_compute_bvh_bounds,
     dim=(d.nworld, rc.bvh_ngeom),
     inputs=[
@@ -385,7 +386,7 @@ def refit_scene_bvh(m: Model, d: Data, rc: RenderContext):
   )
 
   if rc.bvh_nflexgeom > 0:
-    wp.launch(
+    launch(
       kernel=_compute_flex_bvh_bounds,
       dim=(d.nworld, rc.bvh_nflexgeom),
       inputs=[
@@ -1009,14 +1010,14 @@ def build_flex_bvh(
   flexvert_norm = wp.zeros((nworld, nflexvert), dtype=wp.vec3)
   flex_shell = wp.array(mjm.flex_shell, dtype=int)
 
-  wp.launch(
+  launch(
     kernel=accumulate_flex_vertex_normals,
     dim=(nworld, mjm.nflexelem),
     inputs=[mjm.nflex, flex_dim, flex_vertadr, flex_elemadr, flex_elemnum, flex_elemdataadr, flex_elem, flexvert_xpos],
     outputs=[flexvert_norm],
   )
 
-  wp.launch(
+  launch(
     kernel=normalize_vertex_normals,
     dim=(nworld, nflexvert),
     inputs=[flexvert_norm],
@@ -1027,7 +1028,7 @@ def build_flex_bvh(
   vert_adr = mjm.flex_vertadr[flex_id]
 
   if dim == 2:
-    wp.launch(
+    launch(
       kernel=_build_flex_2d_elements,
       dim=(nworld, nelem),
       inputs=[
@@ -1043,7 +1044,7 @@ def build_flex_bvh(
       outputs=[face_point, face_index, group],
     )
 
-    wp.launch(
+    launch(
       kernel=_build_flex_2d_sides,
       dim=(nworld, nshell),
       inputs=[
@@ -1059,7 +1060,7 @@ def build_flex_bvh(
       outputs=[face_point, face_index, group],
     )
   elif dim == 3:
-    wp.launch(
+    launch(
       kernel=_build_flex_3d_shells,
       dim=(nworld, nshell),
       inputs=[
@@ -1082,7 +1083,7 @@ def build_flex_bvh(
   )
 
   group_root = wp.empty(nworld, dtype=int)
-  wp.launch(
+  launch(
     kernel=compute_bvh_group_roots,
     dim=nworld,
     inputs=[flex_mesh.id],
@@ -1096,7 +1097,7 @@ def refit_flex_bvh(m: Model, d: Data, rc: RenderContext):
   """Refit per-flex BVHs."""
   flexvert_norm = wp.zeros(d.flexvert_xpos.shape, dtype=wp.vec3)
 
-  wp.launch(
+  launch(
     kernel=accumulate_flex_vertex_normals,
     dim=(d.nworld, m.nflexelem),
     inputs=[
@@ -1112,7 +1113,7 @@ def refit_flex_bvh(m: Model, d: Data, rc: RenderContext):
     outputs=[flexvert_norm],
   )
 
-  wp.launch(
+  launch(
     kernel=normalize_vertex_normals,
     dim=(d.nworld, d.flexvert_xpos.shape[1]),
     inputs=[flexvert_norm],
@@ -1125,7 +1126,7 @@ def refit_flex_bvh(m: Model, d: Data, rc: RenderContext):
     nface = mesh.points.shape[0] // (3 * d.nworld)
 
     if rc.flex_dim_np[i] == 2:
-      wp.launch(
+      launch(
         kernel=_update_flex_2d_face_points,
         dim=(d.nworld, nface // 2),
         inputs=[
@@ -1145,7 +1146,7 @@ def refit_flex_bvh(m: Model, d: Data, rc: RenderContext):
         outputs=[mesh.points],
       )
     else:
-      wp.launch(
+      launch(
         kernel=_update_flex_3d_face_points,
         dim=(d.nworld, nface),
         inputs=[

@@ -1,4 +1,6 @@
 # Copyright 2026 The Newton Developers
+from mujoco_warp._src.warp_util import launch
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,7 +61,7 @@ class SphereTriangleTest(parameterized.TestCase):
     pos = wp.zeros(1, dtype=wp.vec3)
     normal = wp.zeros(1, dtype=wp.vec3)
 
-    wp.launch(
+    launch(
       sphere_triangle_kernel,
       dim=1,
       inputs=[
@@ -189,7 +191,7 @@ class BoxTriangleTest(parameterized.TestCase):
     pos = wp.zeros(1, dtype=collision_primitive_core.mat23f)
     normal = wp.zeros(1, dtype=collision_primitive_core.mat23f)
 
-    wp.launch(
+    launch(
       box_triangle_kernel,
       dim=1,
       inputs=[
@@ -304,7 +306,7 @@ class CapsuleTriangleTest(parameterized.TestCase):
     pos = wp.zeros(1, dtype=collision_primitive_core.mat23f)
     normal = wp.zeros(1, dtype=collision_primitive_core.mat23f)
 
-    wp.launch(
+    launch(
       capsule_triangle_kernel,
       dim=1,
       inputs=[
@@ -437,7 +439,7 @@ class CylinderTriangleTest(parameterized.TestCase):
     pos = wp.zeros(1, dtype=collision_primitive_core.mat23f)
     normal = wp.zeros(1, dtype=collision_primitive_core.mat23f)
 
-    wp.launch(
+    launch(
       cylinder_triangle_kernel,
       dim=1,
       inputs=[
