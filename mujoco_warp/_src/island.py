@@ -277,6 +277,66 @@ def flood_fill(m: types.Model, d: types.Data, tree_tree: wp.array3d[int]):
   )
 
 
+@wp.kernel
+def _compute_raw_island_nv(
+  dof_treeid: wp.array[int],
+  tree_island_in: wp.array2d[int],
+  raw_island_nv_out: wp.array2d[int],
+):
+  """Count DOFs per raw island via atomic_add."""
+  worldid, dofid = wp.tid()
+  treeid = dof_treeid[dofid]
+  if treeid < 0:
+    return
+  islandid = tree_island_in[worldid, treeid]
+  if islandid >= 0:
+    wp.atomic_add(raw_island_nv_out, worldid, islandid, 1)
+
+
+@wp.kernel
+def _compute_raw_to_merged(
+  nisland_inout: wp.array[int],
+  raw_island_nv_in: wp.array2d[int],
+  raw_to_merged_out: wp.array2d[int],
+  merged_nv_scratch: wp.array2d[int],
+):
+  """Per-world first-fit bin packing: merge raw islands <=32 DOFs."""
+  worldid = wp.tid()
+  nraw = nisland_inout[worldid]
+  nmerged = int(0)
+  for raw in range(nraw):
+    raw_nv = raw_island_nv_in[worldid, raw]
+    if raw_nv > 32:
+      raw_to_merged_out[worldid, raw] = nmerged
+      merged_nv_scratch[worldid, nmerged] = raw_nv
+      nmerged += 1
+    else:
+      placed = int(-1)
+      for m_id in range(nmerged):
+        if placed < 0 and merged_nv_scratch[worldid, m_id] + raw_nv <= 32:
+          placed = m_id
+      if placed >= 0:
+        raw_to_merged_out[worldid, raw] = placed
+        merged_nv_scratch[worldid, placed] += raw_nv
+      else:
+        raw_to_merged_out[worldid, raw] = nmerged
+        merged_nv_scratch[worldid, nmerged] = raw_nv
+        nmerged += 1
+  nisland_inout[worldid] = nmerged
+
+
+@wp.kernel
+def _remap_tree_island(
+  raw_to_merged_in: wp.array2d[int],
+  tree_island_inout: wp.array2d[int],
+):
+  """Apply raw->merged island mapping to tree_island."""
+  worldid, treeid = wp.tid()
+  raw = tree_island_inout[worldid, treeid]
+  if raw >= 0:
+    tree_island_inout[worldid, treeid] = raw_to_merged_in[worldid, raw]
+
+
 @event_scope
 def island(m: types.Model, d: types.Data):
   """Discover constraint islands."""
@@ -882,6 +942,30 @@ def compute_island_mapping(m: types.Model, d: types.Data, ctx: IslandSolverConte
       d.njmax,
     ],
     outputs=[efc_tree],
+  )
+
+  # 0. Merge small raw islands (<=32 DOFs) via first-fit bin packing.
+  #    This remaps tree_island so all downstream kernels see merged islands.
+  raw_island_nv = wp.zeros((d.nworld, m.ntree), dtype=int)
+  wp.launch(
+    _compute_raw_island_nv,
+    dim=(d.nworld, m.nv),
+    inputs=[m.dof_treeid, d.tree_island],
+    outputs=[raw_island_nv],
+  )
+  raw_to_merged = wp.zeros((d.nworld, m.ntree), dtype=int)
+  merged_nv_scratch = wp.zeros((d.nworld, m.ntree), dtype=int)
+  wp.launch(
+    _compute_raw_to_merged,
+    dim=d.nworld,
+    inputs=[d.nisland, raw_island_nv],
+    outputs=[raw_to_merged, merged_nv_scratch],
+  )
+  wp.launch(
+    _remap_tree_island,
+    dim=(d.nworld, m.ntree),
+    inputs=[raw_to_merged],
+    outputs=[d.tree_island],
   )
 
   # 1. Count DOFs per island
