@@ -75,6 +75,11 @@ def _create_island_solver_context(m: types.Model, d: types.Data) -> IslandSolver
 
   alloc_h = m.opt.solver == types.SolverType.NEWTON
   alloc_island_cg = m.opt.solver == types.SolverType.CG
+  alloc_small = m.opt.solver == types.SolverType.NEWTON
+
+  ih_small = wp.zeros((nworld, ntree, 32, 32), dtype=float) if alloc_small else wp.empty((nworld, 0, 0, 0), dtype=float)
+  ih_small_grad = wp.zeros((nworld, ntree, 32), dtype=float) if alloc_small else wp.empty((nworld, 0, 0), dtype=float)
+  ih_small_Mgrad = wp.zeros((nworld, ntree, 32), dtype=float) if alloc_small else wp.empty((nworld, 0, 0), dtype=float)
 
   return IslandSolverContext(
     Jaref=wp.empty((nworld, njmax), dtype=float),
@@ -86,6 +91,9 @@ def _create_island_solver_context(m: types.Model, d: types.Data) -> IslandSolver
     prev_grad=wp.empty((nworld, nv), dtype=float) if alloc_island_cg else wp.empty((nworld, 0), dtype=float),
     prev_Mgrad=wp.empty((nworld, nv), dtype=float) if alloc_island_cg else wp.empty((nworld, 0), dtype=float),
     h=wp.zeros((nworld, nv_pad, nv_pad), dtype=float) if alloc_h else wp.empty((nworld, 0, 0), dtype=float),
+    ih_small=ih_small,
+    ih_small_grad=ih_small_grad,
+    ih_small_Mgrad=ih_small_Mgrad,
     # Per-island solver scalars
     cost=wp.empty((nworld, ntree), dtype=float),
     prev_cost=wp.empty((nworld, ntree), dtype=float),
@@ -4619,6 +4627,7 @@ def _update_gradient_JTDAJ_island(
   island_done_in: wp.array2d[bool],
   # Out:
   ih_out: wp.array3d[float],
+  ih_small_out: wp.array4d[float],
 ):
   """Build island Hessian: ih += Jᵀ·D·J for active constraints."""
   worldid, iefcid = wp.tid()
@@ -4642,35 +4651,67 @@ def _update_gradient_JTDAJ_island(
   if is_sparse:
     rownnz = iefc_J_rownnz_in[worldid, iefcid]
     rowadr = iefc_J_rowadr_in[worldid, iefcid]
-    for k1 in range(rownnz):
-      adr1 = rowadr + k1
-      Ji = iefc_J_in[worldid, 0, adr1]
-      i = iefc_J_colind_in[worldid, 0, adr1]
+    if inv <= 32:
+      for k1 in range(rownnz):
+        adr1 = rowadr + k1
+        Ji = iefc_J_in[worldid, 0, adr1]
+        i = iefc_J_colind_in[worldid, 0, adr1] - idofadr
 
-      for k2 in range(k1 + 1):
-        adr2 = rowadr + k2
-        Jj = iefc_J_in[worldid, 0, adr2]
-        j = iefc_J_colind_in[worldid, 0, adr2]
+        for k2 in range(k1 + 1):
+          adr2 = rowadr + k2
+          Jj = iefc_J_in[worldid, 0, adr2]
+          j = iefc_J_colind_in[worldid, 0, adr2] - idofadr
 
-        h = Ji * Jj * D
-        wp.atomic_add(ih_out[worldid, i], j, h)
-        if i != j:
-          wp.atomic_add(ih_out[worldid, j], i, h)
+          h = Ji * Jj * D
+          wp.atomic_add(ih_small_out[worldid, islandid, i], j, h)
+          if i != j:
+            wp.atomic_add(ih_small_out[worldid, islandid, j], i, h)
+    else:
+      for k1 in range(rownnz):
+        adr1 = rowadr + k1
+        Ji = iefc_J_in[worldid, 0, adr1]
+        i = iefc_J_colind_in[worldid, 0, adr1]
+
+        for k2 in range(k1 + 1):
+          adr2 = rowadr + k2
+          Jj = iefc_J_in[worldid, 0, adr2]
+          j = iefc_J_colind_in[worldid, 0, adr2]
+
+          h = Ji * Jj * D
+          wp.atomic_add(ih_out[worldid, i], j, h)
+          if i != j:
+            wp.atomic_add(ih_out[worldid, j], i, h)
   else:
-    for ii in range(inv):
-      i = idofadr + ii
-      Ji = iefc_J_in[worldid, iefcid, i]
-      if Ji == 0.0:
-        continue
-      for jj in range(ii + 1):
-        j = idofadr + jj
-        Jj = iefc_J_in[worldid, iefcid, j]
-        if Jj == 0.0:
+    if inv <= 32:
+      for ii in range(inv):
+        i = idofadr + ii
+        Ji = iefc_J_in[worldid, iefcid, i]
+        if Ji == 0.0:
           continue
-        h = Ji * Jj * D
-        wp.atomic_add(ih_out[worldid, i], j, h)
-        if i != j:
-          wp.atomic_add(ih_out[worldid, j], i, h)
+        for jj in range(ii + 1):
+          j = idofadr + jj
+          Jj = iefc_J_in[worldid, iefcid, j]
+          if Jj == 0.0:
+            continue
+          h = Ji * Jj * D
+          wp.atomic_add(ih_small_out[worldid, islandid, ii], jj, h)
+          if ii != jj:
+            wp.atomic_add(ih_small_out[worldid, islandid, jj], ii, h)
+    else:
+      for ii in range(inv):
+        i = idofadr + ii
+        Ji = iefc_J_in[worldid, iefcid, i]
+        if Ji == 0.0:
+          continue
+        for jj in range(ii + 1):
+          j = idofadr + jj
+          Jj = iefc_J_in[worldid, iefcid, j]
+          if Jj == 0.0:
+            continue
+          h = Ji * Jj * D
+          wp.atomic_add(ih_out[worldid, i], j, h)
+          if i != j:
+            wp.atomic_add(ih_out[worldid, j], i, h)
 
 
 @wp.kernel
@@ -4684,10 +4725,13 @@ def _update_gradient_set_h_M_sparse_island(
   M_in: wp.array3d[float],
   dof_island_in: wp.array2d[int],
   map_dof2idof_in: wp.array2d[int],
+  island_idofadr_in: wp.array2d[int],
+  island_nv_in: wp.array2d[int],
   # In:
   island_done_in: wp.array2d[bool],
   # Out:
   ih_out: wp.array3d[float],
+  ih_small_out: wp.array4d[float],
 ):
   """Add sparse mass matrix to island Hessian using global-to-island DOF mapping."""
   worldid, elementid = wp.tid()
@@ -4718,9 +4762,18 @@ def _update_gradient_set_h_M_sparse_island(
   idof_j = map_dof2idof_in[worldid, j_global]
 
   val = M_in[worldid, 0, madr]
-  ih_out[worldid, idof_i, idof_j] += val
-  if idof_i != idof_j:
-    ih_out[worldid, idof_j, idof_i] += val
+  inv = island_nv_in[worldid, island_i]
+  if inv <= 32:
+    idofadr = island_idofadr_in[worldid, island_i]
+    local_i = idof_i - idofadr
+    local_j = idof_j - idofadr
+    ih_small_out[worldid, island_i, local_i, local_j] += val
+    if local_i != local_j:
+      ih_small_out[worldid, island_i, local_j, local_i] += val
+  else:
+    ih_out[worldid, idof_i, idof_j] += val
+    if idof_i != idof_j:
+      ih_out[worldid, idof_j, idof_i] += val
 
 
 @wp.kernel
@@ -4731,11 +4784,14 @@ def _update_gradient_set_h_M_dense_island(
   nidof_in: wp.array[int],
   M_in: wp.array3d[float],
   map_idof2dof_in: wp.array2d[int],
+  island_idofadr_in: wp.array2d[int],
+  island_nv_in: wp.array2d[int],
   # In:
   idof_islandid_in: wp.array2d[int],
   island_done_in: wp.array2d[bool],
   # Out:
   ih_out: wp.array3d[float],
+  ih_small_out: wp.array4d[float],
 ):
   """Add dense mass matrix to island Hessian."""
   worldid, idofid = wp.tid()
@@ -4750,12 +4806,23 @@ def _update_gradient_set_h_M_dense_island(
     return
 
   dof_i = map_idof2dof_in[worldid, idofid]
+  inv = island_nv_in[worldid, islandid]
 
   # Copy row from M to ih, mapping columns
   nid = nidof_in[worldid]
-  for jdof in range(nid):
-    dof_j = map_idof2dof_in[worldid, jdof]
-    ih_out[worldid, idofid, jdof] += M_in[worldid, dof_i, dof_j]
+  if inv <= 32:
+    idofadr = island_idofadr_in[worldid, islandid]
+    local_i = idofid - idofadr
+    for jdof in range(nid):
+      if idof_islandid_in[worldid, jdof] != islandid:
+        continue
+      dof_j = map_idof2dof_in[worldid, jdof]
+      local_j = jdof - idofadr
+      ih_small_out[worldid, islandid, local_i, local_j] += M_in[worldid, dof_i, dof_j]
+  else:
+    for jdof in range(nid):
+      dof_j = map_idof2dof_in[worldid, jdof]
+      ih_out[worldid, idofid, jdof] += M_in[worldid, dof_i, dof_j]
 
 
 @wp.kernel
@@ -4786,6 +4853,7 @@ def _update_gradient_JTCJ_island(
   island_done_in: wp.array2d[bool],
   # Out:
   ih_out: wp.array3d[float],
+  ih_small_out: wp.array4d[float],
 ):
   """Add elliptic cone Hessian correction: Jᵀ·C·J for contacts in CONE state."""
   conid = wp.tid()
@@ -4897,67 +4965,268 @@ def _update_gradient_JTCJ_island(
 
       # Accumulate J1^T * hcone * J2 into ih (lower triangle)
       if is_sparse:
-        if dim1id == dim2id:
-          rownnz = iefc_J_rownnz_in[worldid, ic1]
-          rowadr = iefc_J_rowadr_in[worldid, ic1]
-          for k1 in range(rownnz):
-            adr1 = rowadr + k1
-            J1 = iefc_J_in[worldid, 0, adr1]
-            i = iefc_J_colind_in[worldid, 0, adr1]
+        if inv <= 32:
+          if dim1id == dim2id:
+            rownnz = iefc_J_rownnz_in[worldid, ic1]
+            rowadr = iefc_J_rowadr_in[worldid, ic1]
+            for k1 in range(rownnz):
+              adr1 = rowadr + k1
+              J1 = iefc_J_in[worldid, 0, adr1]
+              i = iefc_J_colind_in[worldid, 0, adr1] - idofadr
 
-            for k2 in range(k1 + 1):
-              adr2 = rowadr + k2
-              J2 = iefc_J_in[worldid, 0, adr2]
-              j = iefc_J_colind_in[worldid, 0, adr2]
+              for k2 in range(k1 + 1):
+                adr2 = rowadr + k2
+                J2 = iefc_J_in[worldid, 0, adr2]
+                j = iefc_J_colind_in[worldid, 0, adr2] - idofadr
 
-              val = hcone * J1 * J2
-              wp.atomic_add(ih_out[worldid, i], j, val)
-              if i != j:
-                wp.atomic_add(ih_out[worldid, j], i, val)
+                val = hcone * J1 * J2
+                wp.atomic_add(ih_small_out[worldid, islandid, i], j, val)
+                if i != j:
+                  wp.atomic_add(ih_small_out[worldid, islandid, j], i, val)
+          else:
+            rownnz1 = iefc_J_rownnz_in[worldid, ic1]
+            rowadr1 = iefc_J_rowadr_in[worldid, ic1]
+            rownnz2 = iefc_J_rownnz_in[worldid, ic2]
+            rowadr2 = iefc_J_rowadr_in[worldid, ic2]
+
+            for k1 in range(rownnz1):
+              adr1 = rowadr1 + k1
+              J1 = iefc_J_in[worldid, 0, adr1]
+              i = iefc_J_colind_in[worldid, 0, adr1] - idofadr
+
+              for k2 in range(rownnz2):
+                adr2 = rowadr2 + k2
+                J2 = iefc_J_in[worldid, 0, adr2]
+                j = iefc_J_colind_in[worldid, 0, adr2] - idofadr
+
+                val = hcone * J1 * J2
+                if i == j:
+                  wp.atomic_add(ih_small_out[worldid, islandid, i], j, val * 2.0)
+                else:
+                  wp.atomic_add(ih_small_out[worldid, islandid, i], j, val)
+                  wp.atomic_add(ih_small_out[worldid, islandid, j], i, val)
         else:
-          rownnz1 = iefc_J_rownnz_in[worldid, ic1]
-          rowadr1 = iefc_J_rowadr_in[worldid, ic1]
-          rownnz2 = iefc_J_rownnz_in[worldid, ic2]
-          rowadr2 = iefc_J_rowadr_in[worldid, ic2]
+          if dim1id == dim2id:
+            rownnz = iefc_J_rownnz_in[worldid, ic1]
+            rowadr = iefc_J_rowadr_in[worldid, ic1]
+            for k1 in range(rownnz):
+              adr1 = rowadr + k1
+              J1 = iefc_J_in[worldid, 0, adr1]
+              i = iefc_J_colind_in[worldid, 0, adr1]
 
-          for k1 in range(rownnz1):
-            adr1 = rowadr1 + k1
-            J1 = iefc_J_in[worldid, 0, adr1]
-            i = iefc_J_colind_in[worldid, 0, adr1]
+              for k2 in range(k1 + 1):
+                adr2 = rowadr + k2
+                J2 = iefc_J_in[worldid, 0, adr2]
+                j = iefc_J_colind_in[worldid, 0, adr2]
 
-            for k2 in range(rownnz2):
-              adr2 = rowadr2 + k2
-              J2 = iefc_J_in[worldid, 0, adr2]
-              j = iefc_J_colind_in[worldid, 0, adr2]
-
-              val = hcone * J1 * J2
-              if i == j:
-                wp.atomic_add(ih_out[worldid, i], j, val * 2.0)
-              else:
+                val = hcone * J1 * J2
                 wp.atomic_add(ih_out[worldid, i], j, val)
-                wp.atomic_add(ih_out[worldid, j], i, val)
-      else:
-        for i in range(inv):
-          J1i = iefc_J_in[worldid, ic1, idofadr + i]
-          if J1i == 0.0:
-            continue
-          for jj in range(i + 1):
-            J2j = iefc_J_in[worldid, ic2, idofadr + jj]
-            if J2j == 0.0:
-              continue
-            val = hcone * J1i * J2j
-            wp.atomic_add(ih_out[worldid, idofadr + i], idofadr + jj, val)
-            if i != jj:
-              wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val)
+                if i != j:
+                  wp.atomic_add(ih_out[worldid, j], i, val)
+          else:
+            rownnz1 = iefc_J_rownnz_in[worldid, ic1]
+            rowadr1 = iefc_J_rowadr_in[worldid, ic1]
+            rownnz2 = iefc_J_rownnz_in[worldid, ic2]
+            rowadr2 = iefc_J_rowadr_in[worldid, ic2]
 
-            if dim1id != dim2id:
-              J1j = iefc_J_in[worldid, ic1, idofadr + jj]
-              J2i = iefc_J_in[worldid, ic2, idofadr + i]
-              if J1j != 0.0 and J2i != 0.0:
-                val2 = hcone * J1j * J2i
-                wp.atomic_add(ih_out[worldid, idofadr + i], idofadr + jj, val2)
-                if i != jj:
-                  wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val2)
+            for k1 in range(rownnz1):
+              adr1 = rowadr1 + k1
+              J1 = iefc_J_in[worldid, 0, adr1]
+              i = iefc_J_colind_in[worldid, 0, adr1]
+
+              for k2 in range(rownnz2):
+                adr2 = rowadr2 + k2
+                J2 = iefc_J_in[worldid, 0, adr2]
+                j = iefc_J_colind_in[worldid, 0, adr2]
+
+                val = hcone * J1 * J2
+                if i == j:
+                  wp.atomic_add(ih_out[worldid, i], j, val * 2.0)
+                else:
+                  wp.atomic_add(ih_out[worldid, i], j, val)
+                  wp.atomic_add(ih_out[worldid, j], i, val)
+      else:
+        if inv <= 32:
+          for i in range(inv):
+            J1i = iefc_J_in[worldid, ic1, idofadr + i]
+            if J1i == 0.0:
+              continue
+            for jj in range(i + 1):
+              J2j = iefc_J_in[worldid, ic2, idofadr + jj]
+              if J2j == 0.0:
+                continue
+              val = hcone * J1i * J2j
+              wp.atomic_add(ih_small_out[worldid, islandid, i], jj, val)
+              if i != jj:
+                wp.atomic_add(ih_small_out[worldid, islandid, jj], i, val)
+
+              if dim1id != dim2id:
+                J1j = iefc_J_in[worldid, ic1, idofadr + jj]
+                J2i = iefc_J_in[worldid, ic2, idofadr + i]
+                if J1j != 0.0 and J2i != 0.0:
+                  val2 = hcone * J1j * J2i
+                  wp.atomic_add(ih_small_out[worldid, islandid, i], jj, val2)
+                  if i != jj:
+                    wp.atomic_add(ih_small_out[worldid, islandid, jj], i, val2)
+        else:
+          for i in range(inv):
+            J1i = iefc_J_in[worldid, ic1, idofadr + i]
+            if J1i == 0.0:
+              continue
+            for jj in range(i + 1):
+              J2j = iefc_J_in[worldid, ic2, idofadr + jj]
+              if J2j == 0.0:
+                continue
+              val = hcone * J1i * J2j
+              wp.atomic_add(ih_out[worldid, idofadr + i], idofadr + jj, val)
+              if i != jj:
+                wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val)
+
+              if dim1id != dim2id:
+                J1j = iefc_J_in[worldid, ic1, idofadr + jj]
+                J2i = iefc_J_in[worldid, ic2, idofadr + i]
+                if J1j != 0.0 and J2i != 0.0:
+                  val2 = hcone * J1j * J2i
+                  wp.atomic_add(ih_out[worldid, idofadr + i], idofadr + jj, val2)
+                  if i != jj:
+                    wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val2)
+
+
+@wp.kernel
+def _regularize_island_small_h(
+  nisland_in: wp.array[int],
+  island_nv_in: wp.array2d[int],
+  island_done_in: wp.array2d[bool],
+  ih_small_inout: wp.array4d[float],
+):
+  """Clamp diagonal of ih_small to eps for robustness, matching scalar Cholesky."""
+  worldid, islandid = wp.tid()
+  if islandid >= nisland_in[worldid]:
+    return
+  if island_done_in[worldid, islandid]:
+    return
+  inv = island_nv_in[worldid, islandid]
+  if inv > 32 or inv == 0:
+    return
+  for i in range(inv):
+    diag = ih_small_inout[worldid, islandid, i, i]
+    if diag < 1e-6:
+      ih_small_inout[worldid, islandid, i, i] = 1e-6
+
+
+@wp.kernel
+def _pad_island_small_unused(
+  nisland_in: wp.array[int],
+  island_nv_in: wp.array2d[int],
+  island_done_in: wp.array2d[bool],
+  ih_small_inout: wp.array4d[float],
+):
+  """Set diagonal=1 on rows [inv, 32) of each small island's 32x32 matrix."""
+  worldid, islandid = wp.tid()
+  if islandid >= nisland_in[worldid]:
+    return
+  if island_done_in[worldid, islandid]:
+    return
+  inv = island_nv_in[worldid, islandid]
+  if inv > 32 or inv == 0:
+    return
+  for i in range(inv, 32):
+    ih_small_inout[worldid, islandid, i, i] = 1.0
+
+
+@wp.kernel
+def _prepare_island_small_grad(
+  nisland_in: wp.array[int],
+  island_nv_in: wp.array2d[int],
+  island_idofadr_in: wp.array2d[int],
+  island_done_in: wp.array2d[bool],
+  grad_in: wp.array2d[float],
+  ih_small_grad_out: wp.array3d[float],
+):
+  """Gather ctx.grad into ih_small_grad for small islands."""
+  worldid, islandid = wp.tid()
+  if islandid >= nisland_in[worldid]:
+    return
+  if island_done_in[worldid, islandid]:
+    return
+  inv = island_nv_in[worldid, islandid]
+  if inv > 32 or inv == 0:
+    return
+  idofadr = island_idofadr_in[worldid, islandid]
+  for i in range(inv):
+    ih_small_grad_out[worldid, islandid, i] = grad_in[worldid, idofadr + i]
+
+
+@cache_kernel
+def _cholesky_solve_small_island(tile_size: int):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    nisland_in: wp.array[int],
+    island_nv_in: wp.array2d[int],
+    island_done_in: wp.array2d[bool],
+    ih_small_in: wp.array4d[float],
+    ih_small_grad_in: wp.array3d[float],
+    ih_small_Mgrad_out: wp.array3d[float],
+  ):
+    worldid, islandid = wp.tid()
+    TILE = wp.static(tile_size)
+    if islandid >= nisland_in[worldid]:
+      return
+    if island_done_in[worldid, islandid]:
+      return
+    inv = island_nv_in[worldid, islandid]
+    if inv > TILE or inv == 0:
+      return
+    # Cholesky factorization in-place with diagonal clamping for robustness
+    for i in range(inv):
+      for j in range(i + 1):
+        s = ih_small_in[worldid, islandid, i, j]
+        for k in range(j):
+          s -= ih_small_in[worldid, islandid, i, k] * ih_small_in[worldid, islandid, j, k]
+        if i == j:
+          if s <= 1e-6:
+            s = 1e-6
+          ih_small_in[worldid, islandid, i, j] = wp.sqrt(s)
+        else:
+          div = ih_small_in[worldid, islandid, j, j]
+          ih_small_in[worldid, islandid, i, j] = s / wp.max(1e-6, div)
+    # Forward substitution: L @ y = grad
+    for i in range(inv):
+      s = ih_small_grad_in[worldid, islandid, i]
+      for k in range(i):
+        s -= ih_small_in[worldid, islandid, i, k] * ih_small_Mgrad_out[worldid, islandid, k]
+      ih_small_Mgrad_out[worldid, islandid, i] = s / wp.max(1e-6, ih_small_in[worldid, islandid, i, i])
+    # Backward substitution: L^T @ x = y
+    for i_rev in range(inv):
+      i = inv - 1 - i_rev
+      s = ih_small_Mgrad_out[worldid, islandid, i]
+      for k in range(i + 1, inv):
+        s -= ih_small_in[worldid, islandid, k, i] * ih_small_Mgrad_out[worldid, islandid, k]
+      ih_small_Mgrad_out[worldid, islandid, i] = s / wp.max(types.MJ_MINVAL, ih_small_in[worldid, islandid, i, i])
+
+  return kernel
+
+
+@wp.kernel
+def _scatter_island_small_Mgrad(
+  nisland_in: wp.array[int],
+  island_nv_in: wp.array2d[int],
+  island_idofadr_in: wp.array2d[int],
+  island_done_in: wp.array2d[bool],
+  ih_small_Mgrad_in: wp.array3d[float],
+  Mgrad_out: wp.array2d[float],
+):
+  """Write ih_small_Mgrad back to ctx.Mgrad."""
+  worldid, islandid, local_idx = wp.tid()
+  if islandid >= nisland_in[worldid]:
+    return
+  if island_done_in[worldid, islandid]:
+    return
+  inv = island_nv_in[worldid, islandid]
+  if inv > 32 or local_idx >= inv:
+    return
+  idofadr = island_idofadr_in[worldid, islandid]
+  Mgrad_out[worldid, idofadr + local_idx] = ih_small_Mgrad_in[worldid, islandid, local_idx]
 
 
 @wp.kernel
@@ -4987,6 +5256,8 @@ def _cholesky_factorize_solve_island(
 
   inv = island_nv_in[worldid, islandid]
 
+  if inv <= 32:
+    return  # handled by small-island tile_cholesky path
   if inv == 0:
     return
 
@@ -5234,6 +5505,7 @@ def _update_gradient_incremental_island(m: types.Model, d: types.Data, ctx: Isla
 
   # Build H = qM + Jᵀ·D·J
   ctx.h.zero_()
+  ctx.ih_small.zero_()
 
   # JTDAJ
   wp.launch(
@@ -5254,7 +5526,7 @@ def _update_gradient_incremental_island(m: types.Model, d: types.Data, ctx: Isla
       d.efc_islandid,
       ctx.done,
     ],
-    outputs=[ctx.h],
+    outputs=[ctx.h, ctx.ih_small],
   )
 
   # Add mass matrix
@@ -5270,9 +5542,11 @@ def _update_gradient_incremental_island(m: types.Model, d: types.Data, ctx: Isla
         d.M,
         d.dof_island,
         d.map_dof2idof,
+        d.island_idofadr,
+        d.island_nv,
         ctx.done,
       ],
-      outputs=[ctx.h],
+      outputs=[ctx.h, ctx.ih_small],
     )
   else:
     wp.launch(
@@ -5283,10 +5557,12 @@ def _update_gradient_incremental_island(m: types.Model, d: types.Data, ctx: Isla
         d.nidof,
         d.M,
         d.map_idof2dof,
+        d.island_idofadr,
+        d.island_nv,
         d.dof_islandid,
         ctx.done,
       ],
-      outputs=[ctx.h],
+      outputs=[ctx.h, ctx.ih_small],
     )
 
   # Elliptic cone correction: JTCJ
@@ -5317,10 +5593,43 @@ def _update_gradient_incremental_island(m: types.Model, d: types.Data, ctx: Isla
         d.efc_islandid,
         ctx.done,
       ],
-      outputs=[ctx.h],
+      outputs=[ctx.h, ctx.ih_small],
     )
 
-  # Cholesky factorize and solve: Mgrad = H⁻¹ @ grad
+  # Small-island dense Cholesky path (inv <= 32)
+  wp.launch(
+    _regularize_island_small_h,
+    dim=(d.nworld, m.ntree),
+    inputs=[d.nisland, d.island_nv, ctx.done],
+    outputs=[ctx.ih_small],
+  )
+  wp.launch(
+    _pad_island_small_unused,
+    dim=(d.nworld, m.ntree),
+    inputs=[d.nisland, d.island_nv, ctx.done],
+    outputs=[ctx.ih_small],
+  )
+  wp.launch(
+    _prepare_island_small_grad,
+    dim=(d.nworld, m.ntree),
+    inputs=[d.nisland, d.island_nv, d.island_idofadr, ctx.done, ctx.grad],
+    outputs=[ctx.ih_small_grad],
+  )
+  wp.launch_tiled(
+    _cholesky_solve_small_island(32),
+    dim=(d.nworld, m.ntree),
+    inputs=[d.nisland, d.island_nv, ctx.done, ctx.ih_small, ctx.ih_small_grad],
+    outputs=[ctx.ih_small_Mgrad],
+    block_dim=m.block_dim.update_gradient_cholesky,
+  )
+  wp.launch(
+    _scatter_island_small_Mgrad,
+    dim=(d.nworld, m.ntree, 32),
+    inputs=[d.nisland, d.island_nv, d.island_idofadr, ctx.done, ctx.ih_small_Mgrad],
+    outputs=[ctx.Mgrad],
+  )
+
+  # Large-island scalar Cholesky path (inv > 32)
   wp.launch(
     _cholesky_factorize_solve_island,
     dim=(d.nworld, m.ntree),
