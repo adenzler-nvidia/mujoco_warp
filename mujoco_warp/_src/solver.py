@@ -5191,32 +5191,11 @@ def _cholesky_solve_small_island(tile_size: int):
     inv = island_nv_in[worldid, islandid]
     if inv > TILE or inv == 0:
       return
-    # Cholesky factorization in-place with diagonal clamping for robustness
-    for i in range(inv):
-      for j in range(i + 1):
-        s = ih_small_in[worldid, islandid, i, j]
-        for k in range(j):
-          s -= ih_small_in[worldid, islandid, i, k] * ih_small_in[worldid, islandid, j, k]
-        if i == j:
-          if s <= 1e-6:
-            s = 1e-6
-          ih_small_in[worldid, islandid, i, j] = wp.sqrt(s)
-        else:
-          div = ih_small_in[worldid, islandid, j, j]
-          ih_small_in[worldid, islandid, i, j] = s / wp.max(1e-6, div)
-    # Forward substitution: L @ y = grad
-    for i in range(inv):
-      s = ih_small_grad_in[worldid, islandid, i]
-      for k in range(i):
-        s -= ih_small_in[worldid, islandid, i, k] * ih_small_Mgrad_out[worldid, islandid, k]
-      ih_small_Mgrad_out[worldid, islandid, i] = s / wp.max(1e-6, ih_small_in[worldid, islandid, i, i])
-    # Backward substitution: L^T @ x = y
-    for i_rev in range(inv):
-      i = inv - 1 - i_rev
-      s = ih_small_Mgrad_out[worldid, islandid, i]
-      for k in range(i + 1, inv):
-        s -= ih_small_in[worldid, islandid, k, i] * ih_small_Mgrad_out[worldid, islandid, k]
-      ih_small_Mgrad_out[worldid, islandid, i] = s / wp.max(types.MJ_MINVAL, ih_small_in[worldid, islandid, i, i])
+    mat_tile = wp.tile_load(ih_small_in[worldid, islandid], shape=(TILE, TILE))
+    fact_tile = wp.tile_cholesky(mat_tile, fill_mode="upper")
+    rhs_tile = wp.tile_load(ih_small_grad_in[worldid, islandid], shape=TILE)
+    sol_tile = wp.tile_cholesky_solve(fact_tile, rhs_tile, fill_mode="upper")
+    wp.tile_store(ih_small_Mgrad_out[worldid, islandid], sol_tile)
 
   return kernel
 
