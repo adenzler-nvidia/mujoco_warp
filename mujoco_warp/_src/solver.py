@@ -5046,50 +5046,64 @@ def _update_gradient_JTCJ_island(
                   wp.atomic_add(ih_out[worldid, i], j, val)
                   wp.atomic_add(ih_out[worldid, j], i, val)
       else:
-        if inv <= 32:
-          for i in range(inv):
-            J1i = iefc_J_in[worldid, ic1, idofadr + i]
-            if J1i == 0.0:
-              continue
-            for jj in range(i + 1):
-              J2j = iefc_J_in[worldid, ic2, idofadr + jj]
-              if J2j == 0.0:
+        if dim1id == dim2id:
+          if inv <= 32:
+            for i in range(inv):
+              J1i = iefc_J_in[worldid, ic1, idofadr + i]
+              if J1i == 0.0:
                 continue
-              val = hcone * J1i * J2j
-              wp.atomic_add(ih_small_out[worldid, islandid, i], jj, val)
-              if i != jj:
-                wp.atomic_add(ih_small_out[worldid, islandid, jj], i, val)
-
-              if dim1id != dim2id:
-                J1j = iefc_J_in[worldid, ic1, idofadr + jj]
-                J2i = iefc_J_in[worldid, ic2, idofadr + i]
-                if J1j != 0.0 and J2i != 0.0:
-                  val2 = hcone * J1j * J2i
-                  wp.atomic_add(ih_small_out[worldid, islandid, i], jj, val2)
-                  if i != jj:
-                    wp.atomic_add(ih_small_out[worldid, islandid, jj], i, val2)
+              for jj in range(i + 1):
+                J2j = iefc_J_in[worldid, ic2, idofadr + jj]
+                if J2j == 0.0:
+                  continue
+                val = hcone * J1i * J2j
+                wp.atomic_add(ih_small_out[worldid, islandid, i], jj, val)
+                if i != jj:
+                  wp.atomic_add(ih_small_out[worldid, islandid, jj], i, val)
+          else:
+            for i in range(inv):
+              J1i = iefc_J_in[worldid, ic1, idofadr + i]
+              if J1i == 0.0:
+                continue
+              for jj in range(i + 1):
+                J2j = iefc_J_in[worldid, ic2, idofadr + jj]
+                if J2j == 0.0:
+                  continue
+                val = hcone * J1i * J2j
+                wp.atomic_add(ih_out[worldid, idofadr + i], idofadr + jj, val)
+                if i != jj:
+                  wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val)
         else:
-          for i in range(inv):
-            J1i = iefc_J_in[worldid, ic1, idofadr + i]
-            if J1i == 0.0:
-              continue
-            for jj in range(i + 1):
-              J2j = iefc_J_in[worldid, ic2, idofadr + jj]
-              if J2j == 0.0:
+          if inv <= 32:
+            for i in range(inv):
+              J1i = iefc_J_in[worldid, ic1, idofadr + i]
+              J2i = iefc_J_in[worldid, ic2, idofadr + i]
+              if J1i == 0.0 and J2i == 0.0:
                 continue
-              val = hcone * J1i * J2j
-              wp.atomic_add(ih_out[worldid, idofadr + i], idofadr + jj, val)
-              if i != jj:
-                wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val)
-
-              if dim1id != dim2id:
+              for jj in range(i + 1):
+                J2j = iefc_J_in[worldid, ic2, idofadr + jj]
                 J1j = iefc_J_in[worldid, ic1, idofadr + jj]
-                J2i = iefc_J_in[worldid, ic2, idofadr + i]
-                if J1j != 0.0 and J2i != 0.0:
-                  val2 = hcone * J1j * J2i
-                  wp.atomic_add(ih_out[worldid, idofadr + i], idofadr + jj, val2)
-                  if i != jj:
-                    wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val2)
+                val = hcone * (J1i * J2j + J1j * J2i)
+                if val == 0.0:
+                  continue
+                wp.atomic_add(ih_small_out[worldid, islandid, i], jj, val)
+                if i != jj:
+                  wp.atomic_add(ih_small_out[worldid, islandid, jj], i, val)
+          else:
+            for i in range(inv):
+              J1i = iefc_J_in[worldid, ic1, idofadr + i]
+              J2i = iefc_J_in[worldid, ic2, idofadr + i]
+              if J1i == 0.0 and J2i == 0.0:
+                continue
+              for jj in range(i + 1):
+                J2j = iefc_J_in[worldid, ic2, idofadr + jj]
+                J1j = iefc_J_in[worldid, ic1, idofadr + jj]
+                val = hcone * (J1i * J2j + J1j * J2i)
+                if val == 0.0:
+                  continue
+                wp.atomic_add(ih_out[worldid, idofadr + i], idofadr + jj, val)
+                if i != jj:
+                  wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val)
 
 
 @wp.kernel
