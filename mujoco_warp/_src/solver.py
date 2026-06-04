@@ -5107,28 +5107,6 @@ def _update_gradient_JTCJ_island(
 
 
 @wp.kernel
-def _regularize_island_small_h(
-  nisland_in: wp.array[int],
-  island_nv_in: wp.array2d[int],
-  island_done_in: wp.array2d[bool],
-  ih_small_inout: wp.array4d[float],
-):
-  """Clamp diagonal of ih_small to eps for robustness, matching scalar Cholesky."""
-  worldid, islandid = wp.tid()
-  if islandid >= nisland_in[worldid]:
-    return
-  if island_done_in[worldid, islandid]:
-    return
-  inv = island_nv_in[worldid, islandid]
-  if inv > 32 or inv == 0:
-    return
-  for i in range(inv):
-    diag = ih_small_inout[worldid, islandid, i, i]
-    if diag < 1e-6:
-      ih_small_inout[worldid, islandid, i, i] = 1e-6
-
-
-@wp.kernel
 def _pad_island_small_unused(
   nisland_in: wp.array[int],
   island_nv_in: wp.array2d[int],
@@ -5590,12 +5568,6 @@ def _update_gradient_incremental_island(m: types.Model, d: types.Data, ctx: Isla
     )
 
   # Small-island dense Cholesky path (inv <= 32)
-  wp.launch(
-    _regularize_island_small_h,
-    dim=(d.nworld, m.ntree),
-    inputs=[d.nisland, d.island_nv, ctx.done],
-    outputs=[ctx.ih_small],
-  )
   wp.launch(
     _pad_island_small_unused,
     dim=(d.nworld, m.ntree),
