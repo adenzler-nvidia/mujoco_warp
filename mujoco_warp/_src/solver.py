@@ -79,7 +79,6 @@ def _create_island_solver_context(m: types.Model, d: types.Data) -> IslandSolver
 
   ih_small = wp.zeros((nworld, ntree, 32, 32), dtype=float) if alloc_small else wp.empty((nworld, 0, 0, 0), dtype=float)
   ih_small_grad = wp.zeros((nworld, ntree, 32), dtype=float) if alloc_small else wp.empty((nworld, 0, 0), dtype=float)
-  ih_small_Mgrad = wp.zeros((nworld, ntree, 32), dtype=float) if alloc_small else wp.empty((nworld, 0, 0), dtype=float)
 
   return IslandSolverContext(
     Jaref=wp.empty((nworld, njmax), dtype=float),
@@ -93,7 +92,6 @@ def _create_island_solver_context(m: types.Model, d: types.Data) -> IslandSolver
     h=wp.zeros((nworld, nv_pad, nv_pad), dtype=float) if alloc_h else wp.empty((nworld, 0, 0), dtype=float),
     ih_small=ih_small,
     ih_small_grad=ih_small_grad,
-    ih_small_Mgrad=ih_small_Mgrad,
     # Per-island solver scalars
     cost=wp.empty((nworld, ntree), dtype=float),
     prev_cost=wp.empty((nworld, ntree), dtype=float),
@@ -5106,60 +5104,35 @@ def _update_gradient_JTCJ_island(
                   wp.atomic_add(ih_out[worldid, idofadr + jj], idofadr + i, val)
 
 
-@wp.kernel
-def _pad_island_small_unused(
-  nisland_in: wp.array[int],
-  island_nv_in: wp.array2d[int],
-  island_done_in: wp.array2d[bool],
-  ih_small_inout: wp.array4d[float],
-):
-  """Set diagonal=1 on rows [inv, 32) of each small island's 32x32 matrix."""
-  worldid, islandid = wp.tid()
-  if islandid >= nisland_in[worldid]:
-    return
-  if island_done_in[worldid, islandid]:
-    return
-  inv = island_nv_in[worldid, islandid]
-  if inv > 32 or inv == 0:
-    return
-  for i in range(inv, 32):
-    ih_small_inout[worldid, islandid, i, i] = 1.0
-
-
-@wp.kernel
-def _prepare_island_small_grad(
-  nisland_in: wp.array[int],
-  island_nv_in: wp.array2d[int],
-  island_idofadr_in: wp.array2d[int],
-  island_done_in: wp.array2d[bool],
-  grad_in: wp.array2d[float],
-  ih_small_grad_out: wp.array3d[float],
-):
-  """Gather ctx.grad into ih_small_grad for small islands."""
-  worldid, islandid = wp.tid()
-  if islandid >= nisland_in[worldid]:
-    return
-  if island_done_in[worldid, islandid]:
-    return
-  inv = island_nv_in[worldid, islandid]
-  if inv > 32 or inv == 0:
-    return
-  idofadr = island_idofadr_in[worldid, islandid]
-  for i in range(inv):
-    ih_small_grad_out[worldid, islandid, i] = grad_in[worldid, idofadr + i]
-
-
 @cache_kernel
 def _cholesky_solve_small_island(tile_size: int):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     nisland_in: wp.array[int],
     island_nv_in: wp.array2d[int],
+    island_idofadr_in: wp.array2d[int],
     island_done_in: wp.array2d[bool],
-    ih_small_in: wp.array4d[float],
-    ih_small_grad_in: wp.array3d[float],
-    ih_small_Mgrad_out: wp.array3d[float],
+    grad_in: wp.array2d[float],
+    ih_small_inout: wp.array4d[float],
+    ih_small_grad_inout: wp.array3d[float],
+    Mgrad_out: wp.array2d[float],
   ):
+    """Pad, gather, factor+solve, and scatter for small-island Cholesky.
+
+    Fuses _pad_island_small_unused, _prepare_island_small_grad, the tile
+    Cholesky factor+solve, and _scatter_island_small_Mgrad into a single
+    tiled launch.
+
+    PAD and PREPARE use scalar global-memory writes from every thread in
+    the block (all threads write the same value to the same address, so
+    writes are idempotent).  Because every thread writes every element it
+    later tile_loads, within-thread store-to-load ordering (guaranteed by
+    CUDA) ensures each thread sees its own writes without a barrier.
+
+    SCATTER reads directly from the shared-memory sol_tile returned by
+    tile_cholesky_solve, which ends with a WP_TILE_SYNC, so all threads
+    see the complete solution before the scalar writes to Mgrad_out.
+    """
     worldid, islandid = wp.tid()
     TILE = wp.static(tile_size)
     if islandid >= nisland_in[worldid]:
@@ -5169,35 +5142,32 @@ def _cholesky_solve_small_island(tile_size: int):
     inv = island_nv_in[worldid, islandid]
     if inv > TILE or inv == 0:
       return
-    mat_tile = wp.tile_load(ih_small_in[worldid, islandid], shape=(TILE, TILE))
+    idofadr = island_idofadr_in[worldid, islandid]
+
+    # PAD: set diag=1 on unused rows [inv, TILE). Every thread writes
+    # every element; within-thread ordering guarantees each thread reads
+    # its own stores during the subsequent tile_load.
+    for i in range(inv, TILE):
+      ih_small_inout[worldid, islandid, i, i] = 1.0
+
+    # PREPARE: scalar gather grad -> ih_small_grad for active entries.
+    # Same all-threads-write-all-elements pattern as PAD.
+    for i in range(inv):
+      ih_small_grad_inout[worldid, islandid, i] = grad_in[worldid, idofadr + i]
+
+    # TILE: cooperative factor and solve.
+    mat_tile = wp.tile_load(ih_small_inout[worldid, islandid], shape=(TILE, TILE))
     fact_tile = wp.tile_cholesky(mat_tile, fill_mode="upper")
-    rhs_tile = wp.tile_load(ih_small_grad_in[worldid, islandid], shape=TILE)
+    rhs_tile = wp.tile_load(ih_small_grad_inout[worldid, islandid], shape=TILE)
     sol_tile = wp.tile_cholesky_solve(fact_tile, rhs_tile, fill_mode="upper")
-    wp.tile_store(ih_small_Mgrad_out[worldid, islandid], sol_tile)
+
+    # SCATTER: tile_cholesky_solve returns a shared-memory tile and ends
+    # with WP_TILE_SYNC, so tile_extract reads coherent shared memory.
+    # This avoids a global-memory round-trip through ih_small_Mgrad.
+    for i in range(inv):
+      Mgrad_out[worldid, idofadr + i] = wp.tile_extract(sol_tile, i)
 
   return kernel
-
-
-@wp.kernel
-def _scatter_island_small_Mgrad(
-  nisland_in: wp.array[int],
-  island_nv_in: wp.array2d[int],
-  island_idofadr_in: wp.array2d[int],
-  island_done_in: wp.array2d[bool],
-  ih_small_Mgrad_in: wp.array3d[float],
-  Mgrad_out: wp.array2d[float],
-):
-  """Write ih_small_Mgrad back to ctx.Mgrad."""
-  worldid, islandid, local_idx = wp.tid()
-  if islandid >= nisland_in[worldid]:
-    return
-  if island_done_in[worldid, islandid]:
-    return
-  inv = island_nv_in[worldid, islandid]
-  if inv > 32 or local_idx >= inv:
-    return
-  idofadr = island_idofadr_in[worldid, islandid]
-  Mgrad_out[worldid, idofadr + local_idx] = ih_small_Mgrad_in[worldid, islandid, local_idx]
 
 
 @wp.kernel
@@ -5568,30 +5538,20 @@ def _update_gradient_incremental_island(m: types.Model, d: types.Data, ctx: Isla
     )
 
   # Small-island dense Cholesky path (inv <= 32)
-  wp.launch(
-    _pad_island_small_unused,
-    dim=(d.nworld, m.ntree),
-    inputs=[d.nisland, d.island_nv, ctx.done],
-    outputs=[ctx.ih_small],
-  )
-  wp.launch(
-    _prepare_island_small_grad,
-    dim=(d.nworld, m.ntree),
-    inputs=[d.nisland, d.island_nv, d.island_idofadr, ctx.done, ctx.grad],
-    outputs=[ctx.ih_small_grad],
-  )
   wp.launch_tiled(
     _cholesky_solve_small_island(32),
     dim=(d.nworld, m.ntree),
-    inputs=[d.nisland, d.island_nv, ctx.done, ctx.ih_small, ctx.ih_small_grad],
-    outputs=[ctx.ih_small_Mgrad],
-    block_dim=m.block_dim.update_gradient_cholesky,
-  )
-  wp.launch(
-    _scatter_island_small_Mgrad,
-    dim=(d.nworld, m.ntree, 32),
-    inputs=[d.nisland, d.island_nv, d.island_idofadr, ctx.done, ctx.ih_small_Mgrad],
+    inputs=[
+      d.nisland,
+      d.island_nv,
+      d.island_idofadr,
+      ctx.done,
+      ctx.grad,
+      ctx.ih_small,
+      ctx.ih_small_grad,
+    ],
     outputs=[ctx.Mgrad],
+    block_dim=m.block_dim.update_gradient_cholesky,
   )
 
   # Large-island scalar Cholesky path (inv > 32)

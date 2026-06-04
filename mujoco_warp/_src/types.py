@@ -2176,9 +2176,8 @@ class IslandSolverContext:
   prev_grad: wp.array2d[float]
   prev_Mgrad: wp.array2d[float]
   h: wp.array3d[float]
-  ih_small: wp.array4d[float]       # (nworld, ntree, 32, 32) — per-island dense H
-  ih_small_grad: wp.array3d[float]  # (nworld, ntree, 32) — per-island RHS
-  ih_small_Mgrad: wp.array3d[float] # (nworld, ntree, 32) — per-island solution
+  ih_small: wp.array4d[float]      # (nworld, ntree, 32, 32) — per-island dense H
+  ih_small_grad: wp.array3d[float] # (nworld, ntree, 32) — per-island RHS
 
   # Per-island solver scalars (nworld, ntree)
   cost: wp.array2d[float]
