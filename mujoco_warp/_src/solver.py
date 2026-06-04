@@ -5106,6 +5106,15 @@ def _update_gradient_JTCJ_island(
 
 @cache_kernel
 def _cholesky_solve_small_island(tile_size: int):
+  # Native snippets for CUDA primitives unavailable in Warp Python.
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.func_native(snippet="return (int)threadIdx.x;")
+  def _thread_idx() -> int:
+    return int(0)
+
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     nisland_in: wp.array[int],
@@ -5123,15 +5132,12 @@ def _cholesky_solve_small_island(tile_size: int):
     Cholesky factor+solve, and _scatter_island_small_Mgrad into a single
     tiled launch.
 
-    PAD and PREPARE use scalar global-memory writes from every thread in
-    the block (all threads write the same value to the same address, so
-    writes are idempotent).  Because every thread writes every element it
-    later tile_loads, within-thread store-to-load ordering (guaranteed by
-    CUDA) ensures each thread sees its own writes without a barrier.
-
-    SCATTER reads directly from the shared-memory sol_tile returned by
-    tile_cholesky_solve, which ends with a WP_TILE_SYNC, so all threads
-    see the complete solution before the scalar writes to Mgrad_out.
+    Each thread handles one element for PAD, PREPARE, and SCATTER so the
+    write count equals the original separate-kernel design.  An explicit
+    WP_TILE_SYNC between the scalar writes and the cooperative tile_load
+    ensures global-memory coherence within the block.  SCATTER reads
+    directly from the shared-memory sol_tile (tile_cholesky_solve ends
+    with WP_TILE_SYNC), avoiding a global-memory round-trip.
     """
     worldid, islandid = wp.tid()
     TILE = wp.static(tile_size)
@@ -5143,17 +5149,20 @@ def _cholesky_solve_small_island(tile_size: int):
     if inv > TILE or inv == 0:
       return
     idofadr = island_idofadr_in[worldid, islandid]
+    tidx = _thread_idx()
 
-    # PAD: set diag=1 on unused rows [inv, TILE). Every thread writes
-    # every element; within-thread ordering guarantees each thread reads
-    # its own stores during the subsequent tile_load.
-    for i in range(inv, TILE):
-      ih_small_inout[worldid, islandid, i, i] = 1.0
+    # PAD: thread tidx writes diagonal element [inv+tidx, inv+tidx].
+    pad_i = tidx + inv
+    if pad_i < TILE:
+      ih_small_inout[worldid, islandid, pad_i, pad_i] = 1.0
 
-    # PREPARE: scalar gather grad -> ih_small_grad for active entries.
-    # Same all-threads-write-all-elements pattern as PAD.
-    for i in range(inv):
-      ih_small_grad_inout[worldid, islandid, i] = grad_in[worldid, idofadr + i]
+    # PREPARE: thread tidx writes grad element tidx (if in active range).
+    if tidx < inv:
+      ih_small_grad_inout[worldid, islandid, tidx] = grad_in[worldid, idofadr + tidx]
+
+    # Ensure all scalar global-memory writes above are visible to all
+    # threads before the cooperative tile_load reads them back.
+    _syncthreads()
 
     # TILE: cooperative factor and solve.
     mat_tile = wp.tile_load(ih_small_inout[worldid, islandid], shape=(TILE, TILE))
@@ -5163,9 +5172,10 @@ def _cholesky_solve_small_island(tile_size: int):
 
     # SCATTER: tile_cholesky_solve returns a shared-memory tile and ends
     # with WP_TILE_SYNC, so tile_extract reads coherent shared memory.
-    # This avoids a global-memory round-trip through ih_small_Mgrad.
-    for i in range(inv):
-      Mgrad_out[worldid, idofadr + i] = wp.tile_extract(sol_tile, i)
+    # Each thread scatters its own element (tidx < inv), mirroring the
+    # original per-thread scatter kernel.
+    if tidx < inv:
+      Mgrad_out[worldid, idofadr + tidx] = wp.tile_extract(sol_tile, tidx)
 
   return kernel
 
