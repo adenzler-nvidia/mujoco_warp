@@ -4021,30 +4021,6 @@ def _small_row_category(row: int, nrow_eq: int, nrow_fr: int) -> int:
 
 
 @wp.func
-def _small_row_dot(
-  # Data in:
-  efc_J_rownnz_in: wp.array2d[int],
-  efc_J_rowadr_in: wp.array2d[int],
-  efc_J_colind_in: wp.array3d[int],
-  efc_J_in: wp.array3d[float],
-  map_dof2idof_in: wp.array2d[int],
-  # In:
-  worldid: int,
-  efcid: int,
-  idofadr: int,
-  x: _vec_small,
-) -> float:
-  """J[efcid] @ x for an island-local vector x."""
-  rowadr = efc_J_rowadr_in[worldid, efcid]
-  out = float(0.0)
-  for k in range(efc_J_rownnz_in[worldid, efcid]):
-    adr = rowadr + k
-    col = map_dof2idof_in[worldid, efc_J_colind_in[worldid, 0, adr]] - idofadr
-    out += efc_J_in[worldid, 0, adr] * x[col]
-  return out
-
-
-@wp.func
 def _small_matvec(A: _mat_small, x: _vec_small, n: int) -> _vec_small:
   out = _vec_small()
   for i in range(n):
@@ -4094,28 +4070,27 @@ def _small_cholesky_solve(H: _mat_small, b: _vec_small, n: int) -> _vec_small:
   return x
 
 
+# One warp per small island: each lane owns up to two constraint rows (kept in registers),
+# lanes combine row sums with block reductions, and every lane repeats the small DOF-space work.
+_SMALL_LANES = 32
+_SMALL_ROWS_PER_LANE = (_SMALL_ISLAND_NEFC + _SMALL_LANES - 1) // _SMALL_LANES
+_rows_J = wp.types.matrix(shape=(_SMALL_ROWS_PER_LANE, _SMALL_ISLAND_NV), dtype=float)
+_rows_float = wp.types.vector(length=_SMALL_ROWS_PER_LANE, dtype=float)
+_rows_int = wp.types.vector(length=_SMALL_ROWS_PER_LANE, dtype=int)
+
+
 @wp.func
-def _small_newton_direction(
-  # Data in:
-  efc_J_rownnz_in: wp.array2d[int],
-  efc_J_rowadr_in: wp.array2d[int],
-  efc_J_colind_in: wp.array3d[int],
-  efc_J_in: wp.array3d[float],
-  efc_D_in: wp.array2d[float],
-  efc_aref_in: wp.array2d[float],
-  efc_frictionloss_in: wp.array2d[float],
-  map_dof2idof_in: wp.array2d[int],
-  map_iefc2efc_in: wp.array2d[int],
+def _small_newton_step(
   # In:
-  worldid: int,
   n: int,
+  lane: int,
   nrow: int,
-  nrow_eq: int,
-  nrow_fr: int,
-  idofadr: int,
-  iefcadr: int,
+  rows_category: _rows_int,
+  rows_J: _rows_J,
+  rows_D: _rows_float,
+  rows_f: _rows_float,
+  rows_jaref: _rows_float,
   inertia: _mat_small,
-  acc: _vec_small,
   Ma: _vec_small,
   frc_smooth: _vec_small,
 ) -> tuple[_vec_small, float, float, float]:
@@ -4123,38 +4098,29 @@ def _small_newton_direction(
 
   Returns (search, search_dot, grad_dot, newton_decrement).
   """
-  qfrc_constraint = _vec_small()
-  H = inertia
-  for r in range(nrow):
-    efcid = map_iefc2efc_in[worldid, iefcadr + r]
-    category = _small_row_category(r, nrow_eq, nrow_fr)
-    D = efc_D_in[worldid, efcid]
-    jaref = (
-      _small_row_dot(efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, map_dof2idof_in, worldid, efcid, idofadr, acc)
-      - efc_aref_in[worldid, efcid]
-    )
-    frictionloss = wp.where(category == _ROW_FRICTION, efc_frictionloss_in[worldid, efcid], 0.0)
-    res = _eval_constraint(
-      category == _ROW_EQUALITY, category == _ROW_FRICTION, False, jaref, D, frictionloss, efcid, -1, 0.0, 0.0, 0.0, 0.0, 0.0
-    )
-    force = res[0]
-    quadratic = int(res[1]) == types.ConstraintState.QUADRATIC.value
-    rowadr = efc_J_rowadr_in[worldid, efcid]
-    rownnz = efc_J_rownnz_in[worldid, efcid]
-    for k1 in range(rownnz):
-      adr1 = rowadr + k1
-      i = map_dof2idof_in[worldid, efc_J_colind_in[worldid, 0, adr1]] - idofadr
-      J1 = efc_J_in[worldid, 0, adr1]
-      qfrc_constraint[i] += J1 * force
-      if quadratic:
-        for k2 in range(rownnz):
-          adr2 = rowadr + k2
-          j = map_dof2idof_in[worldid, efc_J_colind_in[worldid, 0, adr2]] - idofadr
-          H[i, j] += J1 * D * efc_J_in[worldid, 0, adr2]
+  frc_constraint = _vec_small()
+  JDJ = _mat_small()
+  for s in range(_SMALL_ROWS_PER_LANE):
+    row = lane + s * _SMALL_LANES
+    if row < nrow:
+      category = rows_category[s]
+      D = rows_D[s]
+      res = _eval_constraint(
+        category == _ROW_EQUALITY, category == _ROW_FRICTION, False, rows_jaref[s], D, rows_f[s], 0, -1, 0.0, 0.0, 0.0, 0.0, 0.0
+      )
+      quadratic = int(res[1]) == types.ConstraintState.QUADRATIC.value
+      for i in range(n):
+        Ji = rows_J[s, i]
+        frc_constraint[i] += Ji * res[0]
+        if quadratic:
+          for j in range(n):
+            JDJ[i, j] += Ji * D * rows_J[s, j]
+  frc_constraint = wp.tile_reduce(wp.add, wp.tile(frc_constraint, preserve_type=True))[0]
+  H = inertia + wp.tile_reduce(wp.add, wp.tile(JDJ, preserve_type=True))[0]
 
   grad = _vec_small()
   for i in range(n):
-    grad[i] = Ma[i] - frc_smooth[i] - qfrc_constraint[i]
+    grad[i] = Ma[i] - frc_smooth[i] - frc_constraint[i]
   solution = _small_cholesky_solve(H, grad, n)
   search = _vec_small()
   for i in range(n):
@@ -4174,7 +4140,6 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
     opt_ls_tolerance: wp.array[float],
     opt_cone: int,
     opt_iterations: int,
-    stat_meaninertia: wp.array[float],
     M_elemid: wp.array2d[int],
     # Data in:
     nisland_in: wp.array[int],
@@ -4204,12 +4169,12 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
     # Out:
     niter_out: wp.array[int],
   ):
-    worldid, islandid = wp.tid()
+    worldid, islandid, lane = wp.tid()
     if islandid >= nisland_in[worldid]:
       return
     n = island_nv_in[worldid, islandid]
-    nefc = island_nefc_in[worldid, islandid]
-    if not _is_small_island(opt_cone, n, nefc):
+    nrow = island_nefc_in[worldid, islandid]
+    if not _is_small_island(opt_cone, n, nrow):
       return
 
     ne = island_ne_in[worldid, islandid]
@@ -4218,9 +4183,7 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
     iefcadr = island_iefcadr_in[worldid, islandid]
     tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
     ls_tolerance = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
-    scale = stat_meaninertia[worldid % stat_meaninertia.shape[0]] * float(n)
-
-    # island DOFs: start point, smooth force and inertia block
+    # island DOFs: start point, smooth force and inertia block (every lane)
     qacc = _vec_small()
     qfrc_smooth = _vec_small()
     M = _mat_small()
@@ -4241,43 +4204,66 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
         M[j, i] = mij
     Ma = _small_matvec(M, qacc, n)
 
-    search, search_dot, grad_dot, newton_decrement = _small_newton_direction(
-      efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, efc_D_in, efc_aref_in, efc_frictionloss_in,
-      map_dof2idof_in, map_iefc2efc_in, worldid, n, nefc, ne, nf, idofadr, iefcadr, M, qacc, Ma, qfrc_smooth,
-    )  # fmt: skip
+    # MuJoCo scales an island's convergence tests by its inertia trace instead of meaninertia * nv
+    scale = float(0.0)
+    for i in range(n):
+      scale += M[i, i]
+
+    # this lane's rows: island-local Jacobian and row data
+    rows_category = _rows_int()
+    rows_J = _rows_J()
+    rows_D = _rows_float()
+    rows_f = _rows_float()
+    rows_jaref = _rows_float()
+    rows_jv = _rows_float()
+    for s in range(_SMALL_ROWS_PER_LANE):
+      row = lane + s * _SMALL_LANES
+      if row < nrow:
+        efcid = map_iefc2efc_in[worldid, iefcadr + row]
+        category = _small_row_category(row, ne, nf)
+        rows_category[s] = category
+        rows_D[s] = efc_D_in[worldid, efcid]
+        rows_f[s] = wp.where(category == _ROW_FRICTION, efc_frictionloss_in[worldid, efcid], 0.0)
+        rowadr = efc_J_rowadr_in[worldid, efcid]
+        jaref = -efc_aref_in[worldid, efcid]
+        for k in range(efc_J_rownnz_in[worldid, efcid]):
+          adr = rowadr + k
+          col = map_dof2idof_in[worldid, efc_J_colind_in[worldid, 0, adr]] - idofadr
+          rows_J[s, col] = efc_J_in[worldid, 0, adr]
+          jaref += efc_J_in[worldid, 0, adr] * qacc[col]
+        rows_jaref[s] = jaref
+
+    search, search_dot, grad_dot, newton_decrement = _small_newton_step(
+      n, lane, nrow, rows_category, rows_J, rows_D, rows_f, rows_jaref, M, Ma, qfrc_smooth
+    )
 
     niter = int(0)
     done = bool(False)
     while niter < opt_iterations and not done:
       # --- linesearch along search (see _linesearch_iterative_kernel) ---
       mv = _small_matvec(M, search, n)
-      gauss1 = float(0.0)
-      gauss2 = float(0.0)
+      local_gauss = wp.vec2(0.0)
+      local_p0 = wp.vec3(0.0)
+      for s in range(_SMALL_ROWS_PER_LANE):
+        row = lane + s * _SMALL_LANES
+        if row < nrow:
+          jv = float(0.0)
+          for i in range(n):
+            jv += rows_J[s, i] * search[i]
+          rows_jv[s] = jv
+          if rows_category[s] == _ROW_EQUALITY:
+            jvD = jv * rows_D[s]
+            local_gauss += wp.vec2(jvD * rows_jaref[s], 0.5 * jv * jvD)
+          else:
+            local_p0 += _row_eval_pt_alpha_zero(rows_category[s], rows_D[s], rows_f[s], rows_jaref[s], jv)
+      gauss_rows = wp.tile_reduce(wp.add, wp.tile(local_gauss, preserve_type=True))[0]
+      p0_rows = wp.tile_reduce(wp.add, wp.tile(local_p0, preserve_type=True))[0]
+
+      gauss1 = gauss_rows[0]
+      gauss2 = gauss_rows[1]
       for i in range(n):
         gauss1 += search[i] * (Ma[i] - qfrc_smooth[i])
         gauss2 += 0.5 * search[i] * mv[i]
-
-      p0_rows = wp.vec3(0.0)
-      for r in range(nefc):
-        efcid = map_iefc2efc_in[worldid, iefcadr + r]
-        category = _small_row_category(r, ne, nf)
-        D = efc_D_in[worldid, efcid]
-        jaref = (
-          _small_row_dot(
-            efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, map_dof2idof_in, worldid, efcid, idofadr, qacc
-          )
-          - efc_aref_in[worldid, efcid]
-        )
-        jv = _small_row_dot(
-          efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, map_dof2idof_in, worldid, efcid, idofadr, search
-        )
-        if category == _ROW_EQUALITY:
-          jvD = jv * D
-          gauss1 += jvD * jaref
-          gauss2 += 0.5 * jv * jvD
-        else:
-          f = wp.where(category == _ROW_FRICTION, efc_frictionloss_in[worldid, efcid], 0.0)
-          p0_rows += _row_eval_pt_alpha_zero(category, D, f, jaref, jv)
       quad_gauss = wp.vec3(0.0, gauss1, gauss2)
 
       gtol = wp.max(tolerance * ls_tolerance * wp.sqrt(search_dot) * scale, 1e-6)
@@ -4286,29 +4272,23 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
       q1_abs = wp.sqrt(2.0 * wp.max(p0_rows[0], 0.0) * wp.max(p0_rows[2], 0.0)) + wp.abs(gauss1)
       gtol_accept = wp.max(gtol, _ALPHA_NOISE_EPS * q1_abs)
 
-      # evaluates the shifted cost at three step sizes in one pass over the rows
       lo_alpha_in = -math.safe_div(p0[1], p0[2])
-      lo_in = _eval_pt(quad_gauss, lo_alpha_in)
-      for r in range(ne, nefc):
-        efcid = map_iefc2efc_in[worldid, iefcadr + r]
-        category = _small_row_category(r, ne, nf)
-        D = efc_D_in[worldid, efcid]
-        jaref = (
-          _small_row_dot(
-            efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, map_dof2idof_in, worldid, efcid, idofadr, qacc
-          )
-          - efc_aref_in[worldid, efcid]
-        )
-        jv = _small_row_dot(
-          efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, map_dof2idof_in, worldid, efcid, idofadr, search
-        )
-        f = wp.where(category == _ROW_FRICTION, efc_frictionloss_in[worldid, efcid], 0.0)
-        lo_in += _row_eval_pt(category, lo_alpha_in, D, f, jaref, jv)
+      local_lo_in = wp.vec3(0.0)
+      for s in range(_SMALL_ROWS_PER_LANE):
+        row = lane + s * _SMALL_LANES
+        if row < nrow and rows_category[s] != _ROW_EQUALITY:
+          local_lo_in += _row_eval_pt(rows_category[s], lo_alpha_in, rows_D[s], rows_f[s], rows_jaref[s], rows_jv[s])
+      lo_in = _eval_pt(quad_gauss, lo_alpha_in) + wp.tile_reduce(wp.add, wp.tile(local_lo_in, preserve_type=True))[0]
 
       alpha = float(0.0)
       improvement = float(0.0)
-      ls_converged = wp.abs(lo_in[1]) < gtol_accept and lo_in[0] < 0.0
-      if ls_converged:
+      # an island that starts at its solution is stationary along search; its cost changes are
+      # float32 noise, so the strict-decrease test below would never accept (MuJoCo accepts too)
+      stationary = wp.abs(p0[1]) < gtol
+      ls_converged = stationary or (wp.abs(lo_in[1]) < gtol_accept and lo_in[0] < 0.0)
+      if stationary:
+        pass
+      elif ls_converged:
         alpha = lo_alpha_in
         improvement = -lo_in[0]
       else:
@@ -4323,24 +4303,33 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
           hi_next_alpha = hi_alpha - math.safe_div(hi[1], hi[2])
           mid_alpha = 0.5 * (lo_alpha + hi_alpha)
 
-          lo_next, hi_next, mid = _eval_pt_3alphas(quad_gauss, lo_next_alpha, hi_next_alpha, mid_alpha)
-          for r in range(ne, nefc):
-            efcid = map_iefc2efc_in[worldid, iefcadr + r]
-            category = _small_row_category(r, ne, nf)
-            D = efc_D_in[worldid, efcid]
-            jaref = (
-              _small_row_dot(
-                efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, map_dof2idof_in, worldid, efcid, idofadr, qacc
-              )
-              - efc_aref_in[worldid, efcid]
-            )
-            jv = _small_row_dot(
-              efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, map_dof2idof_in, worldid, efcid, idofadr, search
-            )
-            f = wp.where(category == _ROW_FRICTION, efc_frictionloss_in[worldid, efcid], 0.0)
-            lo_next += _row_eval_pt(category, lo_next_alpha, D, f, jaref, jv)
-            hi_next += _row_eval_pt(category, hi_next_alpha, D, f, jaref, jv)
-            mid += _row_eval_pt(category, mid_alpha, D, f, jaref, jv)
+          local_lo = wp.vec3(0.0)
+          local_hi = wp.vec3(0.0)
+          local_mid = wp.vec3(0.0)
+          for s in range(_SMALL_ROWS_PER_LANE):
+            row = lane + s * _SMALL_LANES
+            if row < nrow and rows_category[s] != _ROW_EQUALITY:
+              category = rows_category[s]
+              local_lo += _row_eval_pt(category, lo_next_alpha, rows_D[s], rows_f[s], rows_jaref[s], rows_jv[s])
+              local_hi += _row_eval_pt(category, hi_next_alpha, rows_D[s], rows_f[s], rows_jaref[s], rows_jv[s])
+              local_mid += _row_eval_pt(category, mid_alpha, rows_D[s], rows_f[s], rows_jaref[s], rows_jv[s])
+          # one reduction for all three candidates (columns: lo, hi, mid)
+          local_combined = wp.mat33(
+            local_lo[0],
+            local_hi[0],
+            local_mid[0],
+            local_lo[1],
+            local_hi[1],
+            local_mid[1],
+            local_lo[2],
+            local_hi[2],
+            local_mid[2],
+          )
+          result = wp.tile_reduce(wp.add, wp.tile(local_combined, preserve_type=True))[0]
+          gauss_lo, gauss_hi, gauss_mid = _eval_pt_3alphas(quad_gauss, lo_next_alpha, hi_next_alpha, mid_alpha)
+          lo_next = gauss_lo + wp.vec3(result[0, 0], result[1, 0], result[2, 0])
+          hi_next = gauss_hi + wp.vec3(result[0, 1], result[1, 1], result[2, 1])
+          mid = gauss_mid + wp.vec3(result[0, 2], result[1, 2], result[2, 2])
 
           conv_lo = wp.abs(lo_next[1]) < gtol_accept and lo_next[0] < 0.0
           conv_hi = wp.abs(hi_next[1]) < gtol_accept and hi_next[0] < 0.0
@@ -4401,7 +4390,7 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
             ls_converged = True
             break
 
-      if not ls_converged:
+      if not ls_converged and lane == 0:
         if wp.static(bool(warn_overflow & OverflowType.LS_ITERATIONS)):
           wp.printf(
             "linesearch iterations limit reached - please increase ls_iterations beyond %u\n"
@@ -4413,13 +4402,14 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
       for i in range(n):
         qacc[i] += alpha * search[i]
         Ma[i] += alpha * mv[i]
+      for s in range(_SMALL_ROWS_PER_LANE):
+        rows_jaref[s] += alpha * rows_jv[s]
 
-      search, search_dot, grad_dot, newton_decrement = _small_newton_direction(
-        efc_J_rownnz_in, efc_J_rowadr_in, efc_J_colind_in, efc_J_in, efc_D_in, efc_aref_in, efc_frictionloss_in,
-        map_dof2idof_in, map_iefc2efc_in, worldid, n, nefc, ne, nf, idofadr, iefcadr, M, qacc, Ma, qfrc_smooth,
-      )  # fmt: skip
+      search, search_dot, grad_dot, newton_decrement = _small_newton_step(
+        n, lane, nrow, rows_category, rows_J, rows_D, rows_f, rows_jaref, M, Ma, qfrc_smooth
+      )
 
-      # termination (see _solve_done), scaled by the island's DOF count
+      # termination (see _solve_done), scaled by the island's inertia
       niter += 1
       done = (
         (alpha == 0.0)
@@ -4428,18 +4418,18 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
         or (0.5 * newton_decrement / scale < tolerance)
       )
 
-    if not done and niter == opt_iterations and opt_iterations > 0:
-      if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
-        wp.printf(
-          "solver iterations limit reached - please increase iterations beyond %u\n"
-          "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)\n",
-          opt_iterations,
-        )
-      wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
-
-    for i in range(n):
-      qacc_out[worldid, map_idof2dof_in[worldid, idofadr + i]] = qacc[i]
-    wp.atomic_max(niter_out, worldid, niter)
+    if lane < n:
+      qacc_out[worldid, map_idof2dof_in[worldid, idofadr + lane]] = qacc[lane]
+    if lane == 0:
+      if not done and niter == opt_iterations and opt_iterations > 0:
+        if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
+          wp.printf(
+            "solver iterations limit reached - please increase iterations beyond %u\n"
+            "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)\n",
+            opt_iterations,
+          )
+        wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
+      wp.atomic_max(niter_out, worldid, niter)
 
   return kernel
 
@@ -4563,7 +4553,7 @@ def _solve_small_islands(m: types.Model, d: types.Data) -> wp.array:
   """Solve small islands to convergence; returns their iteration count per world."""
   niter = wp.zeros(d.nworld, dtype=int)
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
-  wp.launch(
+  wp.launch_tiled(
     _small_island_solve(warmstart, m.opt.ls_iterations, int(m.opt.warn_overflow)),
     dim=(d.nworld, m.ntree),
     inputs=[
@@ -4571,7 +4561,6 @@ def _solve_small_islands(m: types.Model, d: types.Data) -> wp.array:
       m.opt.ls_tolerance,
       m.opt.cone,
       m.opt.iterations,
-      m.stat.meaninertia,
       m.M_elemid,
       d.nisland,
       d.qacc_warmstart,
@@ -4596,6 +4585,7 @@ def _solve_small_islands(m: types.Model, d: types.Data) -> wp.array:
       d.map_iefc2efc,
     ],
     outputs=[d.qacc, d.overflow, niter],
+    block_dim=_SMALL_LANES,
   )
   return niter
 

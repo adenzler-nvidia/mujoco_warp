@@ -160,11 +160,12 @@ mapped H assembly kernels.
 
 ## Phase 3a notes: small-island fast path (pyramidal cones)
 
-`_small_island_solve`, one thread per island with <= 8 DOFs and <= 64 rows, runs before the main
-solve. It replicates the Newton solver on the island: constraint states and forces
-(`_eval_constraint`), H = M + J'DJ over quadratic rows, Cholesky in registers, the exact bracketing
-line search of `_linesearch_iterative_kernel` (row costs through the same helpers), and the
-`_solve_done` termination test scaled by the island's DOF count. It writes only `qacc`; the main
+`_small_island_solve`, one warp per island with <= 8 DOFs and <= 64 rows (each lane owns up to two
+rows in registers; row sums are block reductions), runs before the main solve. It replicates the
+Newton solver on the island: constraint states and forces (`_eval_constraint`), H = M + J'DJ over
+quadratic rows, Cholesky in registers, the exact bracketing line search of
+`_linesearch_iterative_kernel` (row costs through the same helpers), and the `_solve_done`
+termination test scaled by the island's inertia trace (as MuJoCo's island solver does). It writes only `qacc`; the main
 solve keeps those DOFs fixed (no H row, zero search) and computes their rows' forces, states and
 `qfrc_constraint`. `solver_niter` is the max of the main solve and the small islands.
 
@@ -186,3 +187,26 @@ Results (interleaved, median of 3, ns per world-step):
 Where the time goes with the fast path on: pile256 is 92% Cholesky of the large islands (~660
 DOFs, factored densely; phase 4), pile64 is 47% Cholesky and 13% `_small_island_solve` (one thread
 solves a whole island serially; a warp per island would cut its latency).
+
+### Warp per island
+
+The first version used one thread per island and recomputed J*qacc and J*search through two
+indirections on every line-search pass. On aloha_clutter with pyramidal cones (8-DOF arm islands
+with gripper contacts) it cost 1161 ms of kernel time over 300 steps against a 600 ms saving in the
+main solve, making the step 15% slower. One warp per island with rows in registers and incremental
+Jaref brings the kernel to 343 ms.
+
+Line search at an island's solution: a resting island warm-started at its solution has a search
+direction of ~1e-7 and a slope ~1e-16 at alpha = 0. MJWarp's line search requires a strict cost
+decrease, which float32 noise never provides, so it ran into `ls_iterations` (MuJoCo accepts on the
+slope alone). The fast path treats |slope(0)| < gtol as converged with alpha = 0.
+
+Results (interleaved, median of 3, ns per world-step):
+
+| scene | off | on |
+|---|---|---|
+| aloha_clutter pyramidal, 300 steps | 7712 | 7505 (1.03x) |
+| aloha_clutter pyramidal, full replay | 8080 | 7082 (1.14x, noisy) |
+| pile64 | 20396 | 7052 (2.9x) |
+| pile256 | 5907526 | 432815 (13.7x) |
+| three_humanoids (no small islands) | 546 | 580 (-6%) |
