@@ -1,0 +1,108 @@
+# Small-island fast path for the constraint solver
+
+Status: design + phase 1 in progress. Branch `adenzler/island-fastpath`.
+
+## Problem
+
+The Newton solver treats each world as one problem: a dense `nv_pad x nv_pad` Hessian factored by
+one CTA per world, one global step size, and iterations until the slowest part of the world
+converges. Constraint islands (connected components of kinematic trees linked by constraints) are
+independent subproblems, and the Hessian is block-diagonal across them.
+
+The most common island is a single free body touching only static geometry: 6 DOFs, ~12-21
+constraint rows. In settled scenes these dominate (pile256: 147 of 179 islands, 57% of DOFs;
+aloha_clutter: 5-7 of 12 islands). Warm-started from the previous step, MuJoCo solves them in one
+Newton iteration. Truly unconstrained trees (in no island) are rare (objects in flight).
+
+## Design
+
+Each world's problem is partitioned per step; the partition is exact because islands are
+independent:
+
+| class | definition | solve |
+|---|---|---|
+| U | trees in no island | `qacc = qacc_smooth`, `qfrc_constraint = 0`, no solve |
+| S | island with `nv <= 8` and `nefc <= 64` (tunable) | fused fast-path kernel, each island solved to convergence |
+| L | all other islands | existing Newton solver, restricted to L DOFs via compaction |
+
+### Per step, after island discovery
+
+1. **Bookkeeping.** Per-island DOF and constraint-row counts; constraint rows grouped by island
+   (`map_iefc2efc`, `island_iefcadr`, `island_nefc`); per-world list of S islands.
+2. **U.** Write `qacc_smooth` / zero constraint force for unconstrained DOFs.
+3. **S fast path.** One warp per S island (launch `nworld x ntree` warps, early exit):
+   - load the island's DOFs: M block (from sparse M), `qacc_smooth`, `qfrc_smooth`, warmstart;
+   - load its rows into shared memory: J restricted to the island DOFs (<= 8 floats/row), D,
+     aref, frictionloss, type, cone data;
+   - Newton loop: lanes over rows compute Jaref, constraint state/force (incl. elliptic cones per
+     contact); warp reductions form grad (<= 8) and H = M + J'DJ (+ cone curvature, <= 36 unique
+     entries); 8x8 Cholesky + solve in registers; exact line search over the island's rows;
+     convergence test scaled by the island's DOF count (as MuJoCo);
+   - write `qacc`, `qfrc_constraint`, `efc.Ma` (implicit integrators), row force/state,
+     `solver_niter` (max per world) and iteration-overflow flags.
+4. **L.** Run the existing solver in compacted coordinates over L DOFs, generalizing the sleep
+   compaction (compacted set = awake AND L). S and U rows are inert there: their Jacobian columns
+   are outside the compacted space, so they only add a constant to the cost and nothing to the
+   gradient, Hessian or line search. The S kernel runs after the L solve so S row forces written
+   by the L solve are overwritten. Compacted DOFs are ordered by island, which later enables a
+   block-structured (skyline or per-island tile pool) factorization for L.
+
+### Scope (first version)
+
+Newton only (CG keeps the current path); not the discrete integrator (its metric couples trees
+through tendons and actuators outside islands); islands enabled; `ntree > 1`.
+
+### Risks
+
+- Two solver implementations: the S kernel must reuse the existing row-level functions
+  (constraint state/force, line-search point evaluation, elliptic cone helpers) and differ only
+  in data layout and reductions. Tested against the existing solver on the same islands.
+- Results change: per-island line search and convergence move results toward MuJoCo and away from
+  the current monolithic solve; `solver_niter` becomes the max over islands.
+- Scenes that are entirely L pay the compaction gather/scatter; must be measured
+  (three_humanoids).
+
+## Phases
+
+1. **Bookkeeping.** Make `compute_island_mapping` scale: the constraint-row grouping is
+   O(nisland * nefc) (one thread per island scans all rows) and the size scan is a serial
+   dependent loop. Replace with a deterministic chunked counting sort. Prerequisite for S; also
+   speeds up the sleep path, which runs the mapping every step.
+2. **U and L via generalized compaction.** Exclude U (and later S) DOFs from the global solve.
+   Must match current results when S is empty, at similar cost.
+3. **S fast path kernel.** Tested per island against the existing solver and MuJoCo.
+4. **L factorization.** Block-structured factorization in the island-ordered compacted space
+   (see `adenzler/island-skyline-analysis` for the skyline prototype and layout analysis).
+
+## Phase 1 notes
+
+Measured `compute_island_mapping` (graph-captured, per call):
+
+| scene | nworld | nefc | nisland | total | `_island_map_constraints` | `_island_scan_sizes` |
+|---|---|---|---|---|---|---|
+| pile256 | 32 | 4068 | 178 | 405 us | 238 us | 42 us |
+| pile64 | 512 | 1000 | 42 | 183 us | 112 us | 43 us |
+| three_humanoids | 8192 | 96 | 3 | 99 us | | |
+
+Library sorts are not an option: `segmented_sort_pairs` over worlds takes 120-2500 us and a global
+`radix_sort_pairs` 120-250 us at these sizes, since both sort the full `njmax` capacity.
+
+Counting sort: `make_constraint` emits rows grouped by type in MuJoCo's order (equality, friction,
+limits, contacts; kernels run in sequence), so a stable sort of rows by island alone reproduces
+MuJoCo's per-island layout (equality, friction, other; ascending within each). Rows are split
+into fixed-size chunks; the counting pass also histograms rows per (world, chunk, island); an
+exclusive scan over chunks gives each chunk's base offset per island; a row's rank within its
+chunk is the number of earlier rows in the chunk with the same island. All steps are
+deterministic and parallel.
+
+Result (GPU kernel time per `compute_island_mapping` call, nsys; `njmax = nefc + 400`):
+
+| scene | nworld | before | after |
+|---|---|---|---|
+| pile256 | 32 | 302 us | 38 us |
+| pile64 | 512 | 180 us | 46 us |
+| three_humanoids | 8192 | 99 us | 98 us |
+
+The size scan is now a block-wide tile scan per world. What remains is dominated by the kernels
+that run over every `njmax` row slot (`_init_efc_arrays`, `_island_count_constraints`,
+`_compute_efc_tree`), which could be fused later.
