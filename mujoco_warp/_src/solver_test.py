@@ -1039,6 +1039,77 @@ class SolverTest(parameterized.TestCase):
 
     np.testing.assert_allclose(_get_h(1e-8), _get_h(1.0), rtol=1e-5, atol=1e-6)
 
+  @parameterized.parameters(ConeType.PYRAMIDAL, ConeType.ELLIPTIC)
+  def test_island_solve(self, cone):
+    """Island solve matches the monolithic solve and leaves unconstrained trees unsolved."""
+    pos = {
+      "fly0": "0 0 2",  # unconstrained
+      "fly1": "1 0 2",
+      "fly2": "0 1 2",
+      "fly3": "1 1 2",
+      "s0": "2 0 .049",  # single-body islands on the floor
+      "s1": "3 0 .049",
+      "s2": "4 0 .049",
+      "k0": "5 0 .049",  # stack
+      "k1": "5 0 .148",
+      "k2": "5 0 .247",
+      "w0": "6 0 1",  # welded pair in the air
+      "w1": "6.2 0 1",
+    }
+    bodies = "".join(
+      f'<body name="{n}" pos="{p}"><freejoint/><geom type="box" size=".05 .05 .05"/></body>' for n, p in pos.items()
+    )
+    # w1 spins relative to w0, so the weld loads every DOF of the last compacted tree
+    qvel = np.zeros(6 * len(pos))
+    qvel[-3:] = [1.0, 2.0, 3.0]
+    xml = f"""
+    <mujoco>
+      <worldbody><geom type="plane" size="10 10 .1"/>{bodies}</worldbody>
+      <equality><weld body1="w0" body2="w1"/></equality>
+      <keyframe><key qvel="{" ".join(map(str, qvel))}"/></keyframe>
+    </mujoco>
+    """
+    overrides = {"opt.cone": cone, "opt.solver": SolverType.NEWTON}
+    mjm, mjd, m, d = test_data.fixture(xml=xml, keyframe=0, overrides=overrides)
+    self.assertTrue(m.is_sparse)
+    mujoco.mj_forward(mjm, mjd)
+
+    def run(island_solve):
+      m.opt.island_solve = island_solve
+      # the fixture warmstarts at the solution; start elsewhere so the solver has to iterate
+      d.qacc_warmstart.zero_()
+      d.qacc.fill_(wp.inf)
+      d.qfrc_constraint.fill_(wp.inf)
+      mjw.solve(m, d)
+      return d.qacc.numpy()[0].copy(), d.qfrc_constraint.numpy()[0].copy(), d.efc.force.numpy()[0, : mjd.nefc].copy()
+
+    qacc0, qfrc0, force0 = run(False)
+    qacc1, qfrc1, force1 = run(True)
+    self.assertGreater(np.abs(qacc0[-3:]).min(), 1.0)
+
+    free = np.arange(24)  # fly0..3
+    np.testing.assert_array_equal(qacc1[free], d.qacc_smooth.numpy()[0, free])
+    np.testing.assert_array_equal(qfrc1[free], 0.0)
+    # the compacted factor (48 DOFs + border -> 64) is smaller than the capacity (72 + border -> 80)
+    self.assertEqual(d.ncdof.numpy()[0], mjm.nv - 24)
+    self.assertEqual(d.nvmax_pad, 80)
+
+    np.testing.assert_allclose(qacc1, qacc0, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(qfrc1, qfrc0, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(force1, force0, rtol=1e-4, atol=1e-4)
+    _assert_eq(qacc1, mjd.qacc, "qacc")
+
+    # a short rollout stays close to the monolithic solve (the pyramidal stack alone varies by ~5e-4
+    # run to run, so this only catches plumbing errors such as frozen DOFs or a stale warmstart)
+    qpos = []
+    for island_solve in (False, True):
+      m.opt.island_solve = island_solve
+      d2 = mjw.put_data(mjm, mjd)
+      for _ in range(30):
+        mjw.step(m, d2)
+      qpos.append(d2.qpos.numpy()[0])
+    np.testing.assert_allclose(qpos[1], qpos[0], atol=5e-3)
+
   @parameterized.parameters(
     (ConeType.PYRAMIDAL, SolverType.CG, 25, 5),
     (ConeType.PYRAMIDAL, SolverType.NEWTON, 2, 4),

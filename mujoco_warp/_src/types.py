@@ -945,6 +945,8 @@ class Option:
       sensors are disabled or no sensors are present
     contact_sensor_maxmatch: max number of contacts considered by contact sensor matching criteria
                              contacts matched after this value is exceded will be ignored
+    island_solve: solve constraints per island class (experimental): unconstrained trees are
+                  excluded and constrained ones solved in compacted coordinates
     warn_overflow: overflow warning bitmask (OverflowType)
   """
 
@@ -976,6 +978,7 @@ class Option:
   run_collision_detection: bool
   run_rne_postconstraint: bool
   contact_sensor_maxmatch: int
+  island_solve: bool
   warn_overflow: int
 
   @property

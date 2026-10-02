@@ -2811,10 +2811,20 @@ def _update_gradient_cholesky(tile_size: int, skip_noflip: bool = False):
   return kernel
 
 
+@wp.func
+def _blocked_size(ncdof_in: wp.array[int], worldid: int, tile_size: int, matrix_size: int) -> int:
+  """Factor only the compacted DOFs plus the augmented border, rounded up to the tile size."""
+  if ncdof_in:
+    return wp.min(matrix_size, (ncdof_in[worldid] + tile_size) // tile_size * tile_size)
+  return matrix_size
+
+
 @cache_kernel
 def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_size: int):
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
+    # Data in:
+    ncdof_in: wp.array[int],
     # In:
     ctx_done_in: wp.array[bool],
     ctx_grad_in: wp.array3d[float],
@@ -2839,7 +2849,7 @@ def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_s
     sums = wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
       ctx_h_in[worldid],
       ctx_grad_in[worldid],
-      matrix_size,
+      _blocked_size(ncdof_in, worldid, TILE_SIZE, matrix_size),
       ctx_hfactor[worldid],
       ctx_search_out[worldid],
     )
@@ -2883,6 +2893,8 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
+    # Data in:
+    ncdof_in: wp.array[int],
     # In:
     ctx_done_in: wp.array[bool],
     ctx_grad_in: wp.array3d[float],
@@ -2907,11 +2919,12 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
       if state_changed_count_in[worldid] == 0:
         return
 
+    size = _blocked_size(ncdof_in, worldid, TILE_SIZE, matrix_size)
     if quad_changed_count_in[worldid] > 0:
       sums = wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
         ctx_h_in[worldid],
         ctx_grad_in[worldid],
-        matrix_size,
+        size,
         ctx_hfactor[worldid],
         ctx_search_out[worldid],
       )
@@ -2919,7 +2932,7 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
       sums = wp.static(create_blocked_cholesky_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
         ctx_hfactor[worldid],
         ctx_grad_in[worldid],
-        matrix_size,
+        size,
         ctx_search_out[worldid],
       )
 
@@ -2964,11 +2977,14 @@ def _cholesky_factorize_solve(
       outputs=[ctx.h],
     )
 
+    # compacted DOFs are packed in front, so each world factors only its active block
+    ncdof = d.ncdof if ctx.compact_d_full is not None else None
     if skip_unchanged:
       wp.launch_tiled(
         _update_gradient_cholesky_blocked_skip_unchanged(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv, skip_noflip),
         dim=d.nworld,
         inputs=[
+          ncdof,
           ctx.done,
           ctx.grad.reshape(shape=(d.nworld, ctx.grad.shape[1], 1)),
           ctx.h,
@@ -2987,7 +3003,7 @@ def _cholesky_factorize_solve(
       wp.launch_tiled(
         _update_gradient_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv),
         dim=d.nworld,
-        inputs=[ctx.done, ctx.grad.reshape(shape=(d.nworld, ctx.grad.shape[1], 1)), ctx.h, ctx.hfactor],
+        inputs=[ncdof, ctx.done, ctx.grad.reshape(shape=(d.nworld, ctx.grad.shape[1], 1)), ctx.h, ctx.hfactor],
         outputs=[
           ctx.search.reshape(shape=(d.nworld, m.nv, 1)),
           ctx.search_dot,
@@ -3915,6 +3931,26 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
     _update_gradient(m, d, ctx, compact=compact)
 
 
+def _use_island_solve(m: types.Model, d: types.Data) -> bool:
+  if not m.opt.island_solve:
+    return False
+  supported = (
+    m.opt.solver == types.SolverType.NEWTON
+    and m.is_sparse
+    and m.ntree > 1
+    and not (m.opt.disableflags & types.DisableBit.ISLAND)
+    and m.opt.integrator != types.IntegratorType.DISCRETE
+    and not (m.opt.enableflags & types.EnableBit.SLEEP)
+    and d.cqacc.shape[0] == d.nworld
+  )
+  if not supported:
+    raise ValueError(
+      "opt.island_solve requires the Newton solver, a sparse Jacobian, more than one tree, islands enabled,"
+      " a non-discrete integrator, and sleep disabled"
+    )
+  return True
+
+
 @event_scope
 def solve(m: types.Model, d: types.Data):
   if m.opt.enableflags & types.EnableBit.SLEEP:
@@ -3928,6 +3964,11 @@ def solve(m: types.Model, d: types.Data):
   if d.njmax == 0 or m.nv == 0:
     wp.copy(d.qacc, d.qacc_smooth)
     d.solver_niter.fill_(0)
+  elif _use_island_solve(m, d):
+    island.island(m, d)
+    island.update_active_dofs(m, d, constrained_only=True)
+    solve_compact(m, d, inactive_smooth=True)
+    island.compute_island_mapping(m, d)
   else:
     ctx = _create_solver_context(m, d)
     _solve(m, d, ctx)
@@ -4240,10 +4281,12 @@ def _gather_dof_vecs_compact(
 @wp.kernel
 def _scatter_dof_vecs(
   # Data in:
+  qacc_smooth_in: wp.array2d[float],
   dof_cdof_in: wp.array2d[int],
   # In:
   qacc_c_in: wp.array2d[float],
   qfrc_constraint_c_in: wp.array2d[float],
+  inactive_smooth: bool,
   # Data out:
   qacc_out: wp.array2d[float],
   qfrc_constraint_out: wp.array2d[float],
@@ -4254,7 +4297,8 @@ def _scatter_dof_vecs(
     qacc_out[worldid, i] = qacc_c_in[worldid, ci]
     qfrc_constraint_out[worldid, i] = qfrc_constraint_c_in[worldid, ci]
   else:
-    qacc_out[worldid, i] = 0.0
+    # unconstrained DOFs move freely; sleeping DOFs are frozen
+    qacc_out[worldid, i] = wp.where(inactive_smooth, qacc_smooth_in[worldid, i], 0.0)
     qfrc_constraint_out[worldid, i] = 0.0
 
 
@@ -4303,14 +4347,15 @@ def _gather_J_dense(
 
 
 @event_scope
-def solve_compact(m: types.Model, d: types.Data):
+def solve_compact(m: types.Model, d: types.Data, inactive_smooth: bool = False):
   """Run the dense Newton constraint solver in compacted DOF space.
 
   Gathers the active-DOF inertia, constraint Jacobian, and smooth/warmstart vectors
   into nvmax_pad-sized dense workspaces, runs the stock dense Newton solver on a
   shallow-replaced (m, d) at nvmax_pad, then scatters qacc/qfrc_constraint back.
-  Inactive DOFs are frozen to 0. On the incremental Newton path the solver
-  kernels read the sparse M and J directly through the compaction maps.
+  Inactive DOFs are frozen to 0, or take qacc_smooth with inactive_smooth (they are
+  unconstrained). On the incremental Newton path the solver kernels read the sparse M
+  and J directly through the compaction maps.
   """
   _compact_gather(m, d)
 
@@ -4342,7 +4387,7 @@ def solve_compact(m: types.Model, d: types.Data):
   sctx.compact_d_full = d
   _solve(m2, d2, sctx, compact=True)
 
-  _compact_scatter(m, d)
+  _compact_scatter(m, d, inactive_smooth)
 
 
 @event_scope
@@ -4389,12 +4434,12 @@ def _compact_gather(m: types.Model, d: types.Data):
 
 
 @event_scope
-def _compact_scatter(m: types.Model, d: types.Data):
-  # scatter results back to full DOF space (inactive frozen to 0) in one launch
+def _compact_scatter(m: types.Model, d: types.Data, inactive_smooth: bool):
+  # scatter results back to full DOF space in one launch
   wp.launch(
     _scatter_dof_vecs,
     dim=(d.nworld, m.nv),
-    inputs=[d.dof_cdof, d.cqacc, d.cqfrc_constraint],
+    inputs=[d.qacc_smooth, d.dof_cdof, d.cqacc, d.cqfrc_constraint, inactive_smooth],
     outputs=[d.qacc, d.qfrc_constraint],
   )
 

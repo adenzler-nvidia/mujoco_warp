@@ -106,3 +106,33 @@ Result (GPU kernel time per `compute_island_mapping` call, nsys; `njmax = nefc +
 The size scan is now a block-wide tile scan per world. What remains is dominated by the kernels
 that run over every `njmax` row slot (`_init_efc_arrays`, `_island_count_constraints`,
 `_compute_efc_tree`), which could be fused later.
+
+## Phase 2 notes
+
+Implemented as designed behind the experimental warp-only `opt.island_solve`: trees in no island
+are excluded from the constraint solve (`qacc = qacc_smooth`, zero constraint force), the rest are
+solved through the sleep path's compaction, and the compacted blocked Cholesky factors only
+`round_up(ncdof + 1, 16)` rows per world instead of the static `nvmax_pad` (also used by the sleep
+path).
+
+Overhead with nothing to exclude (median of 3 interleaved runs, ns per world-step):
+
+| scene | off | on |
+|---|---|---|
+| three_humanoids (nworld 8192) | 676 | 824 (-18%) |
+| aloha_clutter awake (nworld 2048) | 5761 | 5961 (-3.5%) |
+| pile64 / pile256 | within noise | |
+
+Kernel attribution on three_humanoids (+41.6 ms over the profiled run): the compacted M*v
+(`_mul_m_sparse_compact`, +23 ms vs -9 ms native), mapped variants of the DOF-space solver kernels
+(~+20 ms), island discovery/mapping/compaction bookkeeping (~+12 ms), Cholesky (-5 ms).
+
+Conclusion: running the whole solver in compacted coordinates is the wrong substrate for L. The
+skyline prototype's approach, keeping the solver native and moving only H assembly and the
+factorization into island-ordered coordinates (gather grad, scatter search), measured +6 ms on the
+same scene. With L DOFs first in that order, the factorization can stop at `round_up(nL + 1, 16)`
+and S/U DOFs get zero gradient and search, which is everything phase 3 needs from the L solve,
+and the island order is what phase 4's block factorization needs.
+
+Testing note: `test_data.fixture` warmstarts at the solution (`qacc_warmstart = qacc`), so solver
+tests must reset the warmstart or they never exercise the factorization.
