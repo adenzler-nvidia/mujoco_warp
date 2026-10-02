@@ -157,3 +157,32 @@ Overhead with nothing to exclude, same setup as above:
 
 The rest is per-step island discovery and mapping, the map/gather/scatter launches, and the
 mapped H assembly kernels.
+
+## Phase 3a notes: small-island fast path (pyramidal cones)
+
+`_small_island_solve`, one thread per island with <= 8 DOFs and <= 64 rows, runs before the main
+solve. It replicates the Newton solver on the island: constraint states and forces
+(`_eval_constraint`), H = M + J'DJ over quadratic rows, Cholesky in registers, the exact bracketing
+line search of `_linesearch_iterative_kernel` (row costs through the same helpers), and the
+`_solve_done` termination test scaled by the island's DOF count. It writes only `qacc`; the main
+solve keeps those DOFs fixed (no H row, zero search) and computes their rows' forces, states and
+`qfrc_constraint`. `solver_niter` is the max of the main solve and the small islands.
+
+Elliptic cones are not on the fast path yet (their islands stay large).
+
+Known approximation: the incremental solver's stable-state fast path rescales the whole stale
+gradient along the ray, including the small islands' converged residual; the error is at that
+residual's level.
+
+Results (interleaved, median of 3, ns per world-step):
+
+| scene | off | on |
+|---|---|---|
+| pile64 (nworld 512) | 25149 | 7559 (3.3x) |
+| pile256 (nworld 32) | 7265992 | 561245 (12.9x) |
+| three_humanoids (no small islands) | 698 | 735 (-5%) |
+| aloha_clutter awake (elliptic) | 7744 | 8053 (-4%) |
+
+Where the time goes with the fast path on: pile256 is 92% Cholesky of the large islands (~660
+DOFs, factored densely; phase 4), pile64 is 47% Cholesky and 13% `_small_island_solve` (one thread
+solves a whole island serially; a warp per island would cut its latency).

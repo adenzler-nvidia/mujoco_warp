@@ -1041,7 +1041,7 @@ class SolverTest(parameterized.TestCase):
 
   @parameterized.parameters(ConeType.PYRAMIDAL, ConeType.ELLIPTIC)
   def test_island_solve(self, cone):
-    """Island solve matches the monolithic solve and leaves unconstrained trees unsolved."""
+    """Island solve matches the monolithic solve; small islands take the fast path."""
     pos = {
       "fly0": "0 0 2",  # unconstrained
       "fly1": "1 0 2",
@@ -1059,12 +1059,19 @@ class SolverTest(parameterized.TestCase):
     bodies = "".join(
       f'<body name="{n}" pos="{p}"><freejoint/><geom type="box" size=".05 .05 .05"/></body>' for n, p in pos.items()
     )
-    # w1 spins relative to w0, so the weld loads every DOF of the last compacted tree
-    qvel = np.zeros(6 * len(pos))
+    # a 2-DOF arm with friction loss, its first hinge past its limit: a small island
+    arm = (
+      '<body name="arm" pos="7 0 1"><joint type="hinge" axis="0 1 0" range="-.5 -.1" frictionloss=".5"/>'
+      '<geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/>'
+      '<body pos=".3 0 0"><joint type="hinge" axis="0 1 0" frictionloss=".2"/>'
+      '<geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/></body></body>'
+    )
+    # w1 spins relative to w0, so the weld loads every DOF of the last tree
+    qvel = np.zeros(2 + 6 * len(pos))
     qvel[-3:] = [1.0, 2.0, 3.0]
     xml = f"""
     <mujoco>
-      <worldbody><geom type="plane" size="10 10 .1"/>{bodies}</worldbody>
+      <worldbody><geom type="plane" size="10 10 .1"/>{arm}{bodies}</worldbody>
       <equality><weld body1="w0" body2="w1"/></equality>
       <keyframe><key qvel="{" ".join(map(str, qvel))}"/></keyframe>
     </mujoco>
@@ -1087,11 +1094,16 @@ class SolverTest(parameterized.TestCase):
     qacc1, qfrc1, force1 = run(True)
     self.assertGreater(np.abs(qacc0[-3:]).min(), 1.0)
 
-    free = np.arange(24)  # fly0..3
+    free = np.arange(2, 26)  # fly0..3
     np.testing.assert_array_equal(qacc1[free], d.qacc_smooth.numpy()[0, free])
     np.testing.assert_array_equal(qfrc1[free], 0.0)
-    # the factored island block (48 DOFs + border -> 64) is smaller than h (72 + border -> 80)
+
+    # only large islands (stack and welded pair) are factored; arm and single boxes are small
+    # (elliptic cones are not on the fast path yet)
+    ctx = solver._create_solver_context(m, d)
+    solver._island_h_order(m, d, ctx)
     self.assertEqual(d.nidof.numpy()[0], mjm.nv - 24)
+    self.assertEqual(ctx.h_nrow.numpy()[0], 30 if cone == ConeType.PYRAMIDAL else mjm.nv - 24)
     self.assertEqual(m.nv_pad, 80)
 
     np.testing.assert_allclose(qacc1, qacc0, rtol=1e-4, atol=1e-4)
