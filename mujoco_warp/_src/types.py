@@ -61,6 +61,7 @@ class BlockDim:
     convex_ccd: convex CCD kernel block dimension (collision_convex)
     actuator_velocity: actuator velocity block dimension (forward)
     island_dsu: island discovery DSU block dimension (island)
+    island_scan_sizes: island size scan block dimension (island)
     ray: ray block dimension (ray)
     contact_sort: contact sort block dimension (sensor)
     energy_vel_kinetic: energy velocity kinetic block dimension (sensor)
@@ -92,6 +93,7 @@ class BlockDim:
   actuator_velocity: int = 32
   # island
   island_dsu: int = 32
+  island_scan_sizes: int = 64
   # ray
   ray: int = 64
   # sensor
