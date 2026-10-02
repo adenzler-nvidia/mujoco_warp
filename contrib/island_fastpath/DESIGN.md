@@ -136,3 +136,24 @@ and the island order is what phase 4's block factorization needs.
 
 Testing note: `test_data.fixture` warmstarts at the solution (`qacc_warmstart = qacc`), so solver
 tests must reset the warmstart or they never exercise the factorization.
+
+### Rework: island order for H only
+
+`opt.island_solve` now keeps the solver in DOF coordinates. Only the Hessian is assembled and
+factored in island order: rows are the island DOFs (`map_idof2dof`, from
+`compute_island_mapping`); DOFs outside the factored block (unconstrained now, small islands in
+phase 3) map to no row, start at their solution (`qacc_smooth` for now) and get a zero search
+direction. The blocked Cholesky factors only `round_up(nidof + 1, 16)` rows; grad is gathered into
+and search scattered out of the island order around it.
+
+Overhead with nothing to exclude, same setup as above:
+
+| scene | off | on |
+|---|---|---|
+| three_humanoids | 569 | 596 (-4.7%) |
+| pile64 | 22076 | 22645 (-2.6%) |
+| pile256 | 5776587 | 5768598 (0%) |
+| aloha_clutter awake | 7135 | 7096 (0%) |
+
+The rest is per-step island discovery and mapping, the map/gather/scatter launches, and the
+mapped H assembly kernels.

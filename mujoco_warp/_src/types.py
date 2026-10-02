@@ -2609,6 +2609,12 @@ class SolverContext:
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None
   compact_d_full: Optional["Data"] = None
+  # opt.island_solve: h rows in island order, DOFs outside H map to -1 (None: h in DOF order)
+  h_row2dof: Optional[wp.array2d[int]] = None
+  h_dof2row: Optional[wp.array2d[int]] = None
+  h_nrow: Optional[wp.array[int]] = None
+  pgrad: Optional[wp.array2d[float]] = None
+  psearch: Optional[wp.array2d[float]] = None
 
 
 @dataclasses.dataclass

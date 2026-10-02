@@ -1090,9 +1090,9 @@ class SolverTest(parameterized.TestCase):
     free = np.arange(24)  # fly0..3
     np.testing.assert_array_equal(qacc1[free], d.qacc_smooth.numpy()[0, free])
     np.testing.assert_array_equal(qfrc1[free], 0.0)
-    # the compacted factor (48 DOFs + border -> 64) is smaller than the capacity (72 + border -> 80)
-    self.assertEqual(d.ncdof.numpy()[0], mjm.nv - 24)
-    self.assertEqual(d.nvmax_pad, 80)
+    # the factored island block (48 DOFs + border -> 64) is smaller than h (72 + border -> 80)
+    self.assertEqual(d.nidof.numpy()[0], mjm.nv - 24)
+    self.assertEqual(m.nv_pad, 80)
 
     np.testing.assert_allclose(qacc1, qacc0, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(qfrc1, qfrc0, rtol=1e-4, atol=1e-4)

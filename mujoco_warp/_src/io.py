@@ -1703,17 +1703,6 @@ _COMPACT_DATA_FIELDS: tuple[str, ...] = (
 )
 
 
-def _island_solve_capable(mjm: mujoco.MjModel) -> bool:
-  """Whether opt.island_solve can be used, so its compacted vectors must be allocated."""
-  return (
-    mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON
-    and mjm.ntree > 1
-    and is_sparse(mjm)
-    and not (mjm.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_ISLAND)
-    and mjm.opt.integrator != types.IntegratorType.DISCRETE
-  )
-
-
 def _allocate_compact_arrays(
   mjm: mujoco.MjModel,
   d: types.Data,
@@ -1721,7 +1710,6 @@ def _allocate_compact_arrays(
   nvmax_pad: int,
   njmax_pad: int,
   compact: bool,
-  island_solve: bool = False,
 ):
   """Allocate workspace for the compacted dense factor/solve (when nvmax is requested).
 
@@ -1735,16 +1723,11 @@ def _allocate_compact_arrays(
   pipeline can run in compacted space and ``d.M`` / ``d.qacc`` etc. become nvmax-sized
   directly, collapsing these ``c*`` shadows into the primary Data fields.
   """
-  # opt.island_solve only needs the compacted vectors: its models are sparse and the smooth
-  # solve stays in full coordinates
-  vectors = compact or island_solve
   nw = nworld if compact else 0
   nvp = nvmax_pad if compact else 0
   njp = njmax_pad if compact else 0
-  nwv = nworld if vectors else 0
-  nvpv = nvmax_pad if vectors else 0
 
-  if vectors:
+  if compact:
     # match the float32 tolerance clamp applied in put_model; rescale by nv/nvmax_pad so
     # the solver's nv-normalized convergence test matches the full-model baseline.
     scale = float(mjm.nv) / float(nvmax_pad)
@@ -1770,12 +1753,12 @@ def _allocate_compact_arrays(
   d.crhs = wp.empty((nw, nvp, 1), dtype=float)
   d.cx = wp.empty((nw, nvp, 1), dtype=float)
   d.cJ = wp.empty((nw, njp, nvp), dtype=float) if alloc_cJ else wp.empty((0, 0, 0), dtype=float)
-  d.cMa = wp.empty((nwv, nvpv), dtype=float)
-  d.cqfrc_smooth = wp.empty((nwv, nvpv), dtype=float)
-  d.cqacc_smooth = wp.empty((nwv, nvpv), dtype=float)
-  d.cqacc_warmstart = wp.empty((nwv, nvpv), dtype=float)
-  d.cqacc = wp.empty((nwv, nvpv), dtype=float)
-  d.cqfrc_constraint = wp.empty((nwv, nvpv), dtype=float)
+  d.cMa = wp.empty((nw, nvp), dtype=float)
+  d.cqfrc_smooth = wp.empty((nw, nvp), dtype=float)
+  d.cqacc_smooth = wp.empty((nw, nvp), dtype=float)
+  d.cqacc_warmstart = wp.empty((nw, nvp), dtype=float)
+  d.cqacc = wp.empty((nw, nvp), dtype=float)
+  d.cqfrc_constraint = wp.empty((nw, nvp), dtype=float)
 
 
 def _initial_body_awake(mjm: mujoco.MjModel, nworld: int, init_asleep: bool) -> np.ndarray:
@@ -1835,7 +1818,6 @@ def make_data(
     mjm.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_ISLAND
   )
   compact_alloc = sleep_enabled or (nvmax is not None)
-  island_alloc = _island_solve_capable(mjm)
 
   if nvmax is None:
     nvmax = mjm.nv
@@ -2007,7 +1989,7 @@ def make_data(
   d = types.Data(**d_kwargs)
 
   _allocate_island_arrays(mjm, d, nworld, njmax, mjd)
-  _allocate_compact_arrays(mjm, d, nworld, sizes["nvmax_pad"], sizes["njmax_pad"], compact_alloc, island_alloc)
+  _allocate_compact_arrays(mjm, d, nworld, sizes["nvmax_pad"], sizes["njmax_pad"], compact_alloc)
   d.ncdof.zero_()
   d.dof_cdof.fill_(-1)
   d.cdof_dof.fill_(-1)
@@ -2061,7 +2043,6 @@ def put_data(
     mjm.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_ISLAND
   )
   compact_alloc = sleep_enabled or (nvmax is not None)
-  island_alloc = _island_solve_capable(mjm)
 
   if nvmax is None:
     nvmax = mjm.nv
@@ -2328,7 +2309,7 @@ def put_data(
   d.qLD = wp.array(np.full((nworld, qld_total), qLD), dtype=float)
 
   _allocate_island_arrays(mjm, d, nworld, njmax, mjd)
-  _allocate_compact_arrays(mjm, d, nworld, sizes["nvmax_pad"], sizes["njmax_pad"], compact_alloc, island_alloc)
+  _allocate_compact_arrays(mjm, d, nworld, sizes["nvmax_pad"], sizes["njmax_pad"], compact_alloc)
   d.ncdof.zero_()
   d.dof_cdof.fill_(-1)
   d.cdof_dof.fill_(-1)

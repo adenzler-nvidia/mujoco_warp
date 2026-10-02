@@ -891,9 +891,7 @@ def _reset_compact_maps(
 
 
 @cache_kernel
-def _compact_dofs_builder(warn_overflow: int, constrained_only: bool):
-  CONSTRAINED_ONLY = constrained_only
-
+def _compact_dofs_builder(warn_overflow: int):
   @wp.kernel(module="unique", enable_backward=False)
   def _compact_dofs(
     # Model:
@@ -902,7 +900,6 @@ def _compact_dofs_builder(warn_overflow: int, constrained_only: bool):
     tree_dofnum: wp.array[int],
     # Data in:
     tree_awake_in: wp.array2d[int],
-    tree_island_in: wp.array2d[int],
     nvmax_in: int,
     # Data out:
     ncdof_out: wp.array[int],
@@ -913,10 +910,6 @@ def _compact_dofs_builder(warn_overflow: int, constrained_only: bool):
     worldid = wp.tid()
     count = int(0)
     for t in range(ntree):
-      # unconstrained trees need no constraint solve
-      if wp.static(CONSTRAINED_ONLY):
-        if tree_island_in[worldid, t] < 0:
-          continue
       if tree_awake_in[worldid, t] == 1:
         adr = tree_dofadr[t]
         num = tree_dofnum[t]
@@ -945,11 +938,8 @@ def _compact_dofs_builder(warn_overflow: int, constrained_only: bool):
 
 
 @event_scope
-def update_active_dofs(m: types.Model, d: types.Data, constrained_only: bool = False):
-  """Rebuild the compaction maps (dof_cdof / cdof_dof) from tree_awake.
-
-  With constrained_only, trees in no island are left out as well.
-  """
+def update_active_dofs(m: types.Model, d: types.Data):
+  """Rebuild the compaction maps (dof_cdof / cdof_dof) from tree_awake."""
   wp.launch(
     _reset_compact_maps,
     dim=(d.nworld, max(m.nv, d.nvmax_pad)),
@@ -957,8 +947,8 @@ def update_active_dofs(m: types.Model, d: types.Data, constrained_only: bool = F
     outputs=[d.dof_cdof, d.cdof_dof],
   )
   wp.launch(
-    _compact_dofs_builder(int(m.opt.warn_overflow), constrained_only),
+    _compact_dofs_builder(int(m.opt.warn_overflow)),
     dim=(d.nworld,),
-    inputs=[m.ntree, m.tree_dofadr, m.tree_dofnum, d.tree_awake, d.tree_island, d.nvmax],
+    inputs=[m.ntree, m.tree_dofadr, m.tree_dofnum, d.tree_awake, d.nvmax],
     outputs=[d.ncdof, d.dof_cdof, d.cdof_dof, d.overflow],
   )
