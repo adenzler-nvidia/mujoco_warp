@@ -280,3 +280,38 @@ Local-memory traffic is 0, registers 167, theoretical occupancy 25%, one launch 
 
 aloha's small islands (8-DOF arms with gripper contacts) spend relatively more time in line-search
 reductions than in the Hessian work this targeted.
+
+## Phase 4b notes: large islands factored in parallel from a tile pool
+
+The packed island order let neighbouring islands share tiles, so a world's large islands had to be
+factored in one serial chain. Now `ctx.h` / `ctx.hfactor` are a per-world tile pool (3D arrays of
+stacked 16x16 tiles): each large island of n DOFs owns a dense block of c = ceil(n / 16) tiles per
+side, starting at an exclusive scan of c^2; grad and search are gathered into island-aligned rows
+(an exclusive scan of 16c). Islands take at most (nv^2 + 30 nv + 225 ntree) / 256 tiles, about the
+dense Hessian's size.
+
+- Layout: `_island_pool_layout` (tile scans per world), `_island_pool_maps` (per DOF: aligned row,
+  pool row of its first tile column, island-local index).
+- Assembly: `_island_pool_init` (one thread per aligned row, island found by binary search on the
+  row bases) writes M and identity padding; `_JTDACJ_sparse` and the incremental update take a pool
+  mode that writes the upper triangle through `_island_pool_add`.
+- Factorization: `_island_pool_cholesky` launches one block per (world, island) running
+  `create_pool_cholesky_newton_func` (factor or solve-only, as the incremental path decides per
+  world); `_island_pool_sums` adds the per-island Newton sums in island order.
+
+Tests: per-island pool Cholesky against numpy (with a NaN-initialized factor), the NaN-poisoned pool
+in the island solve, and each pool block compared with M + J'DJ after a poorly warm-started solve
+(so incremental updates are exercised).
+
+Interleaved, median of 3, ns per world-step, vs the skyline version (GPU partly shared):
+
+| scene | skyline | tile pool |
+|---|---|---|
+| pile64 | 4635 | 4180 (1.11x) |
+| pile256 | 42508 | 31635 (1.34x) |
+| aloha_clutter pyramidal | 7701 | 7621 (1.01x) |
+| aloha_clutter elliptic | 6191 | 5792 (1.07x) |
+| three_humanoids | 751 | 549 (1.37x; at parity with island_solve off) |
+
+pile256's Cholesky no longer appears among its top kernels; the step is now spread over many small,
+launch-bound kernels and the small-island kernel (16%).

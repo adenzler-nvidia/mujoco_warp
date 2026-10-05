@@ -1076,6 +1076,7 @@ class SolverTest(parameterized.TestCase):
         d.efc.D,
         d.efc.state,
         d.dof_cdof,
+        None,
         ctx.Jaref,
         ctx.done,
         groups_per_world,
@@ -1251,32 +1252,51 @@ class SolverTest(parameterized.TestCase):
     np.testing.assert_array_equal(qacc1[free], d.qacc_smooth.numpy()[0, free])
     np.testing.assert_array_equal(qfrc1[free], 0.0)
 
-    # only large islands (stack and welded pair) are factored; arm and single boxes are small
-    # (elliptic cones are not on the fast path yet)
-    ctx = solver._create_solver_context(m, d)
+    # only large islands get a block in the tile pool: the stack (18 DOFs, 2 tiles per side) and the
+    # welded pair (12, 1); arm and single boxes are small (elliptic cones are not on the fast path)
+    ctx = solver._create_solver_context(m, d, island=True)
     solver._island_h_order(m, d, ctx)
     self.assertEqual(d.nidof.numpy()[0], mjm.nv - 24)
-    self.assertEqual(ctx.h_nrow.numpy()[0], 30 if cone == ConeType.PYRAMIDAL else mjm.nv - 24)
-    self.assertEqual(m.nv_pad, 80)
-    # tile envelope: each tile column starts at the island owning its first row; padding is diagonal
-    # pyramidal: stack rows 0-17, welded pair 18-29; elliptic: arm 0-1, boxes 2-19, stack 20-37,
-    # welded pair 38-49
-    top = [0, 0, 32, 48, 64] if cone == ConeType.PYRAMIDAL else [0, 0, 16, 32, 64]
-    np.testing.assert_array_equal(ctx.cholesky_top.numpy()[0], top)
+    nisland = d.nisland.numpy()[0]
+    ntile = ctx.island_ntile.numpy()[0, :nisland]
+    self.assertEqual(sorted(ntile[ntile > 0]), [1, 2] if cone == ConeType.PYRAMIDAL else [1, 1, 1, 1, 1, 2])
 
     np.testing.assert_allclose(qacc1, qacc0, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(qfrc1, qfrc0, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(force1, force0, rtol=1e-4, atol=1e-4)
     _assert_eq(qacc1, mjd.qacc, "qacc")
 
-    # h entries outside the active rows and the tile envelope are neither written nor read
+    # tile pool entries outside the island blocks are neither written nor read
     m.opt.island_solve = True
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver._create_solver_context(m, d, island=True)
     ctx.h.fill_(np.nan)
     ctx.hfactor.fill_(np.nan)
-    d.qacc_warmstart.zero_()
+    # a poor warm start takes several iterations, so the incremental Hessian updates are exercised
+    d.qacc_warmstart.assign(np.random.default_rng(0).uniform(-5.0, 5.0, (1, mjm.nv)))
     solver._solve(m, d, ctx)
-    np.testing.assert_allclose(d.qacc.numpy()[0], qacc1, rtol=1e-5, atol=1e-5)
+    self.assertGreater(d.solver_niter.numpy()[0], 1)
+    np.testing.assert_allclose(d.qacc.numpy()[0], qacc1, rtol=1e-3, atol=1e-3)
+
+    if cone == ConeType.PYRAMIDAL:
+      # each pool block is M + J'DJ over the quadratic rows of its island
+      nefc = d.nefc.numpy()[0]
+      J = np.zeros((nefc, mjm.nv))
+      rownnz, rowadr = d.efc.J_rownnz.numpy()[0], d.efc.J_rowadr.numpy()[0]
+      colind, Jval = d.efc.J_colind.numpy()[0, 0], d.efc.J.numpy()[0, 0]
+      for r in range(nefc):
+        J[r, colind[rowadr[r] : rowadr[r] + rownnz[r]]] = Jval[rowadr[r] : rowadr[r] + rownnz[r]]
+      DQ = d.efc.D.numpy()[0, :nefc] * (d.efc.state.numpy()[0, :nefc] == types.ConstraintState.QUADRATIC)
+      M = np.zeros((mjm.nv, mjm.nv))
+      mujoco.mj_fullM(mjm, mjd, M)
+      pool, row2dof = ctx.h.numpy()[0], ctx.h_row2dof.numpy()[0]
+      for i in np.flatnonzero(ctx.island_ntile.numpy()[0]):
+        c, tilebase, vbase = ctx.island_ntile.numpy()[0, i], ctx.island_tilebase.numpy()[0, i], ctx.island_vbase.numpy()[0, i]
+        dofs = row2dof[vbase : vbase + d.island_nv.numpy()[0, i]]
+        H = M[np.ix_(dofs, dofs)] + J[:, dofs].T @ (DQ[:, None] * J[:, dofs])
+        for ra in range(len(dofs)):
+          for rb in range(ra, len(dofs)):
+            entry = pool[16 * (tilebase + (ra // 16) * c + rb // 16) + ra % 16, rb % 16]
+            np.testing.assert_allclose(entry, H[ra, rb], rtol=1e-4, atol=1e-4)
 
     # a short rollout stays close to the monolithic solve (the pyramidal stack alone varies by ~5e-4
     # run to run, so this only catches plumbing errors such as frozen DOFs or a stale warmstart)
@@ -1290,7 +1310,7 @@ class SolverTest(parameterized.TestCase):
     np.testing.assert_allclose(qpos[1], qpos[0], atol=5e-3)
 
   def test_island_solve_small_cholesky(self):
-    """The single-tile Cholesky (nv <= 32) leaves DOFs outside the island-ordered h unsolved."""
+    """DOFs outside the large islands get no search direction, also for nv <= 32."""
     bodies = "".join(f'<body pos="{x} 0 .049"><freejoint/><geom type="box" size=".05 .05 .05"/></body>' for x in (0, 1))
     _, _, m, d = test_data.fixture(
       xml=f'<mujoco><worldbody><geom type="plane" size="5 5 .1"/>{bodies}</worldbody></mujoco>',
@@ -1298,12 +1318,11 @@ class SolverTest(parameterized.TestCase):
     )
     self.assertLessEqual(m.nv, solver._BLOCK_CHOLESKY_DIM)
     m.opt.island_solve = True
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver._create_solver_context(m, d, island=True)
     solver._island_h_order(m, d, ctx)
 
     # both boxes are small islands, so nothing is left for the main solve to factor
-    self.assertEqual(ctx.h_nrow.numpy()[0], 0)
-    ctx.h.assign(np.tile(np.eye(m.nv_pad, dtype=np.float32), (d.nworld, 1, 1)))
+    np.testing.assert_array_equal(ctx.island_ntile.numpy(), 0)
     ctx.grad.fill_(1.0)
     ctx.done.zero_()
     solver._cholesky_factorize_solve(m, d, ctx)

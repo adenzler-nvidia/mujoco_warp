@@ -28,6 +28,7 @@ from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_augmented_factorize_solve_newton_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_factorize_solve_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_newton_func
+from mujoco_warp._src.block_cholesky import create_pool_cholesky_newton_func
 from mujoco_warp._src.block_cholesky import solve_search_sums
 from mujoco_warp._src.types import InverseContext
 from mujoco_warp._src.types import OverflowType
@@ -64,15 +65,29 @@ def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
   )
 
 
+def _island_pool_size(nv: int, ntree: int) -> tuple[int, int]:
+  """Tiles and aligned rows the island tile pool needs at most.
+
+  An island of n DOFs takes ceil(n / 16) <= (n + 15) / 16 tiles per side, so the islands take at
+  most (nv^2 + 30 nv + 225 ntree) / 256 tiles and nv + 15 ntree aligned rows.
+  """
+  tile = types.TILE_SIZE_JTDAJ_DENSE
+  ntile = -(-(nv * nv + 2 * (tile - 1) * nv + (tile - 1) ** 2 * ntree) // (tile * tile))
+  nrow = -(-(nv + (tile - 1) * ntree) // tile) * tile
+  return ntile, nrow
+
+
 def _create_solver_context(
   m: types.Model,
   d: types.Data,
+  island: bool = False,
 ) -> SolverContext:
   """Create a SolverContext with allocated workspace arrays.
 
   Args:
     m: Model.
     d: Data.
+    island: allocate h and hfactor as island tile pools (opt.island_solve).
 
   Returns:
     SolverContext with allocated arrays.
@@ -86,6 +101,11 @@ def _create_solver_context(
   alloc_hfactor = alloc_h and nv > _BLOCK_CHOLESKY_DIM
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
+
+  h_shape = (nworld, nv_pad, nv_pad)
+  if island:
+    alloc_hfactor = alloc_h
+    h_shape = (nworld, _island_pool_size(nv, m.ntree)[0] * types.TILE_SIZE_JTDAJ_DENSE, types.TILE_SIZE_JTDAJ_DENSE)
 
   return SolverContext(
     Jaref=wp.empty((nworld, njmax), dtype=float),
@@ -107,8 +127,8 @@ def _create_solver_context(
     prev_grad=wp.empty((nworld, nv), dtype=float) if alloc_mgrad else wp.empty((nworld, 0), dtype=float),
     prev_Mgrad=wp.empty((nworld, nv), dtype=float) if alloc_mgrad else wp.empty((nworld, 0), dtype=float),
     beta=wp.empty((nworld,), dtype=float) if alloc_mgrad else wp.empty((0,), dtype=float),
-    h=wp.empty((nworld, nv_pad, nv_pad), dtype=float) if alloc_h else wp.empty((nworld, 0, 0), dtype=float),
-    hfactor=wp.empty((nworld, nv_pad, nv_pad), dtype=float) if alloc_hfactor else wp.empty((nworld, 0, 0), dtype=float),
+    h=wp.empty(h_shape, dtype=float) if alloc_h else wp.empty((nworld, 0, 0), dtype=float),
+    hfactor=wp.empty(h_shape, dtype=float) if alloc_hfactor else wp.empty((nworld, 0, 0), dtype=float),
     quad_changed_ids=wp.empty((nworld, njmax), dtype=int) if alloc_incremental else wp.empty((nworld, 0), dtype=int),
     quad_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
     state_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
@@ -2097,9 +2117,34 @@ def _update_gradient_h_incremental(
     ctx_h_out[worldid, row, col] += delta
 
 
+@wp.func
+def _island_pool_add(
+  # In:
+  worldid: int,
+  rowa: int,
+  la: int,
+  rowb: int,
+  lb: int,
+  value: float,
+  # Out:
+  ctx_h_out: wp.array3d[float],
+):
+  """Add to entry (a, b) of an island block in the tile pool, mirrored into its upper triangle.
+
+  rowa is the pool row of island-local row la within its first tile column; tiles of a block row
+  are 16 rows apart.
+  """
+  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
+  if la <= lb:
+    wp.atomic_add(ctx_h_out[worldid, rowa + TILE * (lb // TILE)], lb % TILE, value)
+  else:
+    wp.atomic_add(ctx_h_out[worldid, rowb + TILE * (la // TILE)], la % TILE, value)
+
+
 @cache_kernel
-def _update_gradient_h_incremental_sparse(compact: bool):
+def _update_gradient_h_incremental_sparse(compact: bool, pool: bool = False):
   COMPACT = compact
+  POOL = pool
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def kernel(
@@ -2112,6 +2157,7 @@ def _update_gradient_h_incremental_sparse(compact: bool):
     efc_state_in: wp.array2d[int],
     dof_cdof_in: wp.array2d[int],
     # In:
+    ctx_h_dof_local_in: wp.array2d[int],
     quad_changed_ids_in: wp.array2d[int],
     quad_changed_count_in: wp.array[int],
     slots_per_world: int,
@@ -2149,6 +2195,15 @@ def _update_gradient_h_incremental_sparse(compact: bool):
         if h != 0.0:
           colindi = efc_J_colind_in[worldid, 0, rowadr + ii]
           colindj = efc_J_colind_in[worldid, 0, rowadr + jj]
+          if wp.static(POOL):
+            rowi = dof_cdof_in[worldid, colindi]
+            rowj = dof_cdof_in[worldid, colindj]
+            if rowi < 0 or rowj < 0:
+              continue
+            li = ctx_h_dof_local_in[worldid, colindi]
+            lj = ctx_h_dof_local_in[worldid, colindj]
+            _island_pool_add(worldid, rowi, li, rowj, lj, h, ctx_h_out)
+            continue
           if wp.static(COMPACT):
             colindi = dof_cdof_in[worldid, colindi]
             colindj = dof_cdof_in[worldid, colindj]
@@ -3043,7 +3098,7 @@ def _blocked_bounds(m: types.Model, d: types.Data, ctx: SolverContext) -> tuple:
   """Active rows and tile envelope the blocked Cholesky reads (None, dense: the whole matrix)."""
   if m.nv <= _BLOCK_CHOLESKY_DIM:
     return None, ctx.cholesky_top
-  nrow = d.ncdof if ctx.compact_d_full is not None else ctx.h_nrow
+  nrow = d.ncdof if ctx.compact_d_full is not None else None
   return nrow, ctx.cholesky_top
 
 
@@ -3055,12 +3110,11 @@ def _cholesky_factorize_solve(
   If skip_unchanged is True (blocked path only), worlds where no constraints
   changed reuse the cached factorization in hfactor instead of refactorizing.
   """
-  # with island_solve, h is in island order: factor it there and map grad and search around it
-  grad, search = ctx.grad, ctx.search
-  if ctx.h_row2dof is not None:
-    wp.launch(_gather_h_rows, dim=(d.nworld, m.nv_pad), inputs=[ctx.done, ctx.h_row2dof, ctx.grad], outputs=[ctx.pgrad])
-    grad, search = ctx.pgrad, ctx.psearch
+  if ctx.island_ntile is not None:
+    _island_pool_factorize_solve(m, d, ctx, skip_unchanged, skip_noflip)
+    return
 
+  grad, search = ctx.grad, ctx.search
   if m.nv <= _BLOCK_CHOLESKY_DIM:
     wp.launch_tiled(
       _update_gradient_cholesky(m.nv, skip_noflip),
@@ -3114,9 +3168,6 @@ def _cholesky_factorize_solve(
         block_dim=m.block_dim.update_gradient_cholesky_blocked,
       )
 
-  if ctx.h_row2dof is not None:
-    wp.launch(_scatter_h_rows, dim=(d.nworld, m.nv), inputs=[ctx.done, ctx.h_dof2row, ctx.psearch], outputs=[ctx.search])
-
 
 # ---------------------------------------------------------------------------
 # Constraint groups contain consecutive rows with identical sparse support. Each thread group
@@ -3127,8 +3178,9 @@ _JTDAJ_OVERSUBSCRIBE_WAVES = 6
 
 
 @cache_kernel
-def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int):
+def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int, pool: bool = False):
   COMPACT = compact
+  POOL = pool
   ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
   MAX_CONDIM = max_condim
 
@@ -3294,6 +3346,7 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int):
     efc_state_in: wp.array2d[int],
     dof_cdof_in: wp.array2d[int],
     # In:
+    ctx_h_dof_local_in: wp.array2d[int],
     ctx_Jaref_in: wp.array2d[float],
     ctx_done_in: wp.array[bool],
     groups_per_world: int,
@@ -3372,6 +3425,15 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int):
               j_col = efc_J_in[worldid, 0, member_adr + block_col]
               hval += j_row * efc_D_in[worldid, member_row] * j_col
         if hval != 0.0:
+          if wp.static(POOL):
+            row_a = dof_cdof_in[worldid, dof_row]
+            row_b = dof_cdof_in[worldid, dof_col]
+            if row_a < 0 or row_b < 0:
+              continue
+            la = ctx_h_dof_local_in[worldid, dof_row]
+            lb = ctx_h_dof_local_in[worldid, dof_col]
+            _island_pool_add(worldid, row_a, la, row_b, lb, hval, h_out)
+            continue
           if wp.static(COMPACT):
             dof_row = dof_cdof_in[worldid, dof_row]
             dof_col = dof_cdof_in[worldid, dof_col]
@@ -3429,12 +3491,31 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       mj = ctx.compact_m_full if sc else m
       dj = ctx.compact_d_full if sc else d
       m_mat = dj.qH if is_discrete else dj.M
-      # h rows are compacted DOFs, island-ordered DOFs, or DOFs; the first two go through maps
+      # h rows are compacted DOFs or DOFs, or h is an island tile pool
+      island = ctx.island_ntile is not None
       mapped, row2dof, dof2row = sc, dj.cdof_dof, dj.dof_cdof
-      if ctx.h_row2dof is not None:
-        mapped, row2dof, dof2row = True, ctx.h_row2dof, ctx.h_dof2row
+      if island:
+        mapped, dof2row = False, ctx.h_dof_poolrow
+        wp.launch(
+          _island_pool_init,
+          dim=(d.nworld, ctx.pgrad.shape[1]),
+          inputs=[
+            mj.M_elemid,
+            d.nisland,
+            m_mat,
+            d.island_nv,
+            ctx.h_row2dof,
+            ctx.island_tilebase,
+            ctx.island_ntile,
+            ctx.island_vbase,
+            ctx.done,
+          ],
+          outputs=[ctx.h],
+        )
       nrow, top = _blocked_bounds(m, d, ctx)
-      if mapped and nrow is not None:
+      if island:
+        pass
+      elif mapped and nrow is not None:
         # one thread per row, writing only what the blocked Cholesky reads
         wp.launch(
           _update_gradient_init_h_envelope,
@@ -3454,7 +3535,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       max_condim = 3
       if m.opt.cone == types.ConeType.ELLIPTIC and m.nmaxcondim > 3:
         max_condim = int(m.nmaxcondim)
-      jtdaj_kernel = _JTDACJ_sparse(mapped, m.opt.cone, max_condim)
+      jtdaj_kernel = _JTDACJ_sparse(mapped, m.opt.cone, max_condim, island)
       jtdaj_inputs = [
         m.opt.impratio_invsqrt,
         d.contact.friction,
@@ -3470,6 +3551,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         d.efc.D,
         d.efc.state,
         dof2row,
+        ctx.h_dof_local,
         ctx.Jaref,
         ctx.done,
         groups_per_world,
@@ -3650,11 +3732,12 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
   if m.is_sparse or sc:
     dj = ctx.compact_d_full if sc else d
     slots = _jtdaj_groups_per_world(d.nworld, ctx.quad_changed_ids.shape[1])
+    island = ctx.island_ntile is not None
     mapped, dof2row = sc, dj.dof_cdof
-    if ctx.h_dof2row is not None:
-      mapped, dof2row = True, ctx.h_dof2row
+    if island:
+      mapped, dof2row = False, ctx.h_dof_poolrow
     wp.launch(
-      _update_gradient_h_incremental_sparse(mapped),
+      _update_gradient_h_incremental_sparse(mapped, island),
       dim=(d.nworld, slots, _JTDAJ_THREADS_PER_GROUP),
       inputs=[
         dj.efc.J_rownnz,
@@ -3664,6 +3747,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
         d.efc.D,
         d.efc.state,
         dof2row,
+        ctx.h_dof_local,
         ctx.quad_changed_ids,
         ctx.quad_changed_count,
         slots,
@@ -4568,8 +4652,15 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
   return kernel
 
 
+@wp.func
+def _island_ntile(cone: int, ndof: int, nrow: int) -> int:
+  """Tiles per side of a large island's block in the pool; small islands take none."""
+  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
+  return wp.where(_is_small_island(cone, ndof, nrow), 0, (ndof + TILE - 1) // TILE)
+
+
 @cache_kernel
-def _island_h_rowadr(ntree: int):
+def _island_pool_layout(ntree: int):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
@@ -4578,52 +4669,201 @@ def _island_h_rowadr(ntree: int):
     island_nv_in: wp.array2d[int],
     island_nefc_in: wp.array2d[int],
     # Out:
-    island_rowadr_out: wp.array2d[int],
-    h_nrow_out: wp.array[int],
+    island_tilebase_out: wp.array2d[int],
+    island_ntile_out: wp.array2d[int],
+    island_vbase_out: wp.array2d[int],
   ):
-    """First H row of each large island (small islands are solved by the fast path)."""
+    """Per large island: tiles per side, first pool tile and first aligned row."""
     worldid = wp.tid()
     nv_tile = wp.tile_load(island_nv_in[worldid], shape=ntree)
     nefc_tile = wp.tile_load(island_nefc_in[worldid], shape=ntree)
     cone_tile = wp.tile_full(shape=ntree, value=opt_cone, dtype=int)
-    large = wp.tile_map(_large_island_nv, cone_tile, nv_tile, nefc_tile)
-    wp.tile_store(island_rowadr_out[worldid], wp.tile_scan_exclusive(large))
-    nrow = wp.tile_sum(large)
-    h_nrow_out[worldid] = nrow[0]
+    ntile = wp.tile_map(_island_ntile, cone_tile, nv_tile, nefc_tile)
+    wp.tile_store(island_ntile_out[worldid], ntile)
+    wp.tile_store(island_tilebase_out[worldid], wp.tile_scan_exclusive(wp.tile_map(wp.mul, ntile, ntile)))
+    wp.tile_store(island_vbase_out[worldid], wp.tile_scan_exclusive(ntile) * wp.static(types.TILE_SIZE_JTDAJ_DENSE))
 
   return kernel
 
 
-@wp.func
-def _large_island_nv(cone: int, ndof: int, nrow: int) -> int:
-  return wp.where(_is_small_island(cone, ndof, nrow), 0, ndof)
-
-
 @wp.kernel
-def _island_h_maps(
-  # Model:
-  opt_cone: int,
+def _island_pool_maps(
   # Data in:
   dof_island_in: wp.array2d[int],
   island_idofadr_in: wp.array2d[int],
-  island_nv_in: wp.array2d[int],
-  island_nefc_in: wp.array2d[int],
   map_dof2idof_in: wp.array2d[int],
   # In:
-  island_rowadr_in: wp.array2d[int],
+  island_tilebase_in: wp.array2d[int],
+  island_ntile_in: wp.array2d[int],
+  island_vbase_in: wp.array2d[int],
   # Out:
   h_row2dof_out: wp.array2d[int],
   h_dof2row_out: wp.array2d[int],
+  h_dof_poolrow_out: wp.array2d[int],
+  h_dof_local_out: wp.array2d[int],
 ):
-  """H rows are the DOFs of large islands in island order; all other DOFs get no row."""
+  """Aligned vector row, pool row (first tile column) and local index of each large-island DOF."""
   worldid, dofid = wp.tid()
-  islandid = dof_island_in[worldid, dofid]
+  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
   row = int(-1)
+  poolrow = int(-1)
+  local = int(-1)
+  islandid = dof_island_in[worldid, dofid]
   if islandid >= 0:
-    if not _is_small_island(opt_cone, island_nv_in[worldid, islandid], island_nefc_in[worldid, islandid]):
-      row = island_rowadr_in[worldid, islandid] + map_dof2idof_in[worldid, dofid] - island_idofadr_in[worldid, islandid]
+    ntile = island_ntile_in[worldid, islandid]
+    if ntile > 0:
+      local = map_dof2idof_in[worldid, dofid] - island_idofadr_in[worldid, islandid]
+      row = island_vbase_in[worldid, islandid] + local
+      poolrow = TILE * (island_tilebase_in[worldid, islandid] + (local // TILE) * ntile) + local % TILE
       h_row2dof_out[worldid, row] = dofid
   h_dof2row_out[worldid, dofid] = row
+  h_dof_poolrow_out[worldid, dofid] = poolrow
+  h_dof_local_out[worldid, dofid] = local
+
+
+@wp.kernel
+def _island_pool_init(
+  # Model:
+  M_elemid: wp.array2d[int],
+  # Data in:
+  nisland_in: wp.array[int],
+  M_in: wp.array2d[float],
+  island_nv_in: wp.array2d[int],
+  # In:
+  h_row2dof_in: wp.array2d[int],
+  island_tilebase_in: wp.array2d[int],
+  island_ntile_in: wp.array2d[int],
+  island_vbase_in: wp.array2d[int],
+  ctx_done_in: wp.array[bool],
+  # Out:
+  ctx_h_out: wp.array3d[float],
+):
+  """Upper triangle of one row of an island block in the tile pool: M, identity on padding."""
+  worldid, row = wp.tid()
+  if ctx_done_in[worldid]:
+    return
+  nisland = nisland_in[worldid]
+  if nisland == 0:
+    return
+
+  # the owning island is the last one whose aligned rows start at or before this row
+  lo = int(0)
+  hi = nisland
+  while hi - lo > 1:
+    mid = (lo + hi) // 2
+    if island_vbase_in[worldid, mid] <= row:
+      lo = mid
+    else:
+      hi = mid
+  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
+  ntile = island_ntile_in[worldid, lo]
+  vbase = island_vbase_in[worldid, lo]
+  la = row - vbase
+  if la >= TILE * ntile:
+    return
+
+  n = island_nv_in[worldid, lo]
+  tilebase = island_tilebase_in[worldid, lo]
+  dofa = h_row2dof_in[worldid, row]
+  for lb in range(la, TILE * ntile):
+    value = float(0.0)
+    if la < n and lb < n:
+      dofb = h_row2dof_in[worldid, vbase + lb]
+      elemid = M_elemid[wp.max(dofa, dofb), wp.min(dofa, dofb)]
+      if elemid >= 0:
+        value = M_in[worldid, elemid]
+    elif la == lb:
+      value = 1.0
+    ctx_h_out[worldid, TILE * (tilebase + (la // TILE) * ntile + lb // TILE) + la % TILE, lb % TILE] = value
+
+
+@cache_kernel
+def _island_pool_cholesky(tile_size: int, max_size: int, skip_unchanged: bool, skip_noflip: bool):
+  SKIP_UNCHANGED = skip_unchanged
+  SKIP_NOFLIP = skip_noflip
+
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
+  def kernel(
+    # Data in:
+    nisland_in: wp.array[int],
+    # In:
+    ctx_done_in: wp.array[bool],
+    quad_changed_count_in: wp.array[int],
+    state_changed_count_in: wp.array[int],
+    ctx_island_tilebase_in: wp.array2d[int],
+    ctx_island_ntile_in: wp.array2d[int],
+    ctx_island_vbase_in: wp.array2d[int],
+    ctx_pgrad_in: wp.array3d[float],
+    ctx_h_in: wp.array3d[float],
+    # Out:
+    ctx_hfactor_out: wp.array3d[float],
+    ctx_psearch_out: wp.array3d[float],
+    ctx_island_sums_out: wp.array2d[wp.vec2],
+  ):
+    """Factor (or reuse the factor of) one large island's block and solve its Newton step."""
+    worldid, islandid = wp.tid()
+    if ctx_done_in[worldid]:
+      return
+    # an unchanged ray keeps its previous search direction (see _update_gradient_cholesky_blocked)
+    if wp.static(SKIP_NOFLIP):
+      if state_changed_count_in[worldid] == 0:
+        return
+    if islandid >= nisland_in[worldid]:
+      return
+    ntile = ctx_island_ntile_in[worldid, islandid]
+    if ntile == 0:
+      return
+
+    tilebase = ctx_island_tilebase_in[worldid, islandid]
+    vbase = ctx_island_vbase_in[worldid, islandid]
+    factorize = True
+    if wp.static(SKIP_UNCHANGED):
+      factorize = quad_changed_count_in[worldid] > 0
+    if factorize:
+      sums = wp.static(create_pool_cholesky_newton_func(tile_size, max_size, True))(
+        ctx_h_in[worldid], ctx_pgrad_in[worldid], tilebase, ntile, vbase, ctx_hfactor_out[worldid], ctx_psearch_out[worldid]
+      )
+    else:
+      sums = wp.static(create_pool_cholesky_newton_func(tile_size, max_size, False))(
+        ctx_h_in[worldid], ctx_pgrad_in[worldid], tilebase, ntile, vbase, ctx_hfactor_out[worldid], ctx_psearch_out[worldid]
+      )
+    ctx_island_sums_out[worldid, islandid] = sums
+
+  return kernel
+
+
+@cache_kernel
+def _island_pool_sums(skip_noflip: bool):
+  SKIP_NOFLIP = skip_noflip
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    nisland_in: wp.array[int],
+    # In:
+    ctx_done_in: wp.array[bool],
+    state_changed_count_in: wp.array[int],
+    ctx_island_ntile_in: wp.array2d[int],
+    ctx_island_sums_in: wp.array2d[wp.vec2],
+    # Out:
+    ctx_search_dot_out: wp.array[float],
+    ctx_newton_decrement_out: wp.array[float],
+  ):
+    """Sum the islands' Newton step sums in island order (deterministic)."""
+    worldid = wp.tid()
+    if ctx_done_in[worldid]:
+      return
+    if wp.static(SKIP_NOFLIP):
+      if state_changed_count_in[worldid] == 0:
+        return
+    sums = wp.vec2(0.0)
+    for i in range(nisland_in[worldid]):
+      if ctx_island_ntile_in[worldid, i] > 0:
+        sums += ctx_island_sums_in[worldid, i]
+    ctx_search_dot_out[worldid] = sums[0]
+    ctx_newton_decrement_out[worldid] = sums[1]
+
+  return kernel
 
 
 @wp.kernel
@@ -4659,62 +4899,66 @@ def _scatter_h_rows(
 
 
 def _island_h_order(m: types.Model, d: types.Data, ctx: SolverContext):
-  """Assemble and factor h over large islands only, in island order."""
+  """Lay out each large island's Hessian block in the tile pool."""
   island.island(m, d)
   island.compute_island_mapping(m, d)
-  ctx.h_row2dof = wp.full((d.nworld, m.nv_pad), -1, dtype=int)
+  _, nrow = _island_pool_size(m.nv, m.ntree)
+  ctx.h_row2dof = wp.full((d.nworld, nrow), -1, dtype=int)
   ctx.h_dof2row = wp.empty((d.nworld, m.nv), dtype=int)
-  ctx.h_nrow = wp.empty(d.nworld, dtype=int)
-  ctx.pgrad = wp.empty((d.nworld, m.nv_pad), dtype=float)
-  ctx.psearch = wp.empty((d.nworld, m.nv), dtype=float)
-  island_rowadr = wp.empty((d.nworld, m.ntree), dtype=int)
+  ctx.h_dof_poolrow = wp.empty((d.nworld, m.nv), dtype=int)
+  ctx.h_dof_local = wp.empty((d.nworld, m.nv), dtype=int)
+  ctx.island_tilebase = wp.empty((d.nworld, m.ntree), dtype=int)
+  ctx.island_ntile = wp.empty((d.nworld, m.ntree), dtype=int)
+  ctx.island_vbase = wp.empty((d.nworld, m.ntree), dtype=int)
+  ctx.island_sums = wp.empty((d.nworld, m.ntree), dtype=wp.vec2)
+  ctx.pgrad = wp.zeros((d.nworld, nrow), dtype=float)
+  ctx.psearch = wp.zeros((d.nworld, nrow), dtype=float)
   wp.launch_tiled(
-    _island_h_rowadr(m.ntree),
+    _island_pool_layout(m.ntree),
     dim=d.nworld,
     inputs=[m.opt.cone, d.island_nv, d.island_nefc],
-    outputs=[island_rowadr, ctx.h_nrow],
+    outputs=[ctx.island_tilebase, ctx.island_ntile, ctx.island_vbase],
     block_dim=m.block_dim.island_scan_sizes,
   )
   wp.launch(
-    _island_h_maps,
+    _island_pool_maps,
     dim=(d.nworld, m.nv),
-    inputs=[m.opt.cone, d.dof_island, d.island_idofadr, d.island_nv, d.island_nefc, d.map_dof2idof, island_rowadr],
-    outputs=[ctx.h_row2dof, ctx.h_dof2row],
+    inputs=[d.dof_island, d.island_idofadr, d.map_dof2idof, ctx.island_tilebase, ctx.island_ntile, ctx.island_vbase],
+    outputs=[ctx.h_row2dof, ctx.h_dof2row, ctx.h_dof_poolrow, ctx.h_dof_local],
   )
-  if ctx.cholesky_top.shape[1] > 0:
-    ntile = ctx.cholesky_top.shape[1]
-    ctx.cholesky_top = wp.empty((d.nworld, ntile), dtype=int)
-    wp.launch(
-      _island_h_top,
-      dim=(d.nworld, ntile),
-      inputs=[d.dof_island, ctx.h_nrow, ctx.h_row2dof, island_rowadr],
-      outputs=[ctx.cholesky_top],
-    )
 
 
-@wp.kernel
-def _island_h_top(
-  # Data in:
-  dof_island_in: wp.array2d[int],
-  # In:
-  h_nrow_in: wp.array[int],
-  h_row2dof_in: wp.array2d[int],
-  island_rowadr_in: wp.array2d[int],
-  # Out:
-  cholesky_top_out: wp.array2d[int],
+def _island_pool_factorize_solve(
+  m: types.Model, d: types.Data, ctx: SolverContext, skip_unchanged: bool = False, skip_noflip: bool = False
 ):
-  """Tile envelope of the island-ordered h: the first row of the island owning a tile's first row.
-
-  Islands are contiguous and in order, so that is the tile's earliest coupled row.
-  """
-  worldid, tileid = wp.tid()
-  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
-  row = tileid * TILE
-  top = row
-  if row < h_nrow_in[worldid]:
-    islandid = dof_island_in[worldid, h_row2dof_in[worldid, row]]
-    top = island_rowadr_in[worldid, islandid] // TILE * TILE
-  cholesky_top_out[worldid, tileid] = top
+  """Newton step with one block of threads per large island, in island-aligned rows."""
+  nrow = ctx.pgrad.shape[1]
+  tile = types.TILE_SIZE_JTDAJ_DENSE
+  wp.launch(_gather_h_rows, dim=(d.nworld, nrow), inputs=[ctx.done, ctx.h_row2dof, ctx.grad], outputs=[ctx.pgrad])
+  wp.launch_tiled(
+    _island_pool_cholesky(tile, -(-m.nv // tile) * tile, skip_unchanged, skip_noflip),
+    dim=(d.nworld, m.ntree),
+    inputs=[
+      d.nisland,
+      ctx.done,
+      ctx.quad_changed_count,
+      ctx.state_changed_count,
+      ctx.island_tilebase,
+      ctx.island_ntile,
+      ctx.island_vbase,
+      ctx.pgrad.reshape(shape=(d.nworld, nrow, 1)),
+      ctx.h,
+    ],
+    outputs=[ctx.hfactor, ctx.psearch.reshape(shape=(d.nworld, nrow, 1)), ctx.island_sums],
+    block_dim=m.block_dim.update_gradient_cholesky_blocked,
+  )
+  wp.launch(
+    _island_pool_sums(skip_noflip),
+    dim=d.nworld,
+    inputs=[d.nisland, ctx.done, ctx.state_changed_count, ctx.island_ntile, ctx.island_sums],
+    outputs=[ctx.search_dot, ctx.newton_decrement],
+  )
+  wp.launch(_scatter_h_rows, dim=(d.nworld, m.nv), inputs=[ctx.done, ctx.h_dof2row, ctx.psearch], outputs=[ctx.search])
 
 
 def _solve_small_islands(m: types.Model, d: types.Data) -> wp.array:
@@ -4802,7 +5046,7 @@ def solve(m: types.Model, d: types.Data):
     wp.copy(d.qacc, d.qacc_smooth)
     d.solver_niter.fill_(0)
   else:
-    ctx = _create_solver_context(m, d)
+    ctx = _create_solver_context(m, d, island=_use_island_solve(m))
     _solve(m, d, ctx)
 
   if (m.opt.enableflags & types.EnableBit.SLEEP) and m.opt.integrator == types.IntegratorType.DISCRETE and m.ntree > 1:

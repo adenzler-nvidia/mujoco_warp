@@ -2611,10 +2611,16 @@ class SolverContext:
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None
   compact_d_full: Optional["Data"] = None
-  # opt.island_solve: h rows in island order, DOFs outside H map to -1 (None: h in DOF order)
+  # opt.island_solve: h and hfactor are tile pools holding one dense block per large island;
+  # grad and search are gathered into island-aligned rows (DOFs outside map to -1)
   h_row2dof: Optional[wp.array2d[int]] = None
   h_dof2row: Optional[wp.array2d[int]] = None
-  h_nrow: Optional[wp.array[int]] = None
+  h_dof_poolrow: Optional[wp.array2d[int]] = None
+  h_dof_local: Optional[wp.array2d[int]] = None
+  island_tilebase: Optional[wp.array2d[int]] = None
+  island_ntile: Optional[wp.array2d[int]] = None
+  island_vbase: Optional[wp.array2d[int]] = None
+  island_sums: Optional[wp.array2d[wp.vec2]] = None
   pgrad: Optional[wp.array2d[float]] = None
   psearch: Optional[wp.array2d[float]] = None
 
