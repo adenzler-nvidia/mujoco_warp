@@ -4284,9 +4284,9 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
 
       alpha = float(0.0)
       improvement = float(0.0)
-      # an island that starts at its solution is stationary along search; its cost changes are
-      # float32 noise, so the strict-decrease test below would never accept (MuJoCo accepts too)
-      stationary = wp.abs(p0[1]) < gtol
+      # a slope at alpha = 0 below rounding noise means the start is already the line minimum
+      # (see _linesearch_iterative_kernel)
+      stationary = wp.abs(p0[1]) < _ALPHA_NOISE_EPS * q1_abs
       ls_converged = stationary or (wp.abs(lo_in[1]) < gtol_accept and lo_in[0] < 0.0)
       if stationary:
         pass

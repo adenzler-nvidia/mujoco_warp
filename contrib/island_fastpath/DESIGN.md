@@ -199,7 +199,11 @@ Jaref brings the kernel to 343 ms.
 Line search at an island's solution: a resting island warm-started at its solution has a search
 direction of ~1e-7 and a slope ~1e-16 at alpha = 0. MJWarp's line search requires a strict cost
 decrease, which float32 noise never provides, so it ran into `ls_iterations` (MuJoCo accepts on the
-slope alone). The fast path treats |slope(0)| < gtol as converged with alpha = 0.
+slope alone). The main solver has the same stall (google-deepmind/mujoco_warp#1749,
+newton-physics/newton#4212); the fast path uses the same rule as that fix: a slope at alpha = 0
+below the rounding bound `_ALPHA_NOISE_EPS * q1_abs` is converged with alpha = 0. (A first version
+used |slope(0)| < gtol, which would accept the zero step under a loose tolerance, the case #1471
+fixed.)
 
 Results (interleaved, median of 3, ns per world-step):
 
