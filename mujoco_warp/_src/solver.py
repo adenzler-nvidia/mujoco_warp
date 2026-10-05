@@ -2393,6 +2393,67 @@ def _update_gradient_init_h_sparse(compact: bool):
   return kernel
 
 
+@wp.func
+def _init_h_entry(
+  # Model:
+  M_elemid: wp.array2d[int],
+  # Data in:
+  M_in: wp.array2d[float],
+  cdof_dof_in: wp.array2d[int],
+  # In:
+  worldid: int,
+  i: int,
+  j: int,
+) -> float:
+  """M entry of the mapped rows i, j; identity on padded rows."""
+  dofi = cdof_dof_in[worldid, i]
+  dofj = cdof_dof_in[worldid, j]
+  if dofi < 0 or dofj < 0:
+    return wp.where(i == j, 1.0, 0.0)
+  elemid = M_elemid[wp.max(dofi, dofj), wp.min(dofi, dofj)]
+  if elemid >= 0:
+    return M_in[worldid, elemid]
+  return 0.0
+
+
+@wp.kernel
+def _update_gradient_init_h_envelope(
+  # Model:
+  M_elemid: wp.array2d[int],
+  # Data in:
+  M_in: wp.array2d[float],
+  cdof_dof_in: wp.array2d[int],
+  # In:
+  nrow_in: wp.array[int],
+  ctx_cholesky_top_in: wp.array2d[int],
+  ctx_done_in: wp.array[bool],
+  # Out:
+  ctx_h_out: wp.array3d[float],
+):
+  """Initialize the upper triangle of mapped h with M, only where the blocked Cholesky reads it.
+
+  That is the active rows and, within them, the tile envelope plus the last tile column (it carries
+  the right-hand side). The envelope of a row is contiguous since top is nondecreasing.
+  """
+  worldid, i = wp.tid()
+  if ctx_done_in[worldid]:
+    return
+
+  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
+  size = _blocked_size(nrow_in, worldid, TILE, ctx_h_out.shape[1])
+  if i >= size:
+    return
+
+  topid = worldid % ctx_cholesky_top_in.shape[0]
+  jstop = (i // TILE + 1) * TILE
+  while jstop < size and ctx_cholesky_top_in[topid, jstop // TILE] <= i:
+    jstop += TILE
+  for j in range(i, jstop):
+    ctx_h_out[worldid, i, j] = _init_h_entry(M_elemid, M_in, cdof_dof_in, worldid, i, j)
+  for j in range(wp.max(jstop, size - TILE), size):
+    ctx_h_out[worldid, i, j] = _init_h_entry(M_elemid, M_in, cdof_dof_in, worldid, i, j)
+
+
 @wp.kernel(module="unique", enable_backward=False)
 def _add_tendon_metric_dense(
   # Model:
@@ -2978,6 +3039,14 @@ def _padding_h(nv: int, ctx_done_in: wp.array[bool], ctx_h_out: wp.array3d[float
   ctx_h_out[worldid, dofid, dofid] = 1.0
 
 
+def _blocked_bounds(m: types.Model, d: types.Data, ctx: SolverContext) -> tuple:
+  """Active rows and tile envelope the blocked Cholesky reads (None, dense: the whole matrix)."""
+  if m.nv <= _BLOCK_CHOLESKY_DIM:
+    return None, ctx.cholesky_top
+  nrow = d.ncdof if ctx.compact_d_full is not None else ctx.h_nrow
+  return nrow, ctx.cholesky_top
+
+
 def _cholesky_factorize_solve(
   m: types.Model, d: types.Data, ctx: SolverContext, skip_unchanged: bool = False, skip_noflip: bool = False
 ):
@@ -3009,7 +3078,7 @@ def _cholesky_factorize_solve(
     )
 
     # compacted or island-ordered DOFs are packed in front, so each world factors only that block
-    nrow = d.ncdof if ctx.compact_d_full is not None else ctx.h_nrow
+    nrow, _ = _blocked_bounds(m, d, ctx)
 
     if skip_unchanged:
       wp.launch_tiled(
@@ -3364,12 +3433,22 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       mapped, row2dof, dof2row = sc, dj.cdof_dof, dj.dof_cdof
       if ctx.h_row2dof is not None:
         mapped, row2dof, dof2row = True, ctx.h_row2dof, ctx.h_dof2row
-      wp.launch(
-        _update_gradient_init_h_sparse(mapped),
-        dim=(d.nworld, m.nv_pad, m.nv_pad),
-        inputs=[mj.nv, mj.M_elemid, m_mat, row2dof, ctx.done],
-        outputs=[ctx.h],
-      )
+      nrow, top = _blocked_bounds(m, d, ctx)
+      if mapped and nrow is not None:
+        # one thread per row, writing only what the blocked Cholesky reads
+        wp.launch(
+          _update_gradient_init_h_envelope,
+          dim=(d.nworld, m.nv_pad),
+          inputs=[mj.M_elemid, m_mat, row2dof, nrow, top, ctx.done],
+          outputs=[ctx.h],
+        )
+      else:
+        wp.launch(
+          _update_gradient_init_h_sparse(mapped),
+          dim=(d.nworld, m.nv_pad, m.nv_pad),
+          inputs=[mj.nv, mj.M_elemid, m_mat, row2dof, ctx.done],
+          outputs=[ctx.h],
+        )
 
       groups_per_world = _jtdaj_groups_per_world(d.nworld, d.njmax)
       max_condim = 3

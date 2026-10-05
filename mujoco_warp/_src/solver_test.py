@@ -1269,6 +1269,15 @@ class SolverTest(parameterized.TestCase):
     np.testing.assert_allclose(force1, force0, rtol=1e-4, atol=1e-4)
     _assert_eq(qacc1, mjd.qacc, "qacc")
 
+    # h entries outside the active rows and the tile envelope are neither written nor read
+    m.opt.island_solve = True
+    ctx = solver._create_solver_context(m, d)
+    ctx.h.fill_(np.nan)
+    ctx.hfactor.fill_(np.nan)
+    d.qacc_warmstart.zero_()
+    solver._solve(m, d, ctx)
+    np.testing.assert_allclose(d.qacc.numpy()[0], qacc1, rtol=1e-5, atol=1e-5)
+
     # a short rollout stays close to the monolithic solve (the pyramidal stack alone varies by ~5e-4
     # run to run, so this only catches plumbing errors such as frozen DOFs or a stale warmstart)
     qpos = []

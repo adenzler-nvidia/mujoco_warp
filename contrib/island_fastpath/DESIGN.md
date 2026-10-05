@@ -238,3 +238,23 @@ pile64 kernel time (quiet GPU): Cholesky 239 -> 78 ms; the largest items are now
 `_small_island_solve` (173 ms, 31%), Cholesky (78 ms) and `_update_gradient_init_h_sparse` (68 ms,
 12%, still writes all nv_pad^2 entries). pile256: Cholesky 27%, init_h 17%, small islands 16% of a
 much smaller total; with 32 worlds the per-world serial Cholesky chain is the latency (phase 4b).
+
+### H initialization within the envelope
+
+`_update_gradient_init_h_sparse` launched one thread per h entry (nworld * nv_pad^2, 82M threads for
+pile64) and wrote the whole upper triangle every Newton step. For the blocked path with known
+active rows (island order and the compact sleep path), `_update_gradient_init_h_envelope` now uses
+one thread per row and writes only what the blocked Cholesky reads: the active rows, the row's
+tile envelope (contiguous, since top is nondecreasing) and the last tile column (it carries the
+right-hand side). Skipping entries in the per-entry kernel instead only cut 17%; the launch size was
+the cost.
+
+Kernel time, quiet GPU (4a -> with envelope init):
+
+| scene | H init | total kernel time |
+|---|---|---|
+| pile64 | 65.2 -> 10.7 ms | 545 -> 506 ms |
+| pile256 | ~13 -> 1.3 ms | 78 -> 63 ms |
+| aloha_clutter pyramidal | 59.1 -> 39.5 ms | 4033 -> 3906 ms |
+
+Wall clock was too noisy to resolve the aloha change (shared GPU); pile64 1.12x and pile256 1.19x.
