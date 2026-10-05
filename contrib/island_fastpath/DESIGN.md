@@ -214,3 +214,27 @@ Results (interleaved, median of 3, ns per world-step):
 | pile64 | 20396 | 7052 (2.9x) |
 | pile256 | 5907526 | 432815 (13.7x) |
 | three_humanoids (no small islands) | 546 | 580 (-6%) |
+
+## Phase 4a notes: skyline factorization of the large islands
+
+With island_solve, h rows are the large-island DOFs in island order, so the Hessian is block
+diagonal by island. The blocked Cholesky (factor and solve) now takes a per-tile envelope
+`ctx.cholesky_top` (first nonzero row of each tile column; all zeros reproduces the dense
+algorithm) and skips tiles above it; fill stays inside the envelope. For the island order it is
+the first row of the island owning each tile's first row (`_island_h_top`). The loop bounds and the
+NaN-poisoning kernel test come from the skyline prototype (`adenzler/island-skyline-analysis`).
+
+Interleaved, median of 3, ns per world-step (three_humanoids noisy, GPU shared at the end):
+
+| scene | island_solve off | on, before 4a | on, 4a |
+|---|---|---|---|
+| pile64 (nworld 512) | 25222 | 7977 | 6511 (3.9x vs off) |
+| pile256 (nworld 32) | 8058485 | 565892 | 69488 (116x vs off) |
+| aloha_clutter pyramidal | 9081 | 9028 | 8826 |
+| aloha_clutter elliptic | 7692 | 8591 | 7419 |
+| three_humanoids | 737 | 1060 | 844 |
+
+pile64 kernel time (quiet GPU): Cholesky 239 -> 78 ms; the largest items are now
+`_small_island_solve` (173 ms, 31%), Cholesky (78 ms) and `_update_gradient_init_h_sparse` (68 ms,
+12%, still writes all nv_pad^2 entries). pile256: Cholesky 27%, init_h 17%, small islands 16% of a
+much smaller total; with 32 worlds the per-world serial Cholesky chain is the latency (phase 4b).

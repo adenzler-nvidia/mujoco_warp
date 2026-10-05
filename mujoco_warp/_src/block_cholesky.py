@@ -130,16 +130,23 @@ def _create_blocked_cholesky_augmented_factorize_solve_func(
     # In:
     A: wp.array2d[float],
     b: wp.array2d[float],
+    top: wp.array[int],
     matrix_size: int,
     # Out:
     U_out: wp.array2d[float],
     result_out: wp.array2d[float],
   ):
-    """Factor A with b as an augmented border and reuse it as the forward solution."""
+    """Factor A with b as an augmented border and reuse it as the forward solution.
+
+    top[t] is the first nonzero row of tile column t (nondecreasing; all zeros for dense).
+    Cholesky fill stays inside this envelope, so tiles above it are neither read nor written.
+    """
     rhs_tile = wp.tile_zeros(shape=(matrix_size_static, 1), dtype=float, storage="shared")
+    last = matrix_size - block_size
 
     for k in range(0, matrix_size, block_size):
       end = k + block_size
+      top_k = top[k // block_size]
       input_rhs = wp.tile_load(b, shape=(block_size, 1), offset=(k, 0), storage="shared", bounds_check=False)
       A_kk_tile = wp.tile_load(
         A, shape=(block_size, block_size), offset=(k, k), storage="shared", bounds_check=False, aligned=True
@@ -150,7 +157,7 @@ def _create_blocked_cholesky_augmented_factorize_solve_func(
         # Keep the augmented rank-one correction below float32 precision.
         A_kk_tile[border_size, border_size] = 1.0e30
 
-      for j in range(0, k, block_size):
+      for j in range(top_k, k, block_size):
         U_block = wp.tile_load(
           U_out, shape=(block_size, block_size), offset=(j, k), storage="shared", bounds_check=False, aligned=True
         )
@@ -162,14 +169,22 @@ def _create_blocked_cholesky_augmented_factorize_solve_func(
         wp.tile_assign(rhs_tile, diagonal_border, offset=(k, 0))
       wp.tile_store(U_out, A_kk_tile, offset=(k, k), bounds_check=False, aligned=True)
 
-      for i in range(end, matrix_size, block_size):
+      # Row k's envelope tiles are contiguous since top is nondecreasing. The last tile always
+      # follows: its border column carries the forward solution.
+      i_stop = end
+      while i_stop < last and top[i_stop // block_size] <= k:
+        i_stop += block_size
+      i_hi = wp.where(end < matrix_size, i_stop + block_size, end)
+      for i_env in range(end, i_hi, block_size):
+        i = wp.where(i_env == i_stop, last, i_env)
         A_ki_tile = wp.tile_load(
           A, shape=(block_size, block_size), offset=(k, i), storage="shared", bounds_check=False, aligned=True
         )
         if i + block_size == matrix_size:
           wp.tile_assign(A_ki_tile, input_rhs, offset=(0, border_size))
 
-        for j in range(0, k, block_size):
+        j_lo = wp.where(i == last, top_k, wp.max(top_k, top[i // block_size]))
+        for j in range(j_lo, k, block_size):
           U_jk_tile = wp.tile_load(
             U_out, shape=(block_size, block_size), offset=(j, k), storage="shared", bounds_check=False, aligned=True
           )
@@ -187,7 +202,11 @@ def _create_blocked_cholesky_augmented_factorize_solve_func(
     for i in range(matrix_size - block_size, -1, -block_size):
       i_end = i + block_size
       tmp_tile = wp.tile_view(rhs_tile, shape=(block_size, 1), offset=(i, 0))
-      for j in range(i_end, matrix_size, block_size):
+      # the border entry of x is zero, so U's border column adds nothing outside the envelope
+      j_stop = i_end
+      while j_stop < matrix_size and top[j_stop // block_size] <= i:
+        j_stop += block_size
+      for j in range(i_end, j_stop, block_size):
         U_tile = wp.tile_load(
           U_out, shape=(block_size, block_size), offset=(i, j), storage="shared", bounds_check=False, aligned=True
         )
@@ -224,6 +243,7 @@ def _create_blocked_cholesky_solve_func(
     # In:
     U: wp.array2d[float],
     b: wp.array2d[float],
+    top: wp.array[int],
     matrix_size: int,
     # Out:
     result_out: wp.array2d[float],
@@ -231,14 +251,14 @@ def _create_blocked_cholesky_solve_func(
     """Block Cholesky solve.
 
     Solves A x = b given the Cholesky factor U (A = U^T U) using blocked forward and backward
-    substitution.
+    substitution. top is the tile envelope U was factored with.
     """
     rhs_tile = wp.tile_load(b, shape=(matrix_size_static, 1), offset=(0, 0), storage="shared", bounds_check=False)
 
     # Forward substitution: solve U^T y = b
     for i in range(0, matrix_size, block_size):
       rhs_view = wp.tile_view(rhs_tile, shape=(block_size, 1), offset=(i, 0))
-      for j in range(0, i, block_size):
+      for j in range(top[i // block_size], i, block_size):
         U_block = wp.tile_load(
           U, shape=(block_size, block_size), offset=(j, i), storage="shared", bounds_check=False, aligned=True
         )
@@ -254,7 +274,10 @@ def _create_blocked_cholesky_solve_func(
     for i in range(matrix_size - block_size, -1, -block_size):
       i_end = i + block_size
       tmp_tile = wp.tile_view(rhs_tile, shape=(block_size, 1), offset=(i, 0))
-      for j in range(i_end, matrix_size, block_size):
+      j_stop = i_end
+      while j_stop < matrix_size and top[j_stop // block_size] <= i:
+        j_stop += block_size
+      for j in range(i_end, j_stop, block_size):
         U_tile = wp.tile_load(
           U, shape=(block_size, block_size), offset=(i, j), storage="shared", bounds_check=False, aligned=True
         )

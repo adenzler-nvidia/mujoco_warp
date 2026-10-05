@@ -112,6 +112,7 @@ def _create_solver_context(
     quad_changed_ids=wp.empty((nworld, njmax), dtype=int) if alloc_incremental else wp.empty((nworld, 0), dtype=int),
     quad_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
     state_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
+    cholesky_top=wp.zeros((1, nv_pad // types.TILE_SIZE_JTDAJ_DENSE if alloc_hfactor else 0), dtype=int),
   )
 
 
@@ -2848,6 +2849,7 @@ def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_s
     ctx_done_in: wp.array[bool],
     ctx_grad_in: wp.array3d[float],
     ctx_h_in: wp.array3d[float],
+    ctx_cholesky_top_in: wp.array2d[int],
     ctx_hfactor: wp.array3d[float],
     # Out:
     ctx_search_out: wp.array3d[float],
@@ -2868,6 +2870,7 @@ def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_s
     sums = wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
       ctx_h_in[worldid],
       ctx_grad_in[worldid],
+      ctx_cholesky_top_in[worldid % ctx_cholesky_top_in.shape[0]],
       _blocked_size(nrow_in, worldid, TILE_SIZE, matrix_size),
       ctx_hfactor[worldid],
       ctx_search_out[worldid],
@@ -2919,6 +2922,7 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
     ctx_h_in: wp.array3d[float],
     quad_changed_count_in: wp.array[int],
     state_changed_count_in: wp.array[int],
+    ctx_cholesky_top_in: wp.array2d[int],
     ctx_hfactor: wp.array3d[float],
     # Out:
     ctx_search_out: wp.array3d[float],
@@ -2938,10 +2942,12 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
         return
 
     size = _blocked_size(nrow_in, worldid, TILE_SIZE, matrix_size)
+    top = ctx_cholesky_top_in[worldid % ctx_cholesky_top_in.shape[0]]
     if quad_changed_count_in[worldid] > 0:
       sums = wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
         ctx_h_in[worldid],
         ctx_grad_in[worldid],
+        top,
         size,
         ctx_hfactor[worldid],
         ctx_search_out[worldid],
@@ -2950,6 +2956,7 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
       sums = wp.static(create_blocked_cholesky_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
         ctx_hfactor[worldid],
         ctx_grad_in[worldid],
+        top,
         size,
         ctx_search_out[worldid],
       )
@@ -3015,6 +3022,7 @@ def _cholesky_factorize_solve(
           ctx.h,
           ctx.quad_changed_count,
           ctx.state_changed_count if skip_noflip else ctx.quad_changed_count,
+          ctx.cholesky_top,
           ctx.hfactor,
         ],
         outputs=[
@@ -3028,7 +3036,7 @@ def _cholesky_factorize_solve(
       wp.launch_tiled(
         _update_gradient_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv),
         dim=d.nworld,
-        inputs=[nrow, ctx.done, grad.reshape(shape=(d.nworld, grad.shape[1], 1)), ctx.h, ctx.hfactor],
+        inputs=[nrow, ctx.done, grad.reshape(shape=(d.nworld, grad.shape[1], 1)), ctx.h, ctx.cholesky_top, ctx.hfactor],
         outputs=[
           search.reshape(shape=(d.nworld, m.nv, 1)),
           ctx.search_dot,
@@ -4555,6 +4563,40 @@ def _island_h_order(m: types.Model, d: types.Data, ctx: SolverContext):
     inputs=[m.opt.cone, d.dof_island, d.island_idofadr, d.island_nv, d.island_nefc, d.map_dof2idof, island_rowadr],
     outputs=[ctx.h_row2dof, ctx.h_dof2row],
   )
+  if ctx.cholesky_top.shape[1] > 0:
+    ntile = ctx.cholesky_top.shape[1]
+    ctx.cholesky_top = wp.empty((d.nworld, ntile), dtype=int)
+    wp.launch(
+      _island_h_top,
+      dim=(d.nworld, ntile),
+      inputs=[d.dof_island, ctx.h_nrow, ctx.h_row2dof, island_rowadr],
+      outputs=[ctx.cholesky_top],
+    )
+
+
+@wp.kernel
+def _island_h_top(
+  # Data in:
+  dof_island_in: wp.array2d[int],
+  # In:
+  h_nrow_in: wp.array[int],
+  h_row2dof_in: wp.array2d[int],
+  island_rowadr_in: wp.array2d[int],
+  # Out:
+  cholesky_top_out: wp.array2d[int],
+):
+  """Tile envelope of the island-ordered h: the first row of the island owning a tile's first row.
+
+  Islands are contiguous and in order, so that is the tile's earliest coupled row.
+  """
+  worldid, tileid = wp.tid()
+  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
+  row = tileid * TILE
+  top = row
+  if row < h_nrow_in[worldid]:
+    islandid = dof_island_in[worldid, h_row2dof_in[worldid, row]]
+    top = island_rowadr_in[worldid, islandid] // TILE * TILE
+  cholesky_top_out[worldid, tileid] = top
 
 
 def _solve_small_islands(m: types.Model, d: types.Data) -> wp.array:

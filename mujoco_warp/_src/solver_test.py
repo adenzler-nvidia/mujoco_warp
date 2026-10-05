@@ -1258,6 +1258,11 @@ class SolverTest(parameterized.TestCase):
     self.assertEqual(d.nidof.numpy()[0], mjm.nv - 24)
     self.assertEqual(ctx.h_nrow.numpy()[0], 30 if cone == ConeType.PYRAMIDAL else mjm.nv - 24)
     self.assertEqual(m.nv_pad, 80)
+    # tile envelope: each tile column starts at the island owning its first row; padding is diagonal
+    # pyramidal: stack rows 0-17, welded pair 18-29; elliptic: arm 0-1, boxes 2-19, stack 20-37,
+    # welded pair 38-49
+    top = [0, 0, 32, 48, 64] if cone == ConeType.PYRAMIDAL else [0, 0, 16, 32, 64]
+    np.testing.assert_array_equal(ctx.cholesky_top.numpy()[0], top)
 
     np.testing.assert_allclose(qacc1, qacc0, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(qfrc1, qfrc0, rtol=1e-4, atol=1e-4)
