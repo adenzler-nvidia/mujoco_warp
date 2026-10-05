@@ -2973,12 +2973,18 @@ def _cholesky_factorize_solve(
   If skip_unchanged is True (blocked path only), worlds where no constraints
   changed reuse the cached factorization in hfactor instead of refactorizing.
   """
+  # with island_solve, h is in island order: factor it there and map grad and search around it
+  grad, search = ctx.grad, ctx.search
+  if ctx.h_row2dof is not None:
+    wp.launch(_gather_h_rows, dim=(d.nworld, m.nv_pad), inputs=[ctx.done, ctx.h_row2dof, ctx.grad], outputs=[ctx.pgrad])
+    grad, search = ctx.pgrad, ctx.psearch
+
   if m.nv <= _BLOCK_CHOLESKY_DIM:
     wp.launch_tiled(
       _update_gradient_cholesky(m.nv, skip_noflip),
       dim=d.nworld,
-      inputs=[ctx.grad, ctx.h, ctx.state_changed_count if skip_noflip else d.nefc, ctx.done],
-      outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
+      inputs=[grad, ctx.h, ctx.state_changed_count if skip_noflip else d.nefc, ctx.done],
+      outputs=[search, ctx.search_dot, ctx.newton_decrement],
       block_dim=m.block_dim.update_gradient_cholesky,
     )
   else:
@@ -2991,10 +2997,6 @@ def _cholesky_factorize_solve(
 
     # compacted or island-ordered DOFs are packed in front, so each world factors only that block
     nrow = d.ncdof if ctx.compact_d_full is not None else ctx.h_nrow
-    grad, search = ctx.grad, ctx.search
-    if ctx.h_row2dof is not None:
-      wp.launch(_gather_h_rows, dim=(d.nworld, m.nv_pad), inputs=[ctx.done, ctx.h_row2dof, ctx.grad], outputs=[ctx.pgrad])
-      grad, search = ctx.pgrad, ctx.psearch
 
     if skip_unchanged:
       wp.launch_tiled(
@@ -3029,8 +3031,8 @@ def _cholesky_factorize_solve(
         block_dim=m.block_dim.update_gradient_cholesky_blocked,
       )
 
-    if ctx.h_row2dof is not None:
-      wp.launch(_scatter_h_rows, dim=(d.nworld, m.nv), inputs=[ctx.done, ctx.h_dof2row, ctx.psearch], outputs=[ctx.search])
+  if ctx.h_row2dof is not None:
+    wp.launch(_scatter_h_rows, dim=(d.nworld, m.nv), inputs=[ctx.done, ctx.h_dof2row, ctx.psearch], outputs=[ctx.search])
 
 
 # ---------------------------------------------------------------------------

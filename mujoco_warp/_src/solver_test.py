@@ -1122,6 +1122,26 @@ class SolverTest(parameterized.TestCase):
       qpos.append(d2.qpos.numpy()[0])
     np.testing.assert_allclose(qpos[1], qpos[0], atol=5e-3)
 
+  def test_island_solve_small_cholesky(self):
+    """The single-tile Cholesky (nv <= 32) leaves DOFs outside the island-ordered h unsolved."""
+    bodies = "".join(f'<body pos="{x} 0 .049"><freejoint/><geom type="box" size=".05 .05 .05"/></body>' for x in (0, 1))
+    _, _, m, d = test_data.fixture(
+      xml=f'<mujoco><worldbody><geom type="plane" size="5 5 .1"/>{bodies}</worldbody></mujoco>',
+      overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON, "opt.jacobian": "sparse"},
+    )
+    self.assertLessEqual(m.nv, solver._BLOCK_CHOLESKY_DIM)
+    m.opt.island_solve = True
+    ctx = solver._create_solver_context(m, d)
+    solver._island_h_order(m, d, ctx)
+
+    # both boxes are small islands, so nothing is left for the main solve to factor
+    self.assertEqual(ctx.h_nrow.numpy()[0], 0)
+    ctx.h.assign(np.tile(np.eye(m.nv_pad, dtype=np.float32), (d.nworld, 1, 1)))
+    ctx.grad.fill_(1.0)
+    ctx.done.zero_()
+    solver._cholesky_factorize_solve(m, d, ctx)
+    np.testing.assert_array_equal(ctx.search.numpy(), 0.0)
+
   @parameterized.parameters(
     (ConeType.PYRAMIDAL, SolverType.CG, 25, 5),
     (ConeType.PYRAMIDAL, SolverType.NEWTON, 2, 4),
