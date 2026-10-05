@@ -701,6 +701,159 @@ class SolverTest(parameterized.TestCase):
     self.assertGreater(d.qacc.numpy()[0, 0], 0.03)
     self.assertGreater(ctx.improvement.numpy()[0], 5.0e-4)
 
+  def test_linesearch_converges_at_stationary_start(self):
+    """Line search should converge when its start is already the line minimum."""
+    # Captured from a box resting on a plane, warm-started at its float32 solution: the slope at
+    # alpha = 0 and every cost change are rounding noise, so no step strictly improves the cost.
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <geom type="plane" size="5 5 .1"/>
+          <body pos="0 0 .049"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
+        </worldbody>
+      </mujoco>
+      """,
+      overrides={"opt.cone": ConeType.PYRAMIDAL},
+    )
+    ctx = solver._create_solver_context(m, d)
+
+    efc_J = [
+      [0.0, 1.0, 1.0, -5.3886324e-05, 0.05, -0.05],
+      [0.0, -1.0, 1.0, -0.09994611, 0.05, 0.05],
+      [-1.0, 0.0, 1.0, -0.05, 0.09994611, -0.05],
+      [1.0, 0.0, 1.0, -0.05, 5.3886324e-05, 0.05],
+      [0.0, 1.0, 1.0, -5.3886324e-05, -0.05, 0.05],
+      [0.0, -1.0, 1.0, -0.09994611, -0.05, -0.05],
+      [-1.0, 0.0, 1.0, -0.05, -5.3886324e-05, -0.05],
+      [1.0, 0.0, 1.0, -0.05, -0.09994611, 0.05],
+      [0.0, 1.0, 1.0, 0.09994611, 0.05, -0.05],
+      [0.0, -1.0, 1.0, 5.3886324e-05, 0.05, 0.05],
+      [-1.0, 0.0, 1.0, 0.05, 0.09994611, 0.05],
+      [1.0, 0.0, 1.0, 0.05, 5.3886324e-05, -0.05],
+      [0.0, 1.0, 1.0, 0.09994611, -0.05, 0.05],
+      [0.0, -1.0, 1.0, 5.3886324e-05, -0.05, -0.05],
+      [-1.0, 0.0, 1.0, 0.05, -5.3886324e-05, 0.05],
+      [1.0, 0.0, 1.0, 0.05, -0.09994611, -0.05],
+    ]
+    efc_D = 2.27938
+    jaref = [
+      -0.26898766,
+      -0.26898766,
+      -0.26898766,
+      -0.26898766,
+      -0.26898766,
+      -0.26898763,
+      -0.26898766,
+      -0.26898766,
+      -0.26898766,
+      -0.26898766,
+      -0.26898766,
+      -0.26898766,
+      -0.2689877,
+      -0.26898763,
+      -0.26898763,
+      -0.26898766,
+    ]
+    search = [-2.6907532e-09, 1.0365673e-08, -8.1853896e-17, -2.0852168e-08, -1.2571091e-07, 9.2155496e-08]
+    search_dot = 2.4845367e-14
+    efc_Ma = [-3.1322562e-09, -1.57873e-09, -2.102178e-09, -1.3895347e-10, 1.2078877e-10, -7.200439e-11]
+    qfrc_smooth = [-1.323489e-23, 0.0, -9.81, 2.3210504e-25, -3.9414281e-25, -6.260127e-30]
+
+    nefc = len(efc_J)
+    d.nefc.fill_(nefc)
+    d.ne.zero_()
+    d.nf.zero_()
+    d.efc.frictionloss.zero_()
+    J = np.zeros(d.efc.J.shape, dtype=np.float32)
+    J[0, :nefc, :6] = efc_J
+    d.efc.J.assign(J)
+    D = np.zeros(d.efc.D.shape, dtype=np.float32)
+    D[0, :nefc] = efc_D
+    d.efc.D.assign(D)
+    Jaref = np.zeros(ctx.Jaref.shape, dtype=np.float32)
+    Jaref[0, :nefc] = jaref
+    ctx.Jaref.assign(Jaref)
+    ctx.search.assign(np.array([search], dtype=np.float32))
+    ctx.search_dot.fill_(search_dot)
+    d.efc.Ma.assign(np.array([efc_Ma], dtype=np.float32))
+    d.qfrc_smooth.assign(np.array([qfrc_smooth], dtype=np.float32))
+    ctx.search_unchanged.zero_()
+    ctx.done.fill_(False)
+    d.overflow.zero_()
+
+    solver._linesearch(m, d, ctx)
+
+    self.assertFalse(d.overflow.numpy()[0] & types.OverflowType.LS_ITERATIONS)
+    self.assertEqual(ctx.alpha.numpy()[0], 0.0)
+
+  def _slide_linesearch(self, efc_D, frictionloss, jaref):
+    """Line search on friction rows of one slide joint whose slopes cancel exactly at alpha = 0."""
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option solver="CG" jacobian="dense" iterations="0" ls_iterations="50"/>
+        <worldbody>
+          <body><joint type="slide"/><geom type="sphere" size="0.1" mass="1"/></body>
+        </worldbody>
+      </mujoco>
+      """,
+      njmax=5,
+    )
+    ctx = solver._create_solver_context(m, d)
+    d.ne.zero_()
+    d.nf.fill_(5)
+    d.nefc.fill_(5)
+    d.nacon.zero_()
+    d.M.fill_(1.0)
+    d.qacc.zero_()
+    d.efc.Ma.zero_()
+    d.qfrc_smooth.zero_()
+    d.efc.J.fill_(1.0)
+    d.efc.D.assign(np.array([efc_D], dtype=np.float32))
+    d.efc.frictionloss.assign(np.array([frictionloss], dtype=np.float32))
+    ctx.Jaref.assign(np.array([jaref], dtype=np.float32))
+    ctx.search.fill_(2.0**-24)
+    ctx.search_dot.fill_(2.0**-48)
+    ctx.done.fill_(False)
+    ctx.search_unchanged.fill_(False)
+    d.overflow.zero_()
+
+    solver._linesearch(m, d, ctx)
+    return d, ctx
+
+  def test_linesearch_converges_when_float32_drops_slope_terms(self):
+    """Line search should converge at a minimum whose slope float32 cannot resolve."""
+    # from newton-physics/newton#4212: the float32 reduction loses the small slope terms, and no
+    # step strictly improves the cost
+    stiffness = 2.0**8
+    offset = 2.0**28
+    large = stiffness * offset
+    small = 8.0
+    small_offset = 1.5 * 2.0**10
+    d, ctx = self._slide_linesearch(
+      [stiffness, 1.0, 1.0, 1.0, 1.0],
+      [2 * large, small, large, 0.0, small],
+      [offset, small_offset, -16 * large, 0.0, -small_offset],
+    )
+
+    self.assertFalse(d.overflow.numpy()[0] & types.OverflowType.LS_ITERATIONS)
+    self.assertEqual(ctx.alpha.numpy()[0], 0.0)
+
+  def test_linesearch_rejects_rounding_improvement_at_stationary_start(self):
+    """Line search should not take a step whose cost improvement is float32 rounding."""
+    # the slope at alpha = 0 is exactly zero, but rounding of the ~1e18 costs reports an improvement
+    large = 2.0**36
+    small = 8.0
+    d, ctx = self._slide_linesearch(
+      [1.0, 1.0, 1.0, 1.0, 1.0],
+      [large, small, large, 0.0, small],
+      [1.0e9, 1.0e9, -1.0e9, 1.0e9, -1.0e9],
+    )
+
+    self.assertEqual(ctx.alpha.numpy()[0], 0.0)
+    self.assertEqual(d.qacc.numpy()[0, 0], 0.0)
+
   @parameterized.parameters(1, 2)
   def test_linesearch_accepts_converged_newton_point(self, nworld):
     """Linesearch should accept a Newton point at the minimizer whatever its derivative sign."""
