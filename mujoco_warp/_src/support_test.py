@@ -32,6 +32,7 @@ from mujoco_warp._src.block_cholesky import create_blocked_cholesky_augmented_fa
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_factorize_solve_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_newton_func
+from mujoco_warp._src.block_cholesky import create_pool_cholesky_newton_func
 
 # tolerance for difference between MuJoCo and MJWarp support calculations - mostly
 # due to float precision
@@ -582,6 +583,86 @@ class SupportTest(parameterized.TestCase):
 
     np.testing.assert_allclose(search.numpy()[0, :, 0], -np.linalg.solve(H, b), rtol=1e-3, atol=1e-4)
     np.testing.assert_allclose(search2.numpy()[0, :, 0], -np.linalg.solve(H, b2), rtol=1e-3, atol=1e-4)
+
+  def test_pool_cholesky(self):
+    """Per-island blocked Cholesky in a tile pool matches a dense solve for each island."""
+    tile = 16
+    islands = [[5, 16, 17, 40], [9, 33]]  # per world
+    nworld = len(islands)
+    rng = np.random.default_rng(0)
+    ntiles = [[-(-n // tile) for n in w] for w in islands]
+    npool = max(sum(c * c for c in w) for w in ntiles)
+    nrow = max(sum(c for c in w) for w in ntiles) * tile
+    max_size = max(max(w) for w in ntiles) * tile
+
+    A = np.zeros((nworld, npool * tile, tile))
+    b = np.zeros((nworld, nrow, 1))
+    b2 = np.zeros((nworld, nrow, 1))
+    layout, dense = [], []
+    for w, (sizes, cs) in enumerate(zip(islands, ntiles)):
+      tilebase = vbase = 0
+      for n, c in zip(sizes, cs):
+        X = rng.standard_normal((n, n))
+        H = np.eye(c * tile)
+        H[:n, :n] = X @ X.T + n * np.eye(n)
+        for i in range(c):
+          for j in range(c):
+            t = tilebase + i * c + j
+            A[w, t * tile : (t + 1) * tile] = H[i * tile : (i + 1) * tile, j * tile : (j + 1) * tile]
+        b[w, vbase : vbase + n, 0] = rng.standard_normal(n)
+        b2[w, vbase : vbase + n, 0] = rng.standard_normal(n)
+        layout.append((w, tilebase, c, vbase))
+        dense.append((w, vbase, n, H[:n, :n]))
+        tilebase += c * c
+        vbase += c * tile
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def pool_kernel(
+      A_in: wp.array3d[float],
+      b_in: wp.array3d[float],
+      layout_in: wp.array[wp.vec4i],
+      U_out: wp.array3d[float],
+      search_out: wp.array3d[float],
+      sums_out: wp.array[wp.vec2],
+    ):
+      i = wp.tid()
+      lay = layout_in[i]
+      sums_out[i] = wp.static(create_pool_cholesky_newton_func(tile, max_size, True))(
+        A_in[lay[0]], b_in[lay[0]], lay[1], lay[2], lay[3], U_out[lay[0]], search_out[lay[0]]
+      )
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def pool_solve_kernel(
+      A_in: wp.array3d[float],
+      b_in: wp.array3d[float],
+      layout_in: wp.array[wp.vec4i],
+      U_out: wp.array3d[float],
+      search_out: wp.array3d[float],
+      sums_out: wp.array[wp.vec2],
+    ):
+      i = wp.tid()
+      lay = layout_in[i]
+      sums_out[i] = wp.static(create_pool_cholesky_newton_func(tile, max_size, False))(
+        A_in[lay[0]], b_in[lay[0]], lay[1], lay[2], lay[3], U_out[lay[0]], search_out[lay[0]]
+      )
+
+    layout_wp = wp.array(np.array(layout, dtype=np.int32), dtype=wp.vec4i)
+    U = wp.array(np.full(A.shape, np.nan), dtype=float)
+    out = [(wp.zeros((nworld, nrow, 1), dtype=float), wp.zeros(len(layout), dtype=wp.vec2)) for _ in range(2)]
+    for kernel, rhs, (search, sums) in ((pool_kernel, b, out[0]), (pool_solve_kernel, b2, out[1])):
+      wp.launch_tiled(
+        kernel,
+        dim=len(layout),
+        inputs=[wp.array(A, dtype=float), wp.array(rhs, dtype=float), layout_wp],
+        outputs=[U, search, sums],
+        block_dim=64,
+      )
+
+    for k, (w, vbase, n, H) in enumerate(dense):
+      for rhs, (search, sums) in ((b, out[0]), (b2, out[1])):
+        x = np.linalg.solve(H, rhs[w, vbase : vbase + n, 0])
+        np.testing.assert_allclose(search.numpy()[w, vbase : vbase + n, 0], -x, rtol=1e-3, atol=1e-4)
+        np.testing.assert_allclose(sums.numpy()[k], [x @ x, rhs[w, vbase : vbase + n, 0] @ x], rtol=1e-3, atol=1e-4)
 
   @parameterized.parameters(
     ("pendula.xml", 1),
