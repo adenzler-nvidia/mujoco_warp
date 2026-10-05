@@ -258,3 +258,25 @@ Kernel time, quiet GPU (4a -> with envelope init):
 | aloha_clutter pyramidal | 59.1 -> 39.5 ms | 4033 -> 3906 ms |
 
 Wall clock was too noisy to resolve the aloha change (shared GPU); pile64 1.12x and pile256 1.19x.
+
+### Small-island kernel: shared memory instead of per-lane matrices
+
+Nsight Compute on pile64 showed `_small_island_solve` moving 2.35 GB of local-memory loads and
+2.71 GB of stores per launch against 125 MB of global loads: every lane kept its own 8x8 inertia,
+Hessian, Cholesky and J'DJ partial and indexed them with runtime indices, which spilled them (235
+registers, 16.7% theoretical occupancy).
+
+Now the island's inertia, Hessian (upper triangle) and constraint force live once in shared memory;
+lanes add their rows into them with shared atomics (`tile_scatter_add`; every call ends in a block
+barrier, so all lanes make the same calls with a mask), and the small DOF vectors, row data and the
+8x8 Cholesky use fixed-size loops, so their indices are constants and they stay in registers.
+Local-memory traffic is 0, registers 167, theoretical occupancy 25%, one launch 1.10 -> 0.77 ms.
+
+| scene | small-island kernel | total kernel | wall clock |
+|---|---|---|---|
+| pile64 | 173 -> 99 ms | 493 -> 424 ms | 1.22x |
+| pile256 | | | 1.14x |
+| aloha_clutter pyramidal | 313 -> 284 ms | 3881 -> 3856 ms | 1.01x |
+
+aloha's small islands (8-DOF arms with gripper contacts) spend relatively more time in line-search
+reductions than in the Hessian work this targeted.
