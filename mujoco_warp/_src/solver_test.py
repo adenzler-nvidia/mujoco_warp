@@ -1350,20 +1350,16 @@ class SolverTest(parameterized.TestCase):
     self.assertTrue(m.is_sparse)
     nefc = mjd.nefc
 
-    warmstart = d.qacc_warmstart.numpy()
-
     def run(island_solve):
       m.opt.island_solve = island_solve
+      # start away from the solution
+      d.qacc_warmstart.zero_()
       if island_solve:
-        # start away from the solution, and every output must be written
-        d.qacc_warmstart.zero_()
+        # every output must be written
         for arr in (d.qacc, d.qfrc_constraint, d.efc.force, d.efc.Ma):
           arr.fill_(wp.inf)
         d.efc.state.fill_(-1)
         d.solver_niter.fill_(-1)
-      else:
-        # TODO(team): the monolithic solve stops early from a zero warmstart on this model
-        d.qacc_warmstart.assign(warmstart)
       mjw.solve(m, d)
       return [
         d.qacc.numpy()[0].copy(),

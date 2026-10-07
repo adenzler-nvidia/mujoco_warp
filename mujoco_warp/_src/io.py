@@ -149,6 +149,24 @@ def _jtdaj_groups(mjd: mujoco.MjData) -> tuple[np.ndarray, np.ndarray]:
   return adr, nrow
 
 
+def _dense_J_to_sparse(mjd: mujoco.MjData, rownnz: np.ndarray, rowadr: np.ndarray, colind: np.ndarray, J: np.ndarray):
+  """Sparse rows of MuJoCo's dense efc_J; the rows of each JTDAJ block share one support.
+
+  The sparse JTDAJ reads every row of a block at the support of its first row, so zeros within
+  the block's support are kept (mju_dense2sparse would drop them per row).
+  """
+  dense_J = mjd.efc_J.reshape((mjd.nefc, -1))
+  adr = 0
+  for start, nrow in zip(*_jtdaj_groups(mjd)):
+    cols = np.flatnonzero(np.any(dense_J[start : start + nrow] != 0.0, axis=0))
+    for row in range(start, start + nrow):
+      rownnz[row] = cols.size
+      rowadr[row] = adr
+      colind[adr : adr + cols.size] = cols
+      J[adr : adr + cols.size] = dense_J[row, cols]
+      adr += cols.size
+
+
 def _get_nflexintcell(mjm: mujoco.MjModel) -> int:
   nflexintcell = 0
   if mjm.nflex > 0:
@@ -2211,10 +2229,7 @@ def put_data(
         J_colind[:nnz] = mjd.efc_J_colind[:nnz]
         J[:nnz] = mjd.efc_J[:nnz]
       else:
-        dense_J = mjd.efc_J.reshape((-1, mjm.nv))[: mjd.nefc]
-        mujoco.mju_dense2sparse(
-          J[: mjd.nefc * mjm.nv], dense_J, J_rownnz[: mjd.nefc], J_rowadr[: mjd.nefc], J_colind[: mjd.nefc * mjm.nv]
-        )
+        _dense_J_to_sparse(mjd, J_rownnz, J_rowadr, J_colind, J)
 
     efc.J_rownnz = wp.array(np.tile(J_rownnz, (nworld, 1)), dtype=int)
     efc.J_rowadr = wp.array(np.tile(J_rowadr, (nworld, 1)), dtype=int)

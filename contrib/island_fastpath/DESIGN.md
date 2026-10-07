@@ -339,6 +339,6 @@ sparse per island), as in MuJoCo's `mj_island` + `mj_solNewton_island`.
   per world, merged islands).
 - Next: bigger slot classes (or a per-island large tier) so merged islands avoid the world solve;
   globally compacted slots instead of per-world capacity; cheaper gathers.
-- Found on the way: the monolithic Newton solve stops early from a zero warmstart on a small
-  test model (upstream too); a Warp kernel-cache bug (functions passed to `tile_map` in
+- Found on the way: put_data loaded a sparse J whose JTDAJ block rows had different supports (fixed:
+  rows of a block now share one support); a Warp kernel-cache bug (functions passed to `tile_map` in
   `module="unique"` kernels are hashed without their callees, so nested changes leave stale code).
