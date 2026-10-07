@@ -376,3 +376,25 @@ before an island solve.
 
 Paired profiles (three_humanoids): -1.2% kernel time per step (row gather 172 -> 75 us, island
 mapping -60 us; +35 us for the discovery pass, +45 us for per-row DOF-to-aligned-row lookups).
+
+## Phase 8: dense factorization of small islands, as for worlds
+
+Islands of one or two tiles per side are factored like a dense world (`_update_gradient_cholesky`):
+`_dense_factor(ntile)` loads the island's H from the pool's upper tiles into one 16x16 or 32x32
+shared tile, factors and solves it every iteration (no factor reuse), one block per island. The
+gradient is a separate per-DOF kernel. Larger islands keep the blocked factorization. Each size
+class is launched only when some island has it (graph conditionals, per step).
+
+Paired profiles vs phase 7: three_humanoids -6% kernel time per step (factorization 887 -> 404
+dense + 113 blocked + 59 gradient us); pile64 about neutral.
+
+Tried and dropped:
+- Building H = M + J'DJ and J'force with tile matmuls from dense island rows (written in the row
+  initialization): the rows cost ~240 us/step to write (one thread per 128-byte row) and the fused
+  kernel needed 145-168 registers (25% occupancy); no gain on three_humanoids, pile64 +20%.
+- Moving M search and J search out of the linesearch into per-DOF / per-row kernels: they are
+  dominated by indirection (column -> aligned row -> search; pool address math) and cost more than
+  they saved (three_humanoids -2%, pile64 +6%).
+
+The remaining gap to the dense world cost is data layout: worlds have dense J rows and dense M/H,
+islands go through sparse rows with a DOF-to-row indirection and tile-pool addressing.

@@ -29,6 +29,7 @@ from mujoco_warp._src import island
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_pool_cholesky_newton_func
+from mujoco_warp._src.block_cholesky import solve_search_sums
 from mujoco_warp._src.solver import _ALPHA_NOISE_EPS
 from mujoco_warp._src.solver import _JTDAJ_THREADS_PER_GROUP
 from mujoco_warp._src.solver import _ROW_EQUALITY
@@ -90,11 +91,12 @@ class IslandContext:
   niter: wp.array2d[int]
   alpha: wp.array2d[float]
   improvement: wp.array2d[float]
-  grad_dot: wp.array2d[float]
   search_dot: wp.array2d[float]
   newton_decrement: wp.array2d[float]
   # whether an island's H changed since its last factorization
   changed: wp.array2d[bool]
+  # per size class (one tile per side, two, more): 1 if any island has it
+  classes: wp.array[int]
   nsolving: wp.array[int]
 
 
@@ -125,6 +127,14 @@ def _ntile(ndof: int) -> int:
   return (ndof + _TILE - 1) // _TILE
 
 
+@wp.func
+def _in_class(ntile: int, sizeclass: int) -> int:
+  """Size class 0: one tile per side, 1: two (both factored as one tile), 2: more (blocked)."""
+  if ntile == 0:
+    return 0
+  return wp.where(wp.min(ntile, 3) - 1 == sizeclass, 1, 0)
+
+
 @cache_kernel
 def _layout(ntree: int):
   @wp.kernel(module="unique", enable_backward=False)
@@ -135,10 +145,14 @@ def _layout(ntree: int):
     tilebase_out: wp.array2d[int],
     ntile_out: wp.array2d[int],
     vbase_out: wp.array2d[int],
+    classes_out: wp.array[int],
   ):
-    """Per island: tiles per side, first pool tile and first aligned DOF row."""
+    """Per island: tiles per side, first pool tile and first aligned DOF row; size classes."""
     worldid = wp.tid()
     ntile = wp.tile_map(_ntile, wp.tile_load(island_nv_in[worldid], shape=ntree))
+    for c in range(3):
+      if wp.tile_reduce(wp.add, wp.tile_map(_in_class, ntile, wp.tile_full(shape=ntree, value=c, dtype=int)))[0] > 0:
+        classes_out[c] = 1
     wp.tile_store(ntile_out[worldid], ntile)
     wp.tile_store(tilebase_out[worldid], wp.tile_scan_exclusive(wp.tile_map(wp.mul, ntile, ntile)))
     wp.tile_store(vbase_out[worldid], wp.tile_scan_exclusive(ntile) * _TILE)
@@ -387,6 +401,30 @@ def _rows(initial: bool):
   return kernel
 
 
+@wp.kernel
+def _grad(
+  # Data in:
+  dof_island_in: wp.array2d[int],
+  # In:
+  row2dof_in: wp.array2d[int],
+  done_in: wp.array2d[bool],
+  Ma_in: wp.array2d[float],
+  iqfrc_smooth_in: wp.array2d[float],
+  frc_in: wp.array2d[float],
+  # Out:
+  grad_out: wp.array2d[float],
+):
+  """Gradient of an aligned island DOF row (zero on padding), as _update_gradient_grad."""
+  worldid, row = wp.tid()
+  dofid = row2dof_in[worldid, row]
+  if dofid < 0:
+    grad_out[worldid, row] = 0.0
+    return
+  if done_in[worldid, dof_island_in[worldid, dofid]]:
+    return
+  grad_out[worldid, row] = Ma_in[worldid, row] - iqfrc_smooth_in[worldid, row] - frc_in[worldid, row]
+
+
 @cache_kernel
 def _factor(max_size: int):
   factorize = create_pool_cholesky_newton_func(_TILE, max_size, True)
@@ -396,57 +434,91 @@ def _factor(max_size: int):
   def kernel(
     # Data in:
     nisland_in: wp.array[int],
-    island_nv_in: wp.array2d[int],
     # In:
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
     niter_in: wp.array2d[int],
-    Ma_in: wp.array2d[float],
-    iqfrc_smooth_in: wp.array2d[float],
-    frc_in: wp.array2d[float],
+    grad_in: wp.array3d[float],
     H_in: wp.array3d[float],
     # Out:
     changed_out: wp.array2d[bool],
-    grad_out: wp.array3d[float],
     U_out: wp.array3d[float],
     search_out: wp.array3d[float],
-    grad_dot_out: wp.array2d[float],
     search_dot_out: wp.array2d[float],
     newton_decrement_out: wp.array2d[float],
   ):
-    """Gradient and Newton search direction of one island."""
+    """Newton search direction of an island over two tiles per side (blocked Cholesky)."""
     worldid, islandid, lane = wp.tid()
     if islandid >= nisland_in[worldid]:
       return
     if done_in[worldid, islandid]:
       return
-    nthread = wp.block_dim()
-    ndof = island_nv_in[worldid, islandid]
     ntile = ntile_in[worldid, islandid]
+    if ntile <= 2:
+      return
     vbase = vbase_in[worldid, islandid]
-    grad_dot = float(0.0)
-    for la in range(lane, ntile * _TILE, nthread):
-      grad = float(0.0)
-      if la < ndof:
-        row = vbase + la
-        grad = Ma_in[worldid, row] - iqfrc_smooth_in[worldid, row] - frc_in[worldid, row]
-      grad_out[worldid, vbase + la, 0] = grad
-      grad_dot += grad * grad
-    grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0]
-    _sync()
     tilebase = tilebase_in[worldid, islandid]
     if changed_out[worldid, islandid] or niter_in[worldid, islandid] == 0:
-      sums = wp.static(factorize)(H_in[worldid], grad_out[worldid], tilebase, ntile, vbase, U_out[worldid], search_out[worldid])
+      sums = wp.static(factorize)(H_in[worldid], grad_in[worldid], tilebase, ntile, vbase, U_out[worldid], search_out[worldid])
     else:
-      sums = wp.static(solve_only)(
-        H_in[worldid], grad_out[worldid], tilebase, ntile, vbase, U_out[worldid], search_out[worldid]
-      )
+      sums = wp.static(solve_only)(H_in[worldid], grad_in[worldid], tilebase, ntile, vbase, U_out[worldid], search_out[worldid])
     _sync()  # every thread has read the flag
     if lane == 0:
       changed_out[worldid, islandid] = False
-      grad_dot_out[worldid, islandid] = grad_dot
+      search_dot_out[worldid, islandid] = sums[0]
+      newton_decrement_out[worldid, islandid] = sums[1]
+
+  return kernel
+
+
+@cache_kernel
+def _dense_factor(ntile: int):
+  N = ntile * _TILE
+
+  @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
+  def kernel(
+    # Data in:
+    nisland_in: wp.array[int],
+    # In:
+    tilebase_in: wp.array2d[int],
+    ntile_in: wp.array2d[int],
+    vbase_in: wp.array2d[int],
+    done_in: wp.array2d[bool],
+    grad_in: wp.array2d[float],
+    H_in: wp.array3d[float],
+    # Out:
+    search_out: wp.array2d[float],
+    search_dot_out: wp.array2d[float],
+    newton_decrement_out: wp.array2d[float],
+  ):
+    """Newton search direction of an island of ntile tiles per side, factored as one tile.
+
+    As _update_gradient_cholesky for a world: the island's H (the pool's upper tiles) is factored
+    in shared memory every iteration.
+    """
+    worldid, islandid, lane = wp.tid()
+    if islandid >= nisland_in[worldid]:
+      return
+    if done_in[worldid, islandid]:
+      return
+    if ntile_in[worldid, islandid] != wp.static(ntile):
+      return
+    vbase = vbase_in[worldid, islandid]
+    row0 = _TILE * tilebase_in[worldid, islandid]
+    # the block's upper tiles (0, 0), (0, 1), (1, 1); the factorization reads no others
+    U = wp.tile_zeros(shape=(N, N), dtype=float, storage="shared")
+    wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0, 0)), offset=(0, 0))
+    if wp.static(ntile == 2):
+      wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
+      wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
+    wp.tile_cholesky_inplace(U, fill_mode="upper")
+    b = wp.tile_load(grad_in[worldid], shape=N, offset=vbase)
+    x = wp.tile_cholesky_solve(U, b, fill_mode="upper")
+    wp.tile_store(search_out[worldid], wp.tile_map(wp.neg, x), offset=vbase)
+    sums = wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b, x))[0]
+    if lane == 0:
       search_dot_out[worldid, islandid] = sums[0]
       newton_decrement_out[worldid, islandid] = sums[1]
 
@@ -484,7 +556,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     iM_in: wp.array3d[float],
     search_in: wp.array2d[float],
     dof2row_in: wp.array2d[int],
-    grad_dot_in: wp.array2d[float],
+    grad_in: wp.array2d[float],
     search_dot_in: wp.array2d[float],
     newton_decrement_in: wp.array2d[float],
     # Data out:
@@ -522,13 +594,17 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     niter = niter_out[worldid, islandid]
 
     # --- termination (see _solve_done) ---
+    grad_dot = float(0.0)
+    for la in range(lane, ndof, nthread):
+      grad_dot += grad_in[worldid, vbase + la] * grad_in[worldid, vbase + la]
+    grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0]
     converged = False
     if niter > 0:
       improvement = improvement_out[worldid, islandid]
       converged = (
         (alpha_out[worldid, islandid] == 0.0)
         or (improvement > 0.0 and improvement / scale < tolerance)
-        or (wp.sqrt(grad_dot_in[worldid, islandid]) / scale < tolerance)
+        or (wp.sqrt(grad_dot) / scale < tolerance)
         or (0.5 * newton_decrement_in[worldid, islandid] / scale < tolerance)
       )
     if converged or niter >= opt_iterations:
@@ -795,10 +871,10 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     niter=wp.empty((nworld, ntree), dtype=int),
     alpha=wp.empty((nworld, ntree), dtype=float),
     improvement=wp.empty((nworld, ntree), dtype=float),
-    grad_dot=wp.empty((nworld, ntree), dtype=float),
     search_dot=wp.empty((nworld, ntree), dtype=float),
     newton_decrement=wp.empty((nworld, ntree), dtype=float),
     changed=wp.zeros((nworld, ntree), dtype=bool),
+    classes=wp.zeros(3, dtype=int),
     nsolving=wp.zeros(1, dtype=int),
   )
 
@@ -831,25 +907,39 @@ def _launch_rows(m: types.Model, d: types.Data, ctx: IslandContext, initial: boo
 def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
   nrow = ctx.qacc.shape[1]
   ctx.nsolving.zero_()
-  wp.launch_tiled(
-    _factor(-(-m.nv // _TILE) * _TILE),
-    dim=(d.nworld, m.ntree),
-    inputs=[
-      d.nisland,
-      d.island_nv,
-      ctx.tilebase,
-      ctx.ntile,
-      ctx.vbase,
-      ctx.done,
-      ctx.niter,
-      ctx.Ma,
-      ctx.qfrc_smooth,
-      ctx.frc,
-      ctx.H,
-    ],
-    outputs=[ctx.changed, ctx.grad, ctx.U, ctx.search, ctx.grad_dot, ctx.search_dot, ctx.newton_decrement],
-    block_dim=_ISLAND_THREADS,
+
+  wp.launch(
+    _grad,
+    dim=(d.nworld, nrow),
+    inputs=[d.dof_island, ctx.row2dof, ctx.done, ctx.Ma, ctx.qfrc_smooth, ctx.frc],
+    outputs=[ctx.grad.reshape((d.nworld, nrow))],
   )
+
+  def dense_factor(ntile: int):
+    wp.launch_tiled(
+      _dense_factor(ntile),
+      dim=(d.nworld, m.ntree),
+      inputs=[d.nisland, ctx.tilebase, ctx.ntile, ctx.vbase, ctx.done, ctx.grad.reshape((d.nworld, nrow)), ctx.H],
+      outputs=[ctx.search.reshape((d.nworld, nrow)), ctx.search_dot, ctx.newton_decrement],
+      block_dim=_ISLAND_THREADS,
+    )
+
+  def blocked_factor():
+    wp.launch_tiled(
+      _factor(-(-m.nv // _TILE) * _TILE),
+      dim=(d.nworld, m.ntree),
+      inputs=[d.nisland, ctx.tilebase, ctx.ntile, ctx.vbase, ctx.done, ctx.niter, ctx.grad, ctx.H],
+      outputs=[ctx.changed, ctx.U, ctx.search, ctx.search_dot, ctx.newton_decrement],
+      block_dim=_ISLAND_THREADS,
+    )
+
+  # each size class only when some island has it
+  for sizeclass, launch in ((0, lambda: dense_factor(1)), (1, lambda: dense_factor(2)), (2, blocked_factor)):
+    if m.opt.graph_conditional:
+      wp.capture_if(ctx.classes[sizeclass : sizeclass + 1], on_true=launch)
+    else:
+      launch()
+
   wp.launch_tiled(
     _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow)),
     dim=(d.nworld, m.ntree),
@@ -876,7 +966,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
       ctx.M,
       ctx.search.reshape((d.nworld, nrow)),
       ctx.dof2row,
-      ctx.grad_dot,
+      ctx.grad.reshape((d.nworld, nrow)),
       ctx.search_dot,
       ctx.newton_decrement,
     ],
@@ -913,7 +1003,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     _layout(m.ntree),
     dim=d.nworld,
     inputs=[d.island_nv],
-    outputs=[ctx.tilebase, ctx.ntile, ctx.vbase],
+    outputs=[ctx.tilebase, ctx.ntile, ctx.vbase, ctx.classes],
     block_dim=m.block_dim.island_scan_sizes,
   )
   ctx.row2dof.fill_(-1)
