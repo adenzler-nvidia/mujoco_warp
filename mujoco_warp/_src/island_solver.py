@@ -52,8 +52,10 @@ from mujoco_warp._src.warp_util import cache_kernel
 wp.set_module_options({"enable_backward": False})
 
 _TILE = types.TILE_SIZE_JTDAJ_DENSE
-# threads per island for the factorization and linesearch kernels
+# threads per island: factorization as _update_gradient_cholesky, linesearch one warp as
+# _linesearch_iterative_kernel
 _ISLAND_THREADS = 64
+_LINESEARCH_THREADS = 32
 
 
 @dataclasses.dataclass
@@ -985,7 +987,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
       ctx.row_jv,
       ctx.nsolving,
     ],
-    block_dim=_ISLAND_THREADS,
+    block_dim=_LINESEARCH_THREADS,
   )
   # constraint evaluation at the updated point, for the next iteration
   _launch_rows(m, d, ctx, initial=False)
