@@ -208,6 +208,12 @@ def _eval_elliptic_delta(
   )
 
 
+def _rows_by_constraint(d):
+  """Row order by (type, id), stable: comparable across world and island row orders."""
+  nefc = d.nefc.numpy()[0]
+  return np.lexsort((np.arange(nefc), d.efc.id.numpy()[0, :nefc], d.efc.type.numpy()[0, :nefc]))
+
+
 class SolverTest(parameterized.TestCase):
   def test_newton_decrement_termination(self):
     """Newton stops when only its local model predicts convergence."""
@@ -1238,12 +1244,15 @@ class SolverTest(parameterized.TestCase):
 
     def run(island_solve):
       m.opt.island_solve = island_solve
+      # island solve builds its rows in island order
+      mjw.make_constraint(m, d)
       # the fixture warmstarts at the solution; start elsewhere so the solver has to iterate
       d.qacc_warmstart.zero_()
       d.qacc.fill_(wp.inf)
       d.qfrc_constraint.fill_(wp.inf)
       mjw.solve(m, d)
-      return d.qacc.numpy()[0].copy(), d.qfrc_constraint.numpy()[0].copy(), d.efc.force.numpy()[0, : mjd.nefc].copy()
+      force = d.efc.force.numpy()[0, : mjd.nefc][_rows_by_constraint(d)]
+      return d.qacc.numpy()[0].copy(), d.qfrc_constraint.numpy()[0].copy(), force
 
     qacc0, qfrc0, force0 = run(False)
     qacc1, qfrc1, force1 = run(True)
@@ -1352,6 +1361,8 @@ class SolverTest(parameterized.TestCase):
 
     def run(island_solve):
       m.opt.island_solve = island_solve
+      # island solve builds its rows in island order
+      mjw.make_constraint(m, d)
       # start away from the solution
       d.qacc_warmstart.zero_()
       if island_solve:
@@ -1361,11 +1372,12 @@ class SolverTest(parameterized.TestCase):
         d.efc.state.fill_(-1)
         d.solver_niter.fill_(-1)
       mjw.solve(m, d)
+      rows = _rows_by_constraint(d)
       return [
         d.qacc.numpy()[0].copy(),
         d.qfrc_constraint.numpy()[0].copy(),
-        d.efc.force.numpy()[0, :nefc].copy(),
-        d.efc.state.numpy()[0, :nefc].copy(),
+        d.efc.force.numpy()[0, :nefc][rows],
+        d.efc.state.numpy()[0, :nefc][rows],
         d.efc.Ma.numpy()[0].copy(),
         d.solver_niter.numpy()[0],
       ]

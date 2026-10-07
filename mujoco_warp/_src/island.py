@@ -952,3 +952,255 @@ def update_active_dofs(m: types.Model, d: types.Data):
     inputs=[m.ntree, m.tree_dofadr, m.tree_dofnum, d.tree_awake, d.nvmax],
     outputs=[d.ncdof, d.dof_cdof, d.cdof_dof, d.overflow],
   )
+
+
+# Island-ordered constraint rows (opt.island_solve). make_constraint runs its row kernels twice:
+# ROWS_DISCOVER merges each active constraint's trees and counts its rows per tree and class, and
+# ROWS_WRITE places the rows at their island's address. An island's rows are contiguous and ordered
+# by class (equality, friction, limit, contact) as in MuJoCo's island arrays.
+ROWS_WORLD = 0
+ROWS_DISCOVER = 1
+ROWS_WRITE = 2
+ROW_CLASSES = 4
+ROW_EQUALITY = 0
+ROW_FRICTION = 1
+ROW_LIMIT = 2
+ROW_CONTACT = 3
+
+
+def island_rows(m: types.Model) -> bool:
+  """Whether constraint rows are built in island order."""
+  return (
+    m.opt.island_solve
+    and m.opt.cone == types.ConeType.PYRAMIDAL
+    and m.opt.solver == types.SolverType.NEWTON
+    and m.is_sparse
+    and m.ntree > 1
+    and m.nflex == 0
+    and not (m.opt.disableflags & types.DisableBit.ISLAND)
+    and not (m.opt.enableflags & types.EnableBit.SLEEP)
+    and m.opt.integrator != types.IntegratorType.DISCRETE
+  )
+
+
+@wp.func
+def rows_discover(
+  # In:
+  worldid: int,
+  tree0: int,
+  tree1: int,
+  nrow: int,
+  rowclass: int,
+  # Data out:
+  tree_island_out: wp.array2d[int],
+  # Out:
+  island_parent_out: wp.array2d[int],
+  tree_nrow_out: wp.array2d[int],
+):
+  """Merge a constraint's trees and count its rows on one of them."""
+  _dsu_union(island_parent_out, worldid, tree0, tree1, tree_island_out)
+  tree = wp.where(tree0 >= 0, tree0, tree1)
+  if tree >= 0:
+    wp.atomic_add(tree_nrow_out, worldid, tree * ROW_CLASSES + rowclass, nrow)
+
+
+@wp.func
+def rows_tendon_tree(
+  # Model:
+  dof_treeid: wp.array[int],
+  ten_J_rownnz: wp.array[int],
+  ten_J_rowadr: wp.array[int],
+  ten_J_colind: wp.array[int],
+  # In:
+  tenid: int,
+) -> int:
+  """A tree the tendon spans (its first DOF's)."""
+  if tenid < 0 or ten_J_rownnz[tenid] == 0:
+    return -1
+  return dof_treeid[ten_J_colind[ten_J_rowadr[tenid]]]
+
+
+@wp.func
+def rows_discover_tendon(
+  # Model:
+  dof_treeid: wp.array[int],
+  ten_J_rownnz: wp.array[int],
+  ten_J_rowadr: wp.array[int],
+  ten_J_colind: wp.array[int],
+  # In:
+  worldid: int,
+  tree: int,
+  tenid: int,
+  # Data out:
+  tree_island_out: wp.array2d[int],
+  # Out:
+  island_parent_out: wp.array2d[int],
+):
+  """Merge every tree a tendon spans with tree."""
+  if tenid < 0:
+    return
+  rowadr = ten_J_rowadr[tenid]
+  for k in range(ten_J_rownnz[tenid]):
+    _dsu_union(island_parent_out, worldid, tree, dof_treeid[ten_J_colind[rowadr + k]], tree_island_out)
+
+
+@wp.func
+def rows_write(
+  # Data in:
+  tree_island_in: wp.array2d[int],
+  # In:
+  worldid: int,
+  tree: int,
+  nrow: int,
+  rowclass: int,
+  nrow_max: int,
+  island_rowadr_in: wp.array2d[int],
+  # Out:
+  island_cursor_out: wp.array2d[int],
+) -> int:
+  """Address of a constraint's first row in its island (nrow_max if it has no tree)."""
+  if tree < 0:
+    return nrow_max
+  slot = tree_island_in[worldid, tree] * ROW_CLASSES + rowclass
+  return island_rowadr_in[worldid, slot] + wp.atomic_add(island_cursor_out, worldid, slot, nrow)
+
+
+@wp.kernel
+def _reset_tree_nrow(
+  # Out:
+  tree_nrow_out: wp.array2d[int],
+):
+  worldid, slot = wp.tid()
+  tree_nrow_out[worldid, slot] = 0
+
+
+@wp.kernel
+def _island_row_layout(
+  # Model:
+  ntree: int,
+  # Data in:
+  nisland_in: wp.array[int],
+  tree_island_in: wp.array2d[int],
+  # In:
+  tree_nrow_in: wp.array2d[int],
+  # Data out:
+  island_nefc_out: wp.array2d[int],
+  island_ne_out: wp.array2d[int],
+  island_nf_out: wp.array2d[int],
+  # Out:
+  island_rowadr_out: wp.array2d[int],
+  island_cursor_out: wp.array2d[int],
+):
+  """Row addresses per island and class, in island order (serial per world, ntree is small)."""
+  worldid = wp.tid()
+  nisland = nisland_in[worldid]
+  for slot in range(ntree * ROW_CLASSES):
+    island_rowadr_out[worldid, slot] = 0
+    island_cursor_out[worldid, slot] = 0
+  for i in range(ntree):
+    island_nefc_out[worldid, i] = 0
+    island_ne_out[worldid, i] = 0
+    island_nf_out[worldid, i] = 0
+  # rows per island and class
+  for tree in range(ntree):
+    islandid = tree_island_in[worldid, tree]
+    if islandid >= 0:
+      for c in range(ROW_CLASSES):
+        island_rowadr_out[worldid, islandid * ROW_CLASSES + c] += tree_nrow_in[worldid, tree * ROW_CLASSES + c]
+  # exclusive scan over (island, class)
+  adr = int(0)
+  for islandid in range(nisland):
+    start = adr
+    for c in range(ROW_CLASSES):
+      slot = islandid * ROW_CLASSES + c
+      n = island_rowadr_out[worldid, slot]
+      island_rowadr_out[worldid, slot] = adr
+      adr += n
+      if c == ROW_EQUALITY:
+        island_ne_out[worldid, islandid] = n
+      elif c == ROW_FRICTION:
+        island_nf_out[worldid, islandid] = n
+    island_nefc_out[worldid, islandid] = adr - start
+
+
+def rows_finalize(m: types.Model, d: types.Data, island_parent: wp.array2d[int]):
+  """Label the islands discovered by the row kernels."""
+  wp.launch(_compress_roots, dim=(d.nworld, m.ntree), inputs=[d.tree_island, island_parent])
+  wp.launch(_label_roots, dim=d.nworld, inputs=[m.ntree, island_parent, d.nisland, d.tree_island])
+  wp.launch(_propagate_labels, dim=(d.nworld, m.ntree), inputs=[island_parent, d.tree_island])
+
+
+@wp.kernel
+def _zero_island_nv(
+  # Data out:
+  island_nv_out: wp.array2d[int],
+):
+  worldid, islandid = wp.tid()
+  island_nv_out[worldid, islandid] = 0
+
+
+@wp.kernel
+def _island_rows_identity(
+  # Data in:
+  nefc_in: wp.array[int],
+  nisland_in: wp.array[int],
+  island_iefcadr_in: wp.array2d[int],
+  # Data out:
+  efc_island_out: wp.array2d[int],
+  map_efc2iefc_out: wp.array2d[int],
+  map_iefc2efc_out: wp.array2d[int],
+):
+  """Rows are in island order: identity maps, and each row's island."""
+  worldid, efcid = wp.tid()
+  if efcid >= nefc_in[worldid]:
+    efc_island_out[worldid, efcid] = -1
+    return
+  lo = int(0)
+  hi = nisland_in[worldid]
+  while hi - lo > 1:
+    mid = (lo + hi) // 2
+    if island_iefcadr_in[worldid, mid] <= efcid:
+      lo = mid
+    else:
+      hi = mid
+  efc_island_out[worldid, efcid] = lo
+  map_efc2iefc_out[worldid, efcid] = efcid
+  map_iefc2efc_out[worldid, efcid] = efcid
+
+
+@event_scope
+def compute_island_dofs(m: types.Model, d: types.Data):
+  """Island DOF mappings (and identity row maps) when rows are already in island order."""
+  wp.launch(_zero_island_nv, dim=(d.nworld, m.ntree), outputs=[d.island_nv])
+  wp.launch(
+    _init_dof_arrays,
+    dim=(d.nworld, m.nv),
+    inputs=[],
+    outputs=[d.dof_island, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
+  )
+  wp.launch(
+    _island_count_dofs,
+    dim=(d.nworld, m.nv),
+    inputs=[m.dof_treeid, d.tree_island],
+    outputs=[d.dof_island, d.island_nv],
+  )
+  wp.launch_tiled(
+    _island_scan_sizes(m.ntree),
+    dim=d.nworld,
+    inputs=[d.island_nv, d.island_nefc],
+    outputs=[d.nidof, d.island_idofadr, d.island_iefcadr],
+    block_dim=types.BlockDim.island_scan_sizes,
+  )
+  d.island_dofadr.fill_(m.nv)
+  wp.launch(
+    _island_map_dofs,
+    dim=(d.nworld, m.nv),
+    inputs=[m.dof_treeid, m.tree_dofadr, m.tree_dofnum, d.nidof, d.tree_island, d.island_idofadr],
+    outputs=[d.island_dofadr, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
+  )
+  wp.launch(
+    _island_rows_identity,
+    dim=(d.nworld, d.njmax),
+    inputs=[d.nefc, d.nisland, d.island_iefcadr],
+    outputs=[d.efc.island, d.map_efc2iefc, d.map_iefc2efc],
+  )

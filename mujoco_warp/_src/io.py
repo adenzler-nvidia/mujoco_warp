@@ -2386,9 +2386,11 @@ def get_data_into(
   # efc indexing
   # mujoco expects contiguous efc ordering for contacts
   # this ordering is not guaranteed with mujoco warp, we enforce order here
+  # non-contact rows by type (island solve orders rows by island, not by type)
+  efc_type = d.efc.type.numpy()[world_id, :nefc]
+  efc_idx_efl = np.flatnonzero(efc_type < int(types.ConstraintType.CONTACT_FRICTIONLESS))
+  efc_idx_efl = efc_idx_efl[np.argsort(efc_type[efc_idx_efl], kind="stable")]
   if ncon > 0:
-    efc_idx_efl = np.arange(ne + nf + nl)
-
     contact_dim = d.contact.dim.numpy()[ncon_filter]
     contact_efc_address = d.contact.efc_address.numpy()[ncon_filter]
 
@@ -2410,7 +2412,7 @@ def get_data_into(
     efc_idx = np.concatenate((efc_idx_efl, *efc_idx_c)) if efc_idx_c else efc_idx_efl
     contact_efc_address_ordered = np.array(contact_efc_address_ordered)
   else:
-    efc_idx = np.array(np.arange(nefc))
+    efc_idx = efc_idx_efl
     contact_efc_address_ordered = np.empty(0)
 
   efc_idx = efc_idx[:nefc]  # dont emit indices for overflow constraints

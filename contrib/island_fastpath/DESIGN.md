@@ -360,3 +360,19 @@ are flat through collisions, roughly at main's level and ~10% behind the phase-4
 of the cost is in the first three Newton iterations, when every island is active (first-iteration
 factorization 261 us vs ~92 us for the dense single-tile path on the same 24576 27-DOF systems);
 later iterations cost little because converged islands drop out.
+
+## Phase 7: constraint rows built in island order
+
+For island_solve models (pyramidal, Newton, sparse, no flex; `island.island_rows`), make_constraint
+runs its row kernels twice. ROWS_DISCOVER reuses each kernel's activation test, merges the
+constraint's trees (DSU) and counts its rows per tree and class (equality, friction, limit,
+contact); `_island_row_layout` turns the counts into island row addresses; ROWS_WRITE takes each
+constraint's address from its island's class base plus an atomic cursor. Rows are then grouped by
+island and, within an island, by class (MuJoCo's island order), so the island solver reads
+efc.* directly: the row gather became a jaref initialization and the island mapping of rows is the
+identity. Consumers that assumed type-ordered rows were adapted (limit sensors now test type and
+nefc; get_data sorts non-contact rows by type). A put_data state must go through make_constraint
+before an island solve.
+
+Paired profiles (three_humanoids): -1.2% kernel time per step (row gather 172 -> 75 us, island
+mapping -60 us; +35 us for the discovery pass, +45 us for per-row DOF-to-aligned-row lookups).

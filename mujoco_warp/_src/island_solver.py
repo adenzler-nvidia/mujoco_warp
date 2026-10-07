@@ -14,9 +14,9 @@
 # ==============================================================================
 """Newton constraint solver over islands (opt.island_solve).
 
-Each step, constraint rows and DOFs are gathered into island order: an island's rows are
-contiguous, and its DOFs occupy tile-aligned rows that double as the right-hand side of its
-Cholesky factorization. Each island's inertia and Hessian are dense blocks of 16x16 tiles in a
+make_constraint writes constraint rows in island order (an island's rows are contiguous). Each
+step, an island's DOFs are gathered into tile-aligned rows that double as the right-hand side of
+its Cholesky factorization. Each island's inertia and Hessian are dense blocks of 16x16 tiles in a
 per-world pool. Every island is solved with its own step size and convergence test, as MuJoCo's
 island solver does, and the results are scattered back.
 """
@@ -33,6 +33,7 @@ from mujoco_warp._src.solver import _ALPHA_NOISE_EPS
 from mujoco_warp._src.solver import _JTDAJ_THREADS_PER_GROUP
 from mujoco_warp._src.solver import _ROW_EQUALITY
 from mujoco_warp._src.solver import _ROW_FRICTION
+from mujoco_warp._src.solver import _ROW_OTHER
 from mujoco_warp._src.solver import _eval_constraint
 from mujoco_warp._src.solver import _eval_pt
 from mujoco_warp._src.solver import _eval_pt_3alphas
@@ -44,7 +45,6 @@ from mujoco_warp._src.solver import _JTDACJ_sparse
 from mujoco_warp._src.solver import _jtdaj_groups_per_world
 from mujoco_warp._src.solver import _row_eval_pt
 from mujoco_warp._src.solver import _row_eval_pt_alpha_zero
-from mujoco_warp._src.solver import _small_row_category
 from mujoco_warp._src.types import OverflowType
 from mujoco_warp._src.warp_util import cache_kernel
 
@@ -75,17 +75,11 @@ class IslandContext:
   grad: wp.array3d[float]
   search: wp.array3d[float]
   mv: wp.array2d[float]
-  # constraint rows in island order
-  row_island: wp.array2d[int]
-  row_category: wp.array2d[int]
-  row_D: wp.array2d[float]
-  row_frictionloss: wp.array2d[float]
+  # per constraint row (make_constraint writes rows in island order)
   row_jaref: wp.array2d[float]
   row_jv: wp.array2d[float]
   # whether a row's curvature is in H (H is updated only where this flips)
   row_quad: wp.array2d[bool]
-  # J column indices remapped to aligned DOF rows, at the addresses of efc.J
-  colind: wp.array3d[int]
   # per-island dense blocks: inertia, Hessian and its factor
   M: wp.array3d[float]
   H: wp.array3d[float]
@@ -105,8 +99,17 @@ class IslandContext:
 
 
 def supported(m: types.Model) -> bool:
-  """Whether the island solver covers this model's options."""
-  return m.opt.cone == types.ConeType.PYRAMIDAL
+  """Whether the island solver covers this model's options (make_constraint writes island rows)."""
+  return island.island_rows(m)
+
+
+@wp.func
+def _row_category(constraint_type: int) -> int:
+  if constraint_type == types.ConstraintType.EQUALITY:
+    return _ROW_EQUALITY
+  if constraint_type == types.ConstraintType.FRICTION_DOF or constraint_type == types.ConstraintType.FRICTION_TENDON:
+    return _ROW_FRICTION
+  return _ROW_OTHER
 
 
 @wp.func
@@ -171,52 +174,29 @@ def _gather_dofs(
 
 
 @wp.kernel
-def _gather_rows(
+def _init_rows(
   # Data in:
   nefc_in: wp.array[int],
   efc_J_rownnz_in: wp.array2d[int],
   efc_J_rowadr_in: wp.array2d[int],
   efc_J_colind_in: wp.array3d[int],
   efc_J_in: wp.array3d[float],
-  efc_D_in: wp.array2d[float],
   efc_aref_in: wp.array2d[float],
-  efc_frictionloss_in: wp.array2d[float],
-  efc_island_in: wp.array2d[int],
-  island_ne_in: wp.array2d[int],
-  island_nf_in: wp.array2d[int],
-  island_iefcadr_in: wp.array2d[int],
-  map_iefc2efc_in: wp.array2d[int],
   # In:
   dof2row_in: wp.array2d[int],
   iqacc_in: wp.array2d[float],
   # Out:
-  row_island_out: wp.array2d[int],
-  row_category_out: wp.array2d[int],
-  row_D_out: wp.array2d[float],
-  row_frictionloss_out: wp.array2d[float],
   row_jaref_out: wp.array2d[float],
-  colind_out: wp.array3d[int],
 ):
-  """Row data in island order; J column indices remapped to aligned DOF rows."""
+  """J qacc - aref of a row at the start point."""
   worldid, row = wp.tid()
   if row >= nefc_in[worldid]:
     return
-  efcid = map_iefc2efc_in[worldid, row]
-  islandid = efc_island_in[worldid, efcid]
-  category = _small_row_category(
-    row - island_iefcadr_in[worldid, islandid], island_ne_in[worldid, islandid], island_nf_in[worldid, islandid]
-  )
-  row_island_out[worldid, row] = islandid
-  row_category_out[worldid, row] = category
-  row_D_out[worldid, row] = efc_D_in[worldid, efcid]
-  row_frictionloss_out[worldid, row] = wp.where(category == _ROW_FRICTION, efc_frictionloss_in[worldid, efcid], 0.0)
-  rowadr = efc_J_rowadr_in[worldid, efcid]
-  jaref = -efc_aref_in[worldid, efcid]
-  for k in range(efc_J_rownnz_in[worldid, efcid]):
+  rowadr = efc_J_rowadr_in[worldid, row]
+  jaref = -efc_aref_in[worldid, row]
+  for k in range(efc_J_rownnz_in[worldid, row]):
     adr = rowadr + k
-    col = dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]
-    colind_out[worldid, 0, adr] = col
-    jaref += efc_J_in[worldid, 0, adr] * iqacc_in[worldid, col]
+    jaref += efc_J_in[worldid, 0, adr] * iqacc_in[worldid, dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
   row_jaref_out[worldid, row] = jaref
 
 
@@ -321,21 +301,21 @@ def _rows(initial: bool):
   def kernel(
     # Data in:
     nefc_in: wp.array[int],
+    efc_type_in: wp.array2d[int],
     efc_J_rownnz_in: wp.array2d[int],
     efc_J_rowadr_in: wp.array2d[int],
+    efc_J_colind_in: wp.array3d[int],
     efc_J_in: wp.array3d[float],
-    map_iefc2efc_in: wp.array2d[int],
+    efc_D_in: wp.array2d[float],
+    efc_frictionloss_in: wp.array2d[float],
+    efc_island_in: wp.array2d[int],
     # In:
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
-    row_island_in: wp.array2d[int],
-    row_category_in: wp.array2d[int],
-    row_D_in: wp.array2d[float],
-    row_frictionloss_in: wp.array2d[float],
     row_jaref_in: wp.array2d[float],
-    colind_in: wp.array3d[int],
+    dof2row_in: wp.array2d[int],
     # Data out:
     efc_force_out: wp.array2d[float],
     efc_state_out: wp.array2d[int],
@@ -352,18 +332,18 @@ def _rows(initial: bool):
     worldid, row = wp.tid()
     if row >= nefc_in[worldid]:
       return
-    islandid = row_island_in[worldid, row]
+    islandid = efc_island_in[worldid, row]
     if done_in[worldid, islandid]:
       return
-    category = row_category_in[worldid, row]
-    D = row_D_in[worldid, row]
+    category = _row_category(efc_type_in[worldid, row])
+    D = efc_D_in[worldid, row]
     res = _eval_constraint(
       category == _ROW_EQUALITY,
       category == _ROW_FRICTION,
       False,
       row_jaref_in[worldid, row],
       D,
-      row_frictionloss_in[worldid, row],
+      efc_frictionloss_in[worldid, row],
       0,
       -1,
       0.0,
@@ -374,9 +354,8 @@ def _rows(initial: bool):
     )
     force = res[0]
     state = int(res[1])
-    efcid = map_iefc2efc_in[worldid, row]
-    efc_force_out[worldid, efcid] = force
-    efc_state_out[worldid, efcid] = state
+    efc_force_out[worldid, row] = force
+    efc_state_out[worldid, row] = state
     quad = state == types.ConstraintState.QUADRATIC.value
     # H = M + sum of D J'J over quadratic rows: add or remove this row's term when it flips
     dH = float(0.0)
@@ -387,20 +366,22 @@ def _rows(initial: bool):
       changed_out[worldid, islandid] = True
       dH = wp.where(quad, D, -D)
 
-    rowadr = efc_J_rowadr_in[worldid, efcid]
-    rownnz = efc_J_rownnz_in[worldid, efcid]
+    rowadr = efc_J_rowadr_in[worldid, row]
+    rownnz = efc_J_rownnz_in[worldid, row]
+    dof2row = dof2row_in[worldid]
+    colind = efc_J_colind_in[worldid, 0]
     tilebase = tilebase_in[worldid, islandid]
     ntile = ntile_in[worldid, islandid]
     vbase = vbase_in[worldid, islandid]
     for k in range(rownnz):
-      cola = colind_in[worldid, 0, rowadr + k]
+      cola = dof2row[colind[rowadr + k]]
       Ja = efc_J_in[worldid, 0, rowadr + k]
       if force != 0.0:
         wp.atomic_add(frc_out[worldid], cola, Ja * force)
       if dH != 0.0:
         JaD = Ja * dH
         for kb in range(k, rownnz):
-          rc = _pool_rc(tilebase, ntile, cola - vbase, colind_in[worldid, 0, rowadr + kb] - vbase)
+          rc = _pool_rc(tilebase, ntile, cola - vbase, dof2row[colind[rowadr + kb]] - vbase)
           wp.atomic_add(H_out[worldid, rc[0]], rc[1], JaD * efc_J_in[worldid, 0, rowadr + kb])
 
   return kernel
@@ -484,13 +465,16 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     opt_iterations: int,
     # Data in:
     nisland_in: wp.array[int],
+    efc_type_in: wp.array2d[int],
     efc_J_rownnz_in: wp.array2d[int],
     efc_J_rowadr_in: wp.array2d[int],
+    efc_J_colind_in: wp.array3d[int],
     efc_J_in: wp.array3d[float],
+    efc_D_in: wp.array2d[float],
+    efc_frictionloss_in: wp.array2d[float],
     island_nv_in: wp.array2d[int],
     island_nefc_in: wp.array2d[int],
     island_iefcadr_in: wp.array2d[int],
-    map_iefc2efc_in: wp.array2d[int],
     # In:
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
@@ -499,10 +483,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     iqfrc_smooth_in: wp.array2d[float],
     iM_in: wp.array3d[float],
     search_in: wp.array2d[float],
-    row_category_in: wp.array2d[int],
-    row_D_in: wp.array2d[float],
-    row_frictionloss_in: wp.array2d[float],
-    colind_in: wp.array3d[int],
+    dof2row_in: wp.array2d[int],
     grad_dot_in: wp.array2d[float],
     search_dot_in: wp.array2d[float],
     newton_decrement_in: wp.array2d[float],
@@ -577,20 +558,20 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     local_p0 = wp.vec3(0.0)
     for r in range(lane, nrow, nthread):
       row = rowadr0 + r
-      efcid = map_iefc2efc_in[worldid, row]
-      rowadr = efc_J_rowadr_in[worldid, efcid]
+      rowadr = efc_J_rowadr_in[worldid, row]
       jv = float(0.0)
-      for k in range(efc_J_rownnz_in[worldid, efcid]):
-        jv += efc_J_in[worldid, 0, rowadr + k] * search[colind_in[worldid, 0, rowadr + k]]
+      for k in range(efc_J_rownnz_in[worldid, row]):
+        adr = rowadr + k
+        jv += efc_J_in[worldid, 0, adr] * search[dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
       row_jv_out[worldid, row] = jv
-      category = row_category_in[worldid, row]
-      D = row_D_in[worldid, row]
+      category = _row_category(efc_type_in[worldid, row])
+      D = efc_D_in[worldid, row]
       jaref = row_jaref_out[worldid, row]
       if category == _ROW_EQUALITY:
         jvD = jv * D
         local_gauss += wp.vec2(jvD * jaref, 0.5 * jv * jvD)
       else:
-        local_p0 += _row_eval_pt_alpha_zero(category, D, row_frictionloss_in[worldid, row], jaref, jv)
+        local_p0 += _row_eval_pt_alpha_zero(category, D, efc_frictionloss_in[worldid, row], jaref, jv)
     dof_sums = wp.tile_reduce(wp.add, wp.tile(local_dof, preserve_type=True))[0]
     gauss_rows = wp.tile_reduce(wp.add, wp.tile(local_gauss, preserve_type=True))[0]
     p0_rows = wp.tile_reduce(wp.add, wp.tile(local_p0, preserve_type=True))[0]
@@ -610,13 +591,13 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     local_lo_in = wp.vec3(0.0)
     for r in range(lane, nrow, nthread):
       row = rowadr0 + r
-      category = row_category_in[worldid, row]
+      category = _row_category(efc_type_in[worldid, row])
       if category != _ROW_EQUALITY:
         local_lo_in += _row_eval_pt(
           category,
           lo_alpha_in,
-          row_D_in[worldid, row],
-          row_frictionloss_in[worldid, row],
+          efc_D_in[worldid, row],
+          efc_frictionloss_in[worldid, row],
           row_jaref_out[worldid, row],
           row_jv_out[worldid, row],
         )
@@ -647,10 +628,10 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
         local_combined = wp.mat33(0.0)
         for r in range(lane, nrow, nthread):
           row = rowadr0 + r
-          category = row_category_in[worldid, row]
+          category = _row_category(efc_type_in[worldid, row])
           if category != _ROW_EQUALITY:
-            D = row_D_in[worldid, row]
-            f = row_frictionloss_in[worldid, row]
+            D = efc_D_in[worldid, row]
+            f = efc_frictionloss_in[worldid, row]
             jaref = row_jaref_out[worldid, row]
             jv = row_jv_out[worldid, row]
             plo = _row_eval_pt(category, lo_next_alpha, D, f, jaref, jv)
@@ -803,14 +784,9 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     grad=wp.zeros((nworld, nrow, 1), dtype=float),
     search=wp.zeros((nworld, nrow, 1), dtype=float),
     mv=wp.zeros((nworld, nrow), dtype=float),
-    row_island=wp.empty((nworld, njmax), dtype=int),
-    row_category=wp.empty((nworld, njmax), dtype=int),
-    row_D=wp.empty((nworld, njmax), dtype=float),
-    row_frictionloss=wp.empty((nworld, njmax), dtype=float),
     row_jaref=wp.empty((nworld, njmax), dtype=float),
     row_jv=wp.empty((nworld, njmax), dtype=float),
     row_quad=wp.zeros((nworld, njmax), dtype=bool),
-    colind=wp.empty(d.efc.J_colind.shape, dtype=int),
     M=wp.empty(pool, dtype=float),
     H=wp.empty(pool, dtype=float),
     U=wp.empty(pool, dtype=float),
@@ -833,20 +809,20 @@ def _launch_rows(m: types.Model, d: types.Data, ctx: IslandContext, initial: boo
     dim=(d.nworld, d.njmax),
     inputs=[
       d.nefc,
+      d.efc.type,
       d.efc.J_rownnz,
       d.efc.J_rowadr,
+      d.efc.J_colind,
       d.efc.J,
-      d.map_iefc2efc,
+      d.efc.D,
+      d.efc.frictionloss,
+      d.efc.island,
       ctx.tilebase,
       ctx.ntile,
       ctx.vbase,
       ctx.done,
-      ctx.row_island,
-      ctx.row_category,
-      ctx.row_D,
-      ctx.row_frictionloss,
       ctx.row_jaref,
-      ctx.colind,
+      ctx.dof2row,
     ],
     outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.frc, ctx.H, ctx.changed],
   )
@@ -882,13 +858,16 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
       m.opt.ls_tolerance,
       m.opt.iterations,
       d.nisland,
+      d.efc.type,
       d.efc.J_rownnz,
       d.efc.J_rowadr,
+      d.efc.J_colind,
       d.efc.J,
+      d.efc.D,
+      d.efc.frictionloss,
       d.island_nv,
       d.island_nefc,
       d.island_iefcadr,
-      d.map_iefc2efc,
       ctx.tilebase,
       ctx.ntile,
       ctx.vbase,
@@ -896,10 +875,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
       ctx.qfrc_smooth,
       ctx.M,
       ctx.search.reshape((d.nworld, nrow)),
-      ctx.row_category,
-      ctx.row_D,
-      ctx.row_frictionloss,
-      ctx.colind,
+      ctx.dof2row,
       ctx.grad_dot,
       ctx.search_dot,
       ctx.newton_decrement,
@@ -927,8 +903,8 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
 
 def solve(m: types.Model, d: types.Data) -> IslandContext:
   """Solve every island with its own Newton iteration and scatter the results back."""
-  island.island(m, d)
-  island.compute_island_mapping(m, d)
+  # make_constraint found the islands and wrote the rows in island order
+  island.compute_island_dofs(m, d)
   ctx = _create_context(m, d)
   nrow = ctx.qacc.shape[1]
 
@@ -971,26 +947,10 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     outputs=[ctx.M],
   )
   wp.launch(
-    _gather_rows,
+    _init_rows,
     dim=(d.nworld, d.njmax),
-    inputs=[
-      d.nefc,
-      d.efc.J_rownnz,
-      d.efc.J_rowadr,
-      d.efc.J_colind,
-      d.efc.J,
-      d.efc.D,
-      d.efc.aref,
-      d.efc.frictionloss,
-      d.efc.island,
-      d.island_ne,
-      d.island_nf,
-      d.island_iefcadr,
-      d.map_iefc2efc,
-      ctx.dof2row,
-      ctx.qacc,
-    ],
-    outputs=[ctx.row_island, ctx.row_category, ctx.row_D, ctx.row_frictionloss, ctx.row_jaref, ctx.colind],
+    inputs=[d.nefc, d.efc.J_rownnz, d.efc.J_rowadr, d.efc.J_colind, d.efc.J, d.efc.aref, ctx.dof2row, ctx.qacc],
+    outputs=[ctx.row_jaref],
   )
   d.solver_niter.zero_()
   wp.launch_tiled(

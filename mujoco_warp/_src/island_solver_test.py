@@ -18,9 +18,11 @@ import mujoco
 import numpy as np
 from absl.testing import absltest
 
+import mujoco_warp as mjw
 from mujoco_warp import ConeType
 from mujoco_warp import SolverType
 from mujoco_warp import test_data
+from mujoco_warp._src import island
 from mujoco_warp._src import island_solver
 
 
@@ -59,6 +61,8 @@ def _fixture():
     xml=xml, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
   )
   m.opt.island_solve = True
+  # rows in island order
+  mjw.make_constraint(m, d)
   # start away from the solution so every island iterates
   d.qacc_warmstart.zero_()
   return mjm, mjd, m, d
@@ -75,7 +79,81 @@ def _dense_J(d):
   return out
 
 
+_ROWS_XML = """
+<mujoco>
+  <worldbody>
+    <geom type="plane" size="10 10 .1"/>
+    <body pos="0 0 1"><joint name="a" type="hinge" axis="0 1 0" range="-.2 .2" frictionloss=".1"/>
+      <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/></body>
+    <body pos="1 0 1"><joint name="b" type="hinge" axis="0 1 0"/>
+      <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/></body>
+    <body pos="2 0 1"><joint name="c" type="hinge" axis="0 1 0"/>
+      <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/></body>
+    <body pos="3 0 1"><joint name="d" type="hinge" axis="0 1 0"/>
+      <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/></body>
+    <body name="e" pos="4 0 1"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
+    <body name="f" pos="4.2 0 1"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
+    <body pos="5 0 .049"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
+    <body pos="6 0 .049"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
+    <body pos="6 0 .148"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
+  </worldbody>
+  <tendon>
+    <fixed name="ab" limited="true" range="-.01 .01" frictionloss=".2"><joint joint="a" coef="1"/><joint joint="b" coef="-1"/></fixed>
+  </tendon>
+  <equality>
+    <joint joint1="c" joint2="d"/>
+    <connect body1="e" body2="f" anchor=".1 0 0"/>
+  </equality>
+  <keyframe><key qpos=".3 .1 0 0 4 0 1 1 0 0 0 4.2 0 1 1 0 0 0 5 0 .049 1 0 0 0 6 0 .049 1 0 0 0 6 0 .148 1 0 0 0"/></keyframe>
+</mujoco>
+"""
+
+
 class IslandSolverTest(absltest.TestCase):
+  def test_rows_in_island_order(self):
+    """Island-mode constraint rows: the same rows, grouped by island, and the same islands."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml=_ROWS_XML, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
+    )
+    self.assertTrue(m.is_sparse)
+
+    def rows(island_solve):
+      m.opt.island_solve = island_solve
+      mjw.make_constraint(m, d)
+      nefc = d.nefc.numpy()[0]
+      etype, eid = d.efc.type.numpy()[0, :nefc], d.efc.id.numpy()[0, :nefc]
+      order = np.lexsort((np.arange(nefc), eid, etype))
+      J = _dense_J(d)
+      fields = [etype, eid, d.efc.D.numpy()[0, :nefc], d.efc.aref.numpy()[0, :nefc], J]
+      return [f[order] for f in fields]
+
+    world = rows(False)
+    island_rows = rows(True)
+    for name, a, b in zip(("type", "id", "D", "aref", "J"), island_rows, world):
+      np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-6, err_msg=name)
+
+    # same islands as discovery from the finished rows
+    tree_island, nisland = d.tree_island.numpy().copy(), d.nisland.numpy().copy()
+    island.island(m, d)
+    np.testing.assert_array_equal(tree_island, d.tree_island.numpy())
+    np.testing.assert_array_equal(nisland, d.nisland.numpy())
+    # tendon (a, b), joint equality (c, d), connect (e, f), floor box, stack
+    self.assertEqual(nisland[0], 5)
+
+    # each island's rows are contiguous and ordered equality, friction, limit, contact
+    nefc = d.nefc.numpy()[0]
+    island.compute_island_dofs(m, d)
+    row_island = d.efc.island.numpy()[0, :nefc]
+    self.assertTrue(np.all(np.diff(row_island) >= 0))
+    rank = {0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 3, 7: 3}  # MuJoCo constraint types to classes
+    etype = d.efc.type.numpy()[0, :nefc]
+    for i in range(nisland[0]):
+      cls = [rank[t] for t in etype[row_island == i]]
+      self.assertEqual(cls, sorted(cls))
+      self.assertEqual(d.island_ne.numpy()[0, i], cls.count(0))
+      self.assertEqual(d.island_nf.numpy()[0, i], cls.count(1))
+      self.assertEqual(d.island_nefc.numpy()[0, i], len(cls))
+
   def test_solve(self):
     """The island solve reaches MuJoCo's solution."""
     mjm, mjd, m, d = _fixture()
