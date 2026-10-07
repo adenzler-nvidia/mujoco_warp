@@ -2621,6 +2621,7 @@ class SolverContext:
   island_ntile: Optional[wp.array2d[int]] = None
   island_vbase: Optional[wp.array2d[int]] = None
   island_sums: Optional[wp.array2d[wp.vec2]] = None
+  island_large: Optional[wp.array[int]] = None  # 1 if any island is left for the world solve
   pgrad: Optional[wp.array2d[float]] = None
   psearch: Optional[wp.array2d[float]] = None
 

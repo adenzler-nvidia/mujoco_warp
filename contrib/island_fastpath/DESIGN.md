@@ -315,3 +315,30 @@ Interleaved, median of 3, ns per world-step, vs the skyline version (GPU partly 
 
 pile256's Cholesky no longer appears among its top kernels; the step is now spread over many small,
 launch-bound kernels and the small-island kernel (16%).
+
+## Phase 5 (in progress): per-island solver, medium islands as worlds of the dense solver
+
+Goal: islands, not worlds, are the unit of the whole solve (own step size, convergence, dense or
+sparse per island), as in MuJoCo's `mj_island` + `mj_solNewton_island`.
+
+- Tried first: one CTA per island solving it in shared memory (J, M, H; 64 threads). 4 ms per
+  step for 24576 humanoid islands vs ~1.1 ms for the dense multi-kernel solver on the same work:
+  26 KB shared + 168 registers per CTA (12.5% occupancy), a long chain of barriers per iteration.
+  Dropped.
+- Now: medium islands (pyramidal, 9-32 DOFs, <= 64 rows) are gathered per step into slots
+  (`nslot = min(ntree, nv // 9)` per world): dense M, dense island-local J rows, row data, DOF
+  vectors, and `meaninertia = trace / 32` so the dense solver's convergence scale is the island
+  inertia trace. The stock dense Newton solver (`_solve(..., compact=True)`) runs with one world per
+  slot; qacc, qfrc_constraint, efc force/state are scattered back. The small-island kernel also
+  writes forces, states and qfrc_constraint, so the world solve is skipped (`capture_if`) unless
+  an island is left for the pool; the slot solve is skipped unless a world has a medium island.
+- Measured (three_humanoids, 8192 worlds): ~460 ns per world-step over the first 50 steps (same as
+  phase 4b), but worse once humanoids merge (54/81-DOF islands go back to the world solve, which
+  then runs for all worlds). Gathers cost ~0.6 ms per step; the slot solve ~1.1 ms per step (as the
+  dense one-humanoid run). pyramidal aloha and the piles are slower than phase 4b (slot capacity
+  per world, merged islands).
+- Next: bigger slot classes (or a per-island large tier) so merged islands avoid the world solve;
+  globally compacted slots instead of per-world capacity; cheaper gathers.
+- Found on the way: the monolithic Newton solve stops early from a zero warmstart on a small
+  test model (upstream too); a Warp kernel-cache bug (functions passed to `tile_map` in
+  `module="unique"` kernels are hashed without their callees, so nested changes leave stale code).

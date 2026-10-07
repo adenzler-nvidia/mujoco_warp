@@ -1677,11 +1677,14 @@ def _solve_init_dof(warmstart: bool, sparse: bool):
     excluded = False
     if h_dof2row_in:
       excluded = h_dof2row_in[worldid, dofid] < 0
-      if excluded and dof_island_in[worldid, dofid] >= 0:
-        if wp.static(SPARSE):
-          if nefc_in[worldid] == 0:
-            qfrc_constraint_out[worldid, dofid] = 0.0
-        return
+      if excluded:
+        if dof_island_in[worldid, dofid] >= 0:
+          if wp.static(SPARSE):
+            if nefc_in[worldid] == 0:
+              qfrc_constraint_out[worldid, dofid] = 0.0
+          return
+        # the world solve may be skipped, so DOFs outside all islands get their (zero) force here
+        qfrc_constraint_out[worldid, dofid] = 0.0
 
     if wp.static(WARMSTART):
       if nefc_in[worldid] > 0 and not excluded:
@@ -4146,6 +4149,9 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
 
 _SMALL_ISLAND_NV = 8
 _SMALL_ISLAND_NEFC = 64
+# islands up to this size are solved as worlds of the dense solver (see _solve_medium_islands)
+_MEDIUM_ISLAND_NV = 32
+_MEDIUM_ISLAND_NEFC = 64
 
 _vec_small = wp.types.vector(length=_SMALL_ISLAND_NV, dtype=float)
 _mat_small = wp.types.matrix(shape=(_SMALL_ISLAND_NV, _SMALL_ISLAND_NV), dtype=float)
@@ -4160,6 +4166,16 @@ _ROW_OTHER = 2
 def _is_small_island(cone: int, ndof: int, nrow: int) -> bool:
   # TODO(team): elliptic cones
   return cone == types.ConeType.PYRAMIDAL and ndof <= _SMALL_ISLAND_NV and nrow <= _SMALL_ISLAND_NEFC
+
+
+@wp.func
+def _is_medium_island(cone: int, ndof: int, nrow: int) -> bool:
+  return (
+    cone == types.ConeType.PYRAMIDAL
+    and not _is_small_island(cone, ndof, nrow)
+    and ndof <= _MEDIUM_ISLAND_NV
+    and nrow <= _MEDIUM_ISLAND_NEFC
+  )
 
 
 @wp.func
@@ -4319,6 +4335,9 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
     map_iefc2efc_in: wp.array2d[int],
     # Data out:
     qacc_out: wp.array2d[float],
+    qfrc_constraint_out: wp.array2d[float],
+    efc_force_out: wp.array2d[float],
+    efc_state_out: wp.array2d[int],
     overflow_out: wp.array[int],
     # Out:
     niter_out: wp.array[int],
@@ -4382,6 +4401,8 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
     rows_f = _rows_float()
     rows_jaref = _rows_float()
     rows_jv = _rows_float()
+    rows_force = _rows_float()
+    rows_state = _rows_int()
     for s in range(wp.static(_SMALL_ROWS_PER_LANE)):
       row = lane + s * _SMALL_LANES
       if row < nrow:
@@ -4436,6 +4457,8 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
             0.0,
           )
           force = res[0]
+          rows_force[s] = force
+          rows_state[s] = int(res[1])
           if int(res[1]) == types.ConstraintState.QUADRATIC.value:
             quadD = rows_D[s]
         # inactive rows have zero Jacobian, so they add nothing
@@ -4635,9 +4658,18 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
         rows_jaref[s] += alpha * rows_jv[s]
       niter += 1
 
+    # forces and states are those of the last evaluation, at the final qacc
     for i in range(N):
       if lane == i and i < n:
-        qacc_out[worldid, map_idof2dof_in[worldid, idofadr + i]] = qacc[i]
+        dofi = map_idof2dof_in[worldid, idofadr + i]
+        qacc_out[worldid, dofi] = qacc[i]
+        qfrc_constraint_out[worldid, dofi] = wp.tile_extract(frc_s, i)
+    for s in range(wp.static(_SMALL_ROWS_PER_LANE)):
+      row = lane + s * _SMALL_LANES
+      if row < nrow:
+        efcid = map_iefc2efc_in[worldid, iefcadr + row]
+        efc_force_out[worldid, efcid] = rows_force[s]
+        efc_state_out[worldid, efcid] = rows_state[s]
     if lane == 0:
       if not done and niter == opt_iterations and opt_iterations > 0:
         if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
@@ -4652,11 +4684,465 @@ def _small_island_solve(warmstart: bool, ls_iterations: int, warn_overflow: int)
   return kernel
 
 
+# Medium islands run through the dense Newton solver as worlds of their own: each world has
+# nslot = min(ntree, nv // 9) slots (a medium island has at least 9 DOFs), and slot v belongs to
+# world v // nslot. Per step, each medium island's inertia, Jacobian rows (dense, island-local
+# columns) and DOF vectors are gathered into its slot; empty slots have no constraint rows.
+
+
+def _medium_nslot(m: types.Model) -> int:
+  if m.opt.cone != types.ConeType.PYRAMIDAL:
+    return 0
+  return min(m.ntree, m.nv // (_SMALL_ISLAND_NV + 1))
+
+
+@wp.kernel
+def _medium_island_slots(
+  # Model:
+  opt_cone: int,
+  # Data in:
+  nisland_in: wp.array[int],
+  island_nv_in: wp.array2d[int],
+  island_nefc_in: wp.array2d[int],
+  # In:
+  nslot: int,
+  # Out:
+  slot_island_out: wp.array[int],
+  island_slot_out: wp.array2d[int],
+  any_medium_out: wp.array[int],
+):
+  """Give each medium island the next slot of its world; unused slots and other islands get -1."""
+  worldid = wp.tid()
+  k = int(0)
+  for i in range(nisland_in[worldid]):
+    slot = int(-1)
+    if _is_medium_island(opt_cone, island_nv_in[worldid, i], island_nefc_in[worldid, i]):
+      slot = worldid * nslot + k
+      slot_island_out[slot] = i
+      k += 1
+    island_slot_out[worldid, i] = slot
+  for j in range(k, nslot):
+    slot_island_out[worldid * nslot + j] = -1
+  if k > 0:
+    any_medium_out[0] = 1
+
+
+@wp.kernel
+def _medium_slot_dofs(
+  # Model:
+  opt_tolerance: wp.array[float],
+  opt_ls_tolerance: wp.array[float],
+  M_elemid: wp.array2d[int],
+  # Data in:
+  qacc_warmstart_in: wp.array2d[float],
+  M_in: wp.array2d[float],
+  qfrc_smooth_in: wp.array2d[float],
+  qacc_smooth_in: wp.array2d[float],
+  island_idofadr_in: wp.array2d[int],
+  island_nv_in: wp.array2d[int],
+  island_nefc_in: wp.array2d[int],
+  island_ne_in: wp.array2d[int],
+  island_nf_in: wp.array2d[int],
+  map_idof2dof_in: wp.array2d[int],
+  # In:
+  nslot: int,
+  slot_island_in: wp.array[int],
+  # Out:
+  slot_qacc_warmstart_out: wp.array2d[float],
+  slot_qfrc_smooth_out: wp.array2d[float],
+  slot_qacc_smooth_out: wp.array2d[float],
+  slot_nefc_out: wp.array[int],
+  slot_ne_out: wp.array[int],
+  slot_nf_out: wp.array[int],
+  slot_meaninertia_out: wp.array[float],
+  slot_tolerance_out: wp.array[float],
+  slot_ls_tolerance_out: wp.array[float],
+):
+  """DOF vectors of each slot (zero on padding), slot sizes and tolerances."""
+  slot, i = wp.tid()
+  N = wp.static(_MEDIUM_ISLAND_NV)
+  worldid = slot // nslot
+  islandid = slot_island_in[slot]
+  n = int(0)
+  idofadr = int(0)
+  if islandid >= 0:
+    n = island_nv_in[worldid, islandid]
+    idofadr = island_idofadr_in[worldid, islandid]
+
+  warmstart = float(0.0)
+  smooth_frc = float(0.0)
+  smooth_acc = float(0.0)
+  if i < n:
+    dofi = map_idof2dof_in[worldid, idofadr + i]
+    warmstart = qacc_warmstart_in[worldid, dofi]
+    smooth_frc = qfrc_smooth_in[worldid, dofi]
+    smooth_acc = qacc_smooth_in[worldid, dofi]
+  slot_qacc_warmstart_out[slot, i] = warmstart
+  slot_qfrc_smooth_out[slot, i] = smooth_frc
+  slot_qacc_smooth_out[slot, i] = smooth_acc
+
+  if i == 0:
+    nefc = int(0)
+    ne = int(0)
+    nf = int(0)
+    # MuJoCo scales an island's convergence tests by its inertia trace: meaninertia * nv = trace
+    trace = float(N)
+    if islandid >= 0:
+      nefc = island_nefc_in[worldid, islandid]
+      ne = island_ne_in[worldid, islandid]
+      nf = island_nf_in[worldid, islandid]
+      trace = float(0.0)
+      for k in range(n):
+        dofk = map_idof2dof_in[worldid, idofadr + k]
+        trace += M_in[worldid, M_elemid[dofk, dofk]]
+    slot_nefc_out[slot] = nefc
+    slot_ne_out[slot] = ne
+    slot_nf_out[slot] = nf
+    slot_meaninertia_out[slot] = trace / float(N)
+    slot_tolerance_out[slot] = opt_tolerance[worldid % opt_tolerance.shape[0]]
+    slot_ls_tolerance_out[slot] = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
+
+
+@wp.kernel
+def _medium_slot_rows(
+  # Data in:
+  efc_type_in: wp.array2d[int],
+  efc_id_in: wp.array2d[int],
+  efc_D_in: wp.array2d[float],
+  efc_aref_in: wp.array2d[float],
+  efc_frictionloss_in: wp.array2d[float],
+  island_iefcadr_in: wp.array2d[int],
+  map_iefc2efc_in: wp.array2d[int],
+  # In:
+  nslot: int,
+  slot_island_in: wp.array[int],
+  slot_nefc_in: wp.array[int],
+  # Out:
+  slot_efc_type_out: wp.array2d[int],
+  slot_efc_id_out: wp.array2d[int],
+  slot_efc_D_out: wp.array2d[float],
+  slot_efc_aref_out: wp.array2d[float],
+  slot_efc_frictionloss_out: wp.array2d[float],
+):
+  """Row data of each slot row; padding rows get zero D."""
+  slot, row = wp.tid()
+  if row < slot_nefc_in[slot]:
+    worldid = slot // nslot
+    efcid = map_iefc2efc_in[worldid, island_iefcadr_in[worldid, slot_island_in[slot]] + row]
+    slot_efc_type_out[slot, row] = efc_type_in[worldid, efcid]
+    slot_efc_id_out[slot, row] = efc_id_in[worldid, efcid]
+    slot_efc_D_out[slot, row] = efc_D_in[worldid, efcid]
+    slot_efc_aref_out[slot, row] = efc_aref_in[worldid, efcid]
+    slot_efc_frictionloss_out[slot, row] = efc_frictionloss_in[worldid, efcid]
+  else:
+    slot_efc_D_out[slot, row] = 0.0
+
+
+@wp.kernel
+def _medium_init_M_J(
+  # In:
+  slot_nefc_in: wp.array[int],
+  # Out:
+  slot_M_out: wp.array3d[float],
+  slot_efc_J_out: wp.array3d[float],
+):
+  """Identity slot inertia and zero Jacobian rows, up to a whole tile past the last row."""
+  slot, row, col = wp.tid()
+  N = wp.static(_MEDIUM_ISLAND_NV)
+  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
+  if row < N:
+    slot_M_out[slot, row, col] = wp.where(row == col, 1.0, 0.0)
+  # the dense kernels read whole tiles of rows
+  if row < (slot_nefc_in[slot] + TILE - 1) // TILE * TILE:
+    slot_efc_J_out[slot, row, col] = 0.0
+
+
+@wp.kernel
+def _medium_gather_M(
+  # Model:
+  M_colind: wp.array[int],
+  M_hinit_i: wp.array[int],
+  # Data in:
+  M_in: wp.array2d[float],
+  dof_island_in: wp.array2d[int],
+  island_idofadr_in: wp.array2d[int],
+  map_dof2idof_in: wp.array2d[int],
+  # In:
+  island_slot_in: wp.array2d[int],
+  # Out:
+  slot_M_out: wp.array3d[float],
+):
+  """Scatter each stored inertia entry of a medium island (and its mirror) into its slot."""
+  worldid, elemid = wp.tid()
+  i = M_hinit_i[elemid]
+  islandid = dof_island_in[worldid, i]
+  if islandid < 0:
+    return
+  slot = island_slot_in[worldid, islandid]
+  if slot < 0:
+    return
+  idofadr = island_idofadr_in[worldid, islandid]
+  li = map_dof2idof_in[worldid, i] - idofadr
+  lj = map_dof2idof_in[worldid, M_colind[elemid]] - idofadr
+  mij = M_in[worldid, elemid]
+  slot_M_out[slot, li, lj] = mij
+  slot_M_out[slot, lj, li] = mij
+
+
+@wp.kernel
+def _medium_gather_J(
+  # Data in:
+  nefc_in: wp.array[int],
+  efc_J_rownnz_in: wp.array2d[int],
+  efc_J_rowadr_in: wp.array2d[int],
+  efc_J_colind_in: wp.array3d[int],
+  efc_J_in: wp.array3d[float],
+  efc_island_in: wp.array2d[int],
+  island_idofadr_in: wp.array2d[int],
+  island_iefcadr_in: wp.array2d[int],
+  map_dof2idof_in: wp.array2d[int],
+  map_efc2iefc_in: wp.array2d[int],
+  # In:
+  island_slot_in: wp.array2d[int],
+  # Out:
+  slot_efc_J_out: wp.array3d[float],
+):
+  """Scatter each Jacobian nonzero of a medium island's row into its slot, island-local."""
+  worldid, efcid, k = wp.tid()
+  if efcid >= nefc_in[worldid] or k >= efc_J_rownnz_in[worldid, efcid]:
+    return
+  islandid = efc_island_in[worldid, efcid]
+  if islandid < 0:
+    return
+  slot = island_slot_in[worldid, islandid]
+  if slot < 0:
+    return
+  adr = efc_J_rowadr_in[worldid, efcid] + k
+  row = map_efc2iefc_in[worldid, efcid] - island_iefcadr_in[worldid, islandid]
+  col = map_dof2idof_in[worldid, efc_J_colind_in[worldid, 0, adr]] - island_idofadr_in[worldid, islandid]
+  slot_efc_J_out[slot, row, col] = efc_J_in[worldid, 0, adr]
+
+
+@wp.kernel
+def _medium_scatter(
+  # Data in:
+  island_idofadr_in: wp.array2d[int],
+  island_nv_in: wp.array2d[int],
+  island_nefc_in: wp.array2d[int],
+  island_iefcadr_in: wp.array2d[int],
+  map_idof2dof_in: wp.array2d[int],
+  map_iefc2efc_in: wp.array2d[int],
+  # In:
+  nslot: int,
+  slot_island_in: wp.array[int],
+  slot_qacc_in: wp.array2d[float],
+  slot_qfrc_constraint_in: wp.array2d[float],
+  slot_efc_force_in: wp.array2d[float],
+  slot_efc_state_in: wp.array2d[int],
+  slot_niter_in: wp.array[int],
+  slot_overflow_in: wp.array[int],
+  # Data out:
+  qacc_out: wp.array2d[float],
+  qfrc_constraint_out: wp.array2d[float],
+  efc_force_out: wp.array2d[float],
+  efc_state_out: wp.array2d[int],
+  overflow_out: wp.array[int],
+  # Out:
+  niter_out: wp.array[int],
+):
+  """Copy each slot's solution to its island's DOFs and rows; fold iterations and overflow."""
+  slot, i = wp.tid()
+  islandid = slot_island_in[slot]
+  if islandid < 0:
+    return
+  worldid = slot // nslot
+  if i < island_nv_in[worldid, islandid]:
+    dofi = map_idof2dof_in[worldid, island_idofadr_in[worldid, islandid] + i]
+    qacc_out[worldid, dofi] = slot_qacc_in[slot, i]
+    qfrc_constraint_out[worldid, dofi] = slot_qfrc_constraint_in[slot, i]
+  if i < island_nefc_in[worldid, islandid]:
+    efcid = map_iefc2efc_in[worldid, island_iefcadr_in[worldid, islandid] + i]
+    efc_force_out[worldid, efcid] = slot_efc_force_in[slot, i]
+    efc_state_out[worldid, efcid] = slot_efc_state_in[slot, i]
+  if i == 0:
+    wp.atomic_max(niter_out, worldid, slot_niter_in[slot])
+    wp.atomic_or(overflow_out, worldid, slot_overflow_in[slot])
+
+
+def _solve_medium_islands(m: types.Model, d: types.Data, niter: wp.array):
+  """Solve medium islands with the dense Newton solver, one world per island slot."""
+  nslot = _medium_nslot(m)
+  if nslot == 0:
+    return
+  N = _MEDIUM_ISLAND_NV
+  R = _MEDIUM_ISLAND_NEFC
+  ns = d.nworld * nslot
+
+  slot_island = wp.empty(ns, dtype=int)
+  island_slot = wp.empty((d.nworld, m.ntree), dtype=int)
+  any_medium = wp.zeros(1, dtype=int)
+  wp.launch(
+    _medium_island_slots,
+    dim=d.nworld,
+    inputs=[m.opt.cone, d.nisland, d.island_nv, d.island_nefc, nslot],
+    outputs=[slot_island, island_slot, any_medium],
+  )
+  qacc_warmstart = wp.empty((ns, N), dtype=float)
+  qfrc_smooth = wp.empty((ns, N), dtype=float)
+  qacc_smooth = wp.empty((ns, N), dtype=float)
+  nefc = wp.empty(ns, dtype=int)
+  ne = wp.empty(ns, dtype=int)
+  nf = wp.empty(ns, dtype=int)
+  meaninertia = wp.empty(ns, dtype=float)
+  tolerance = wp.empty(ns, dtype=float)
+  ls_tolerance = wp.empty(ns, dtype=float)
+  efc_type = wp.empty((ns, R), dtype=int)
+  efc_id = wp.empty((ns, R), dtype=int)
+  efc_D = wp.empty((ns, R), dtype=float)
+  efc_aref = wp.empty((ns, R), dtype=float)
+  efc_frictionloss = wp.empty((ns, R), dtype=float)
+  M = wp.empty((ns, N, N), dtype=float)
+  efc_J = wp.empty((ns, R, N), dtype=float)
+  gc = m.opt.graph_conditional and wp.get_device().is_cuda
+  opt = dataclasses.replace(m.opt, graph_conditional=gc, tolerance=tolerance, ls_tolerance=ls_tolerance)
+  stat = dataclasses.replace(m.stat, meaninertia=meaninertia)
+  m_slot = dataclasses.replace(m, opt=opt, stat=stat, nv=N, nv_pad=N, is_sparse=False)
+  efc = dataclasses.replace(
+    d.efc,
+    type=efc_type,
+    id=efc_id,
+    J=efc_J,
+    D=efc_D,
+    aref=efc_aref,
+    frictionloss=efc_frictionloss,
+    state=wp.zeros((ns, R), dtype=int),
+    force=wp.zeros((ns, R), dtype=float),
+    Ma=wp.zeros((ns, N), dtype=float),
+  )
+  d_slot = dataclasses.replace(
+    d,
+    nworld=ns,
+    njmax=R,
+    M=M,
+    nefc=nefc,
+    ne=ne,
+    nf=nf,
+    qacc_warmstart=qacc_warmstart,
+    qfrc_smooth=qfrc_smooth,
+    qacc_smooth=qacc_smooth,
+    qacc=wp.zeros((ns, N), dtype=float),
+    qfrc_constraint=wp.zeros((ns, N), dtype=float),
+    solver_niter=wp.zeros(ns, dtype=int),
+    overflow=wp.zeros(ns, dtype=int),
+    efc=efc,
+  )
+  ctx_slot = _create_solver_context(m_slot, d_slot)
+  nsolving = wp.empty(1, dtype=int)
+
+  def solve_slots():
+    wp.launch(
+      _medium_slot_dofs,
+      dim=(ns, N),
+      inputs=[
+        m.opt.tolerance,
+        m.opt.ls_tolerance,
+        m.M_elemid,
+        d.qacc_warmstart,
+        d.M,
+        d.qfrc_smooth,
+        d.qacc_smooth,
+        d.island_idofadr,
+        d.island_nv,
+        d.island_nefc,
+        d.island_ne,
+        d.island_nf,
+        d.map_idof2dof,
+        nslot,
+        slot_island,
+      ],
+      outputs=[qacc_warmstart, qfrc_smooth, qacc_smooth, nefc, ne, nf, meaninertia, tolerance, ls_tolerance],
+    )
+    wp.launch(
+      _medium_slot_rows,
+      dim=(ns, R),
+      inputs=[
+        d.efc.type,
+        d.efc.id,
+        d.efc.D,
+        d.efc.aref,
+        d.efc.frictionloss,
+        d.island_iefcadr,
+        d.map_iefc2efc,
+        nslot,
+        slot_island,
+        nefc,
+      ],
+      outputs=[efc_type, efc_id, efc_D, efc_aref, efc_frictionloss],
+    )
+    wp.launch(_medium_init_M_J, dim=(ns, R, N), inputs=[nefc], outputs=[M, efc_J])
+    wp.launch(
+      _medium_gather_M,
+      dim=(d.nworld, m.M_colind.shape[0]),
+      inputs=[m.M_colind, m.M_hinit_i, d.M, d.dof_island, d.island_idofadr, d.map_dof2idof, island_slot],
+      outputs=[M],
+    )
+    # medium island rows have at most N nonzeros
+    wp.launch(
+      _medium_gather_J,
+      dim=(d.nworld, d.njmax, N),
+      inputs=[
+        d.nefc,
+        d.efc.J_rownnz,
+        d.efc.J_rowadr,
+        d.efc.J_colind,
+        d.efc.J,
+        d.efc.island,
+        d.island_idofadr,
+        d.island_iefcadr,
+        d.map_dof2idof,
+        d.map_efc2iefc,
+        island_slot,
+      ],
+      outputs=[efc_J],
+    )
+
+    _solve(m_slot, d_slot, ctx_slot, compact=True, nsolving=nsolving)
+
+    wp.launch(
+      _medium_scatter,
+      dim=(ns, max(N, R)),
+      inputs=[
+        d.island_idofadr,
+        d.island_nv,
+        d.island_nefc,
+        d.island_iefcadr,
+        d.map_idof2dof,
+        d.map_iefc2efc,
+        nslot,
+        slot_island,
+        d_slot.qacc,
+        d_slot.qfrc_constraint,
+        d_slot.efc.force,
+        d_slot.efc.state,
+        d_slot.solver_niter,
+        d_slot.overflow,
+      ],
+      outputs=[d.qacc, d.qfrc_constraint, d.efc.force, d.efc.state, d.overflow, niter],
+    )
+
+  # the slots run only if some world has a medium island
+  if m.opt.graph_conditional:
+    wp.capture_if(any_medium, on_true=solve_slots)
+  else:
+    solve_slots()
+
+
 @wp.func
 def _island_ntile(cone: int, ndof: int, nrow: int) -> int:
-  """Tiles per side of a large island's block in the pool; small islands take none."""
+  """Tiles per side of a large island's block in the pool; small and medium islands take none."""
   TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
-  return wp.where(_is_small_island(cone, ndof, nrow), 0, (ndof + TILE - 1) // TILE)
+  fast = _is_small_island(cone, ndof, nrow) or _is_medium_island(cone, ndof, nrow)
+  return wp.where(fast, 0, (ndof + TILE - 1) // TILE)
 
 
 @cache_kernel
@@ -4672,6 +5158,7 @@ def _island_pool_layout(ntree: int):
     island_tilebase_out: wp.array2d[int],
     island_ntile_out: wp.array2d[int],
     island_vbase_out: wp.array2d[int],
+    island_large_out: wp.array[int],
   ):
     """Per large island: tiles per side, first pool tile and first aligned row."""
     worldid = wp.tid()
@@ -4682,6 +5169,8 @@ def _island_pool_layout(ntree: int):
     wp.tile_store(island_ntile_out[worldid], ntile)
     wp.tile_store(island_tilebase_out[worldid], wp.tile_scan_exclusive(wp.tile_map(wp.mul, ntile, ntile)))
     wp.tile_store(island_vbase_out[worldid], wp.tile_scan_exclusive(ntile) * wp.static(types.TILE_SIZE_JTDAJ_DENSE))
+    if wp.tile_reduce(wp.max, ntile)[0] > 0:
+      island_large_out[0] = 1
 
   return kernel
 
@@ -4911,13 +5400,14 @@ def _island_h_order(m: types.Model, d: types.Data, ctx: SolverContext):
   ctx.island_ntile = wp.empty((d.nworld, m.ntree), dtype=int)
   ctx.island_vbase = wp.empty((d.nworld, m.ntree), dtype=int)
   ctx.island_sums = wp.empty((d.nworld, m.ntree), dtype=wp.vec2)
+  ctx.island_large = wp.zeros(1, dtype=int)
   ctx.pgrad = wp.zeros((d.nworld, nrow), dtype=float)
   ctx.psearch = wp.zeros((d.nworld, nrow), dtype=float)
   wp.launch_tiled(
     _island_pool_layout(m.ntree),
     dim=d.nworld,
     inputs=[m.opt.cone, d.island_nv, d.island_nefc],
-    outputs=[ctx.island_tilebase, ctx.island_ntile, ctx.island_vbase],
+    outputs=[ctx.island_tilebase, ctx.island_ntile, ctx.island_vbase, ctx.island_large],
     block_dim=m.block_dim.island_scan_sizes,
   )
   wp.launch(
@@ -4962,43 +5452,45 @@ def _island_pool_factorize_solve(
 
 
 def _solve_small_islands(m: types.Model, d: types.Data) -> wp.array:
-  """Solve small islands to convergence; returns their iteration count per world."""
+  """Solve small and medium islands to convergence; returns their iteration count per world."""
   niter = wp.zeros(d.nworld, dtype=int)
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
+  inputs = [
+    m.opt.tolerance,
+    m.opt.ls_tolerance,
+    m.opt.cone,
+    m.opt.iterations,
+    m.M_elemid,
+    d.nisland,
+    d.qacc_warmstart,
+    d.M,
+    d.qfrc_smooth,
+    d.qacc_smooth,
+    d.efc.J_rownnz,
+    d.efc.J_rowadr,
+    d.efc.J_colind,
+    d.efc.J,
+    d.efc.D,
+    d.efc.aref,
+    d.efc.frictionloss,
+    d.island_idofadr,
+    d.island_nv,
+    d.island_nefc,
+    d.island_ne,
+    d.island_nf,
+    d.island_iefcadr,
+    d.map_dof2idof,
+    d.map_idof2dof,
+    d.map_iefc2efc,
+  ]
   wp.launch_tiled(
     _small_island_solve(warmstart, m.opt.ls_iterations, int(m.opt.warn_overflow)),
     dim=(d.nworld, m.ntree),
-    inputs=[
-      m.opt.tolerance,
-      m.opt.ls_tolerance,
-      m.opt.cone,
-      m.opt.iterations,
-      m.M_elemid,
-      d.nisland,
-      d.qacc_warmstart,
-      d.M,
-      d.qfrc_smooth,
-      d.qacc_smooth,
-      d.efc.J_rownnz,
-      d.efc.J_rowadr,
-      d.efc.J_colind,
-      d.efc.J,
-      d.efc.D,
-      d.efc.aref,
-      d.efc.frictionloss,
-      d.island_idofadr,
-      d.island_nv,
-      d.island_nefc,
-      d.island_ne,
-      d.island_nf,
-      d.island_iefcadr,
-      d.map_dof2idof,
-      d.map_idof2dof,
-      d.map_iefc2efc,
-    ],
-    outputs=[d.qacc, d.overflow, niter],
+    inputs=inputs,
+    outputs=[d.qacc, d.qfrc_constraint, d.efc.force, d.efc.state, d.overflow, niter],
     block_dim=_SMALL_LANES,
   )
+  _solve_medium_islands(m, d, niter)
   return niter
 
 
@@ -5053,8 +5545,11 @@ def solve(m: types.Model, d: types.Data):
     island.compute_island_mapping(m, d)
 
 
-def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
-  """Finds forces that satisfy constraints."""
+def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, nsolving: wp.array | None = None):
+  """Finds forces that satisfy constraints.
+
+  nsolving (shape (1,), int) may be preallocated so the solve can run in a conditional graph body.
+  """
   if m.opt.integrator == types.IntegratorType.DISCRETE:
     qfrc_smooth_eff = wp.zeros((d.nworld, m.nv_pad), dtype=float, device=d.qacc.device)
     wp.launch(
@@ -5065,9 +5560,11 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     )
     d = dataclasses.replace(d, qfrc_smooth=qfrc_smooth_eff)
 
-  small_niter = None
-  if not compact and _use_island_solve(m):
+  island_solve = not compact and _use_island_solve(m)
+  if island_solve:
     _island_h_order(m, d, ctx)
+    # the world solve below may be skipped
+    d.solver_niter.zero_()
     small_niter = _solve_small_islands(m, d)
 
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
@@ -5085,55 +5582,67 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
       outputs=[d.qacc],
     )
 
-  #  context
-  init_context(m, d, ctx, grad=False, compact=compact)
-  _update_gradient(m, d, ctx, compact=compact)
+  # allocated outside the world solve, which may be a conditional graph body
+  if nsolving is None:
+    nsolving = wp.empty(1, dtype=int)
 
-  if _use_incremental(m):
-    # A new solve computes a new search direction: invalidate the mv/jv reuse
-    # left over from the previous solve.
-    ctx.search_unchanged.zero_()
+  def world_solve():
+    #  context
+    init_context(m, d, ctx, grad=False, compact=compact)
+    _update_gradient(m, d, ctx, compact=compact)
 
-  nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
+    if _use_incremental(m):
+      # A new solve computes a new search direction: invalidate the mv/jv reuse
+      # left over from the previous solve.
+      ctx.search_unchanged.zero_()
 
-  # CG search = -Mgrad
-  if m.opt.solver == types.SolverType.CG:
-    wp.launch_tiled(
-      _solve_init_search_cg_tiled,
-      dim=d.nworld,
-      inputs=[m.nv, m.opt.tolerance, m.stat.meaninertia, ctx.grad, ctx.Mgrad],
-      outputs=[ctx.search, ctx.search_dot, ctx.prev_grad, ctx.prev_Mgrad, ctx.done, nsolving],
-      block_dim=m.block_dim.solve_init_search_cg,
-    )
-  if m.opt.iterations != 0 and m.opt.graph_conditional:
-    # Note: the iteration kernel (indicated by while_body) is repeatedly launched
-    # as long as condition_iteration is not zero.
-    # condition_iteration is a warp array of size 1 and type int, it counts the number
-    # of worlds that are not converged, it becomes 0 when all worlds are converged.
-    # When the number of iterations reaches m.opt.iterations, solver_niter
-    # becomes zero and all worlds are marked as converged to avoid an infinite loop.
-    # note: we only launch the iteration kernel if everything is not done
-    wp.capture_while(nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving, compact=compact)
+    nsolving.fill_(d.nworld)
+
+    # CG search = -Mgrad
+    if m.opt.solver == types.SolverType.CG:
+      wp.launch_tiled(
+        _solve_init_search_cg_tiled,
+        dim=d.nworld,
+        inputs=[m.nv, m.opt.tolerance, m.stat.meaninertia, ctx.grad, ctx.Mgrad],
+        outputs=[ctx.search, ctx.search_dot, ctx.prev_grad, ctx.prev_Mgrad, ctx.done, nsolving],
+        block_dim=m.block_dim.solve_init_search_cg,
+      )
+    if m.opt.iterations != 0 and m.opt.graph_conditional:
+      # Note: the iteration kernel (indicated by while_body) is repeatedly launched
+      # as long as condition_iteration is not zero.
+      # condition_iteration is a warp array of size 1 and type int, it counts the number
+      # of worlds that are not converged, it becomes 0 when all worlds are converged.
+      # When the number of iterations reaches m.opt.iterations, solver_niter
+      # becomes zero and all worlds are marked as converged to avoid an infinite loop.
+      # note: we only launch the iteration kernel if everything is not done
+      wp.capture_while(nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving, compact=compact)
+    else:
+      # This branch is mostly for when JAX is used as it is currently not compatible
+      # with CUDA graph conditional.
+      # It should be removed when JAX becomes compatible.
+      for _ in range(m.opt.iterations):
+        _solver_iteration(m, d, ctx, nsolving, compact=compact)
+
+    # Recover qfrc_constraint (the compacted buffer when run under solve_compact):
+    # the fast path leaves it stale, and the per-iteration zeroing wiped it for
+    # worlds that converged early.
+    if _use_incremental(m):
+      wp.launch(
+        _qfrc_constraint_from_grad,
+        dim=(d.nworld, m.nv),
+        inputs=[d.qfrc_smooth, d.efc.Ma, ctx.grad, ctx.grad_scale],
+        outputs=[d.qfrc_constraint],
+      )
+
+  if island_solve and m.opt.graph_conditional:
+    # islands that are all small or medium are solved already: only M qacc is left
+    wp.capture_if(ctx.island_large, on_true=world_solve, on_false=lambda: support.mul_m(m, d, d.efc.Ma, d.qacc))
   else:
-    # This branch is mostly for when JAX is used as it is currently not compatible
-    # with CUDA graph conditional.
-    # It should be removed when JAX becomes compatible.
-    for _ in range(m.opt.iterations):
-      _solver_iteration(m, d, ctx, nsolving, compact=compact)
+    world_solve()
 
-  if small_niter is not None:
+  if island_solve:
     wp.launch(_max_niter, dim=d.nworld, inputs=[small_niter], outputs=[d.solver_niter])
 
-  # Recover qfrc_constraint (the compacted buffer when run under solve_compact):
-  # the fast path leaves it stale, and the per-iteration zeroing wiped it for
-  # worlds that converged early.
-  if _use_incremental(m):
-    wp.launch(
-      _qfrc_constraint_from_grad,
-      dim=(d.nworld, m.nv),
-      inputs=[d.qfrc_smooth, d.efc.Ma, ctx.grad, ctx.grad_scale],
-      outputs=[d.qfrc_constraint],
-    )
   if m.opt.integrator == types.IntegratorType.DISCRETE and (m.opt.enableflags & types.EnableBit.SLEEP):
     wp.launch(
       derivative._zero_sleeping_dofs,
