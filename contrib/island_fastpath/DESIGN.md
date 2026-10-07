@@ -342,3 +342,21 @@ sparse per island), as in MuJoCo's `mj_island` + `mj_solNewton_island`.
 - Found on the way: put_data loaded a sparse J whose JTDAJ block rows had different supports (fixed:
   rows of a block now share one support); a Warp kernel-cache bug (functions passed to `tile_map` in
   `module="unique"` kernels are hashed without their callees, so nested changes leave stale code).
+
+## Phase 6: a per-island Newton solver (`island_solver.py`, pyramidal cones)
+
+Replaces the world solve for island_solve models with pyramidal cones; no size or row limits and
+no world-level fallback. Each step, rows go to island order (row data copied, J column indices
+remapped to tile-aligned DOF rows, J values stay in place), DOF vectors to tile-aligned island rows
+(also the Cholesky right-hand side), and each island's M into a tile-pool block. Per iteration:
+`_rows` (constraint force/state, J'force by atomics, incremental H where a row's quadratic state
+flips), `_factor` (gradient; blocked Cholesky per island, solve-only if H is unchanged), and
+`_linesearch` (per-island convergence test, linesearch and update; one block per island). The first
+H is assembled by the grouped `_JTDACJ_sparse`. Results are scattered back; `efc.force/state` are
+written in constraint order directly.
+
+Step times (three_humanoids and a variant with the humanoids 120 degrees apart, which never touch)
+are flat through collisions, roughly at main's level and ~10% behind the phase-4b pool path. Most
+of the cost is in the first three Newton iterations, when every island is active (first-iteration
+factorization 261 us vs ~92 us for the dense single-tile path on the same 24576 27-DOF systems);
+later iterations cost little because converged islands drop out.

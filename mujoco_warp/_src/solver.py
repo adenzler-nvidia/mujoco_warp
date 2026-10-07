@@ -5524,6 +5524,13 @@ def _use_island_solve(m: types.Model) -> bool:
   return True
 
 
+def _island_solver():
+  # imported lazily: island_solver builds on this module
+  from mujoco_warp._src import island_solver
+
+  return island_solver
+
+
 @event_scope
 def solve(m: types.Model, d: types.Data):
   if m.opt.enableflags & types.EnableBit.SLEEP:
@@ -5537,6 +5544,8 @@ def solve(m: types.Model, d: types.Data):
   if d.njmax == 0 or m.nv == 0:
     wp.copy(d.qacc, d.qacc_smooth)
     d.solver_niter.fill_(0)
+  elif _use_island_solve(m) and _island_solver().supported(m):
+    _island_solver().solve(m, d)
   else:
     ctx = _create_solver_context(m, d, island=_use_island_solve(m))
     _solve(m, d, ctx)
