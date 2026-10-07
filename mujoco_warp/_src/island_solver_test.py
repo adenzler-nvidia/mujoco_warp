@@ -193,6 +193,23 @@ class IslandSolverTest(absltest.TestCase):
           np.testing.assert_allclose(entry, Hi[a, b], rtol=1e-4, atol=1e-4, err_msg=f"island {i} ({a}, {b})")
     self.assertIn(3, ntiles)
 
+  def test_gradient_scale(self):
+    """The stored gradient times grad_scale is the gradient at the final point.
+
+    Islands whose rows keep their states keep their search direction and gradient (scaled), as in
+    the world solver's stable-state fast path; the welded pair has only equality rows.
+    """
+    _, _, m, d = _fixture()
+    ctx = island_solver.solve(m, d)
+    nisland = d.nisland.numpy()[0]
+    grad_true = ctx.Ma.numpy()[0] - ctx.qfrc_smooth.numpy()[0] - ctx.frc.numpy()[0]
+    grad, scale = ctx.grad.numpy()[0, :, 0], ctx.grad_scale.numpy()[0, :nisland]
+    vbase, nv = ctx.vbase.numpy()[0, :nisland], d.island_nv.numpy()[0, :nisland]
+    for i in range(nisland):
+      rows = slice(vbase[i], vbase[i] + nv[i])
+      np.testing.assert_allclose(scale[i] * grad[rows], grad_true[rows], rtol=1e-3, atol=1e-4, err_msg=f"island {i}")
+    self.assertTrue(np.any(np.abs(scale - 1.0) > 1e-3))
+
   def test_islands_converge_independently(self):
     """Islands stop at their own iteration; the world reports the slowest."""
     _, _, m, d = _fixture()

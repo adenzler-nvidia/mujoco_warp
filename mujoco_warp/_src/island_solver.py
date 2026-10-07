@@ -97,6 +97,11 @@ class IslandContext:
   newton_decrement: wp.array2d[float]
   # whether an island's H changed since its last factorization
   changed: wp.array2d[bool]
+  # whether a row of the island changed state at the last evaluation; without a change the quadratic
+  # piece is the same, so the search direction is kept and grad = grad_scale * (stored grad), as in
+  # the world solver's stable-state fast path
+  state_changed: wp.array2d[bool]
+  grad_scale: wp.array2d[float]
   # per size class (one tile per side, two, more): 1 if any island has it
   classes: wp.array[int]
   nsolving: wp.array[int]
@@ -122,6 +127,12 @@ def _pool_rc(tilebase: int, ntile: int, la: int, lb: int) -> wp.vec2i:
   i = wp.min(la, lb)
   j = wp.max(la, lb)
   return wp.vec2i(_TILE * (tilebase + (i // _TILE) * ntile + j // _TILE) + i % _TILE, j % _TILE)
+
+
+@wp.func
+def _stable(niter: int, state_changed: bool) -> bool:
+  """No row changed state since the last step: the search direction is kept."""
+  return niter > 0 and not state_changed
 
 
 @wp.func
@@ -340,6 +351,7 @@ def _rows(initial: bool):
     frc_out: wp.array2d[float],
     H_out: wp.array3d[float],
     changed_out: wp.array2d[bool],
+    state_changed_out: wp.array2d[bool],
   ):
     """Constraint force and state of a row; adds J'force to frc and updates H where it flips.
 
@@ -370,6 +382,9 @@ def _rows(initial: bool):
     )
     force = res[0]
     state = int(res[1])
+    if wp.static(not INITIAL):
+      if efc_state_out[worldid, row] != state:
+        state_changed_out[worldid, islandid] = True
     efc_force_out[worldid, row] = force
     efc_state_out[worldid, row] = state
     quad = state == types.ConstraintState.QUADRATIC.value
@@ -410,6 +425,8 @@ def _grad(
   # In:
   row2dof_in: wp.array2d[int],
   done_in: wp.array2d[bool],
+  niter_in: wp.array2d[int],
+  state_changed_in: wp.array2d[bool],
   Ma_in: wp.array2d[float],
   iqfrc_smooth_in: wp.array2d[float],
   frc_in: wp.array2d[float],
@@ -422,7 +439,8 @@ def _grad(
   if dofid < 0:
     grad_out[worldid, row] = 0.0
     return
-  if done_in[worldid, dof_island_in[worldid, dofid]]:
+  islandid = dof_island_in[worldid, dofid]
+  if done_in[worldid, islandid] or _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
     return
   grad_out[worldid, row] = Ma_in[worldid, row] - iqfrc_smooth_in[worldid, row] - frc_in[worldid, row]
 
@@ -442,6 +460,7 @@ def _factor(max_size: int):
     vbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
     niter_in: wp.array2d[int],
+    state_changed_in: wp.array2d[bool],
     grad_in: wp.array3d[float],
     H_in: wp.array3d[float],
     # Out:
@@ -450,6 +469,7 @@ def _factor(max_size: int):
     search_out: wp.array3d[float],
     search_dot_out: wp.array2d[float],
     newton_decrement_out: wp.array2d[float],
+    grad_scale_out: wp.array2d[float],
   ):
     """Newton search direction of an island over two tiles per side (blocked Cholesky)."""
     worldid, islandid, lane = wp.tid()
@@ -459,6 +479,8 @@ def _factor(max_size: int):
       return
     ntile = ntile_in[worldid, islandid]
     if ntile <= 2:
+      return
+    if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
       return
     vbase = vbase_in[worldid, islandid]
     tilebase = tilebase_in[worldid, islandid]
@@ -471,6 +493,7 @@ def _factor(max_size: int):
       changed_out[worldid, islandid] = False
       search_dot_out[worldid, islandid] = sums[0]
       newton_decrement_out[worldid, islandid] = sums[1]
+      grad_scale_out[worldid, islandid] = 1.0
 
   return kernel
 
@@ -488,12 +511,15 @@ def _dense_factor(ntile: int):
     ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
+    niter_in: wp.array2d[int],
+    state_changed_in: wp.array2d[bool],
     grad_in: wp.array2d[float],
     H_in: wp.array3d[float],
     # Out:
     search_out: wp.array2d[float],
     search_dot_out: wp.array2d[float],
     newton_decrement_out: wp.array2d[float],
+    grad_scale_out: wp.array2d[float],
   ):
     """Newton search direction of an island of ntile tiles per side, factored as one tile.
 
@@ -506,6 +532,8 @@ def _dense_factor(ntile: int):
     if done_in[worldid, islandid]:
       return
     if ntile_in[worldid, islandid] != wp.static(ntile):
+      return
+    if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
       return
     vbase = vbase_in[worldid, islandid]
     row0 = _TILE * tilebase_in[worldid, islandid]
@@ -523,6 +551,7 @@ def _dense_factor(ntile: int):
     if lane == 0:
       search_dot_out[worldid, islandid] = sums[0]
       newton_decrement_out[worldid, islandid] = sums[1]
+      grad_scale_out[worldid, islandid] = 1.0
 
   return kernel
 
@@ -561,6 +590,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     grad_in: wp.array2d[float],
     search_dot_in: wp.array2d[float],
     newton_decrement_in: wp.array2d[float],
+    state_changed_in: wp.array2d[bool],
     # Data out:
     solver_niter_out: wp.array[int],
     overflow_out: wp.array[int],
@@ -576,6 +606,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     row_jaref_out: wp.array2d[float],
     row_jv_out: wp.array2d[float],
     nsolving_out: wp.array[int],
+    grad_scale_out: wp.array2d[float],
   ):
     """Convergence test, linesearch and update of one island (see _linesearch_iterative_kernel)."""
     worldid, islandid, lane = wp.tid()
@@ -595,11 +626,13 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     ls_tolerance = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
     niter = niter_out[worldid, islandid]
 
-    # --- termination (see _solve_done) ---
+    # --- termination (see _solve_done); the gradient is grad_scale * the stored one ---
+    stable = _stable(niter, state_changed_in[worldid, islandid])
+    grad_scale = grad_scale_out[worldid, islandid]
     grad_dot = float(0.0)
     for la in range(lane, ndof, nthread):
       grad_dot += grad_in[worldid, vbase + la] * grad_in[worldid, vbase + la]
-    grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0]
+    grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0] * grad_scale * grad_scale
     converged = False
     if niter > 0:
       improvement = improvement_out[worldid, islandid]
@@ -607,7 +640,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
         (alpha_out[worldid, islandid] == 0.0)
         or (improvement > 0.0 and improvement / scale < tolerance)
         or (wp.sqrt(grad_dot) / scale < tolerance)
-        or (0.5 * newton_decrement_in[worldid, islandid] / scale < tolerance)
+        or (0.5 * newton_decrement_in[worldid, islandid] * grad_scale * grad_scale / scale < tolerance)
       )
     if converged or niter >= opt_iterations:
       if lane == 0:
@@ -628,20 +661,28 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     local_dof = wp.vec2(0.0)
     for la in range(lane, ndof, nthread):
       row = vbase + la
-      mv = _block_matvec(iM_in[worldid], tilebase, ntile, vbase, ndof, search, la)
-      mv_out[worldid, row] = mv
+      # an unchanged search direction keeps its M search and J search
+      mv = float(0.0)
+      if stable:
+        mv = mv_out[worldid, row]
+      else:
+        mv = _block_matvec(iM_in[worldid], tilebase, ntile, vbase, ndof, search, la)
+        mv_out[worldid, row] = mv
       s = search[row]
       local_dof += wp.vec2(s * (Ma_out[worldid, row] - iqfrc_smooth_in[worldid, row]), s * mv)
     local_gauss = wp.vec2(0.0)
     local_p0 = wp.vec3(0.0)
     for r in range(lane, nrow, nthread):
       row = rowadr0 + r
-      rowadr = efc_J_rowadr_in[worldid, row]
       jv = float(0.0)
-      for k in range(efc_J_rownnz_in[worldid, row]):
-        adr = rowadr + k
-        jv += efc_J_in[worldid, 0, adr] * search[dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
-      row_jv_out[worldid, row] = jv
+      if stable:
+        jv = row_jv_out[worldid, row]
+      else:
+        rowadr = efc_J_rowadr_in[worldid, row]
+        for k in range(efc_J_rownnz_in[worldid, row]):
+          adr = rowadr + k
+          jv += efc_J_in[worldid, 0, adr] * search[dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
+        row_jv_out[worldid, row] = jv
       category = _row_category(efc_type_in[worldid, row])
       D = efc_D_in[worldid, row]
       jaref = row_jaref_out[worldid, row]
@@ -804,6 +845,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     if lane == 0:
       niter_out[worldid, islandid] = niter + 1
       alpha_out[worldid, islandid] = alpha
+      grad_scale_out[worldid, islandid] = grad_scale - alpha
       improvement_out[worldid, islandid] = improvement
       wp.atomic_add(nsolving_out, 0, 1)
 
@@ -876,6 +918,8 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     search_dot=wp.empty((nworld, ntree), dtype=float),
     newton_decrement=wp.empty((nworld, ntree), dtype=float),
     changed=wp.zeros((nworld, ntree), dtype=bool),
+    state_changed=wp.zeros((nworld, ntree), dtype=bool),
+    grad_scale=wp.ones((nworld, ntree), dtype=float),
     classes=wp.zeros(3, dtype=int),
     nsolving=wp.zeros(1, dtype=int),
   )
@@ -902,7 +946,7 @@ def _launch_rows(m: types.Model, d: types.Data, ctx: IslandContext, initial: boo
       ctx.row_jaref,
       ctx.dof2row,
     ],
-    outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.frc, ctx.H, ctx.changed],
+    outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.frc, ctx.H, ctx.changed, ctx.state_changed],
   )
 
 
@@ -913,7 +957,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
   wp.launch(
     _grad,
     dim=(d.nworld, nrow),
-    inputs=[d.dof_island, ctx.row2dof, ctx.done, ctx.Ma, ctx.qfrc_smooth, ctx.frc],
+    inputs=[d.dof_island, ctx.row2dof, ctx.done, ctx.niter, ctx.state_changed, ctx.Ma, ctx.qfrc_smooth, ctx.frc],
     outputs=[ctx.grad.reshape((d.nworld, nrow))],
   )
 
@@ -921,8 +965,18 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
     wp.launch_tiled(
       _dense_factor(ntile),
       dim=(d.nworld, m.ntree),
-      inputs=[d.nisland, ctx.tilebase, ctx.ntile, ctx.vbase, ctx.done, ctx.grad.reshape((d.nworld, nrow)), ctx.H],
-      outputs=[ctx.search.reshape((d.nworld, nrow)), ctx.search_dot, ctx.newton_decrement],
+      inputs=[
+        d.nisland,
+        ctx.tilebase,
+        ctx.ntile,
+        ctx.vbase,
+        ctx.done,
+        ctx.niter,
+        ctx.state_changed,
+        ctx.grad.reshape((d.nworld, nrow)),
+        ctx.H,
+      ],
+      outputs=[ctx.search.reshape((d.nworld, nrow)), ctx.search_dot, ctx.newton_decrement, ctx.grad_scale],
       block_dim=_ISLAND_THREADS,
     )
 
@@ -930,8 +984,8 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
     wp.launch_tiled(
       _factor(-(-m.nv // _TILE) * _TILE),
       dim=(d.nworld, m.ntree),
-      inputs=[d.nisland, ctx.tilebase, ctx.ntile, ctx.vbase, ctx.done, ctx.niter, ctx.grad, ctx.H],
-      outputs=[ctx.changed, ctx.U, ctx.search, ctx.search_dot, ctx.newton_decrement],
+      inputs=[d.nisland, ctx.tilebase, ctx.ntile, ctx.vbase, ctx.done, ctx.niter, ctx.state_changed, ctx.grad, ctx.H],
+      outputs=[ctx.changed, ctx.U, ctx.search, ctx.search_dot, ctx.newton_decrement, ctx.grad_scale],
       block_dim=_ISLAND_THREADS,
     )
 
@@ -971,6 +1025,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
       ctx.grad.reshape((d.nworld, nrow)),
       ctx.search_dot,
       ctx.newton_decrement,
+      ctx.state_changed,
     ],
     outputs=[
       d.solver_niter,
@@ -986,10 +1041,12 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext):
       ctx.row_jaref,
       ctx.row_jv,
       ctx.nsolving,
+      ctx.grad_scale,
     ],
     block_dim=_LINESEARCH_THREADS,
   )
   # constraint evaluation at the updated point, for the next iteration
+  ctx.state_changed.zero_()
   _launch_rows(m, d, ctx, initial=False)
 
 
