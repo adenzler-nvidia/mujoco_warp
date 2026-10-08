@@ -205,22 +205,25 @@ class IslandSolverTest(absltest.TestCase):
     self.assertEqual(sorted(widths), [16, 32, 48])
 
   def test_solve(self):
-    """The island solve reaches MuJoCo's solution, with dense, mixed and sparse islands."""
-    for dense_nv in (64, 32, 0):
-      with self.subTest(dense_nv=dense_nv):
-        mjm, mjd, m, d = _fixture(dense_nv)
+    """The island solve reaches MuJoCo's solution, with dense, mixed and sparse islands.
+
+    Without merging, single boxes, the arm and the welded pair are one-tile groups (_solve_small).
+    """
+    for dense_nv, merge in ((64, True), (64, False), (32, True), (0, True)):
+      with self.subTest(dense_nv=dense_nv, merge=merge):
+        mjm, mjd, m, d = _fixture(dense_nv, merge)
         island_solver.solve(m, d)
         np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
         np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
 
   def test_hessian(self):
     """Each island's H block is M + J'DJ over its quadratic rows, after incremental updates."""
-    for dense_nv in (64, 0):
-      with self.subTest(dense_nv=dense_nv):
-        self._check_hessian(dense_nv)
+    for dense_nv, merge in ((64, True), (64, False), (0, True)):
+      with self.subTest(dense_nv=dense_nv, merge=merge):
+        self._check_hessian(dense_nv, merge)
 
-  def _check_hessian(self, dense_nv):
-    mjm, mjd, m, d = _fixture(dense_nv)
+  def _check_hessian(self, dense_nv, merge):
+    mjm, mjd, m, d = _fixture(dense_nv, merge)
     ctx = island_solver.solve(m, d)
     self.assertGreater(ctx.niter.numpy()[0].max(), 1)
 
