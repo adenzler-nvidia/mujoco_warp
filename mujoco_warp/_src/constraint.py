@@ -6677,11 +6677,12 @@ def make_constraint(m: types.Model, d: types.Data):
     wp.launch(island._reset_tree_nrow, dim=tree_nrow.shape, outputs=[tree_nrow])
     build(island.ROWS_DISCOVER)
     island.rows_finalize(m, d, island_parent)
-    wp.launch(
-      island._island_row_layout,
+    wp.launch_tiled(
+      island._island_row_layout(m.ntree),
       dim=d.nworld,
-      inputs=[m.ntree, d.nisland, d.tree_island, tree_nrow],
+      inputs=[d.tree_island, tree_nrow],
       outputs=[d.island_nefc, d.island_ne, d.island_nf, island_rowadr, island_cursor],
+      block_dim=types.BlockDim.island_scan_sizes,
     )
     slots = island.assign_slots(m, d, efc_nnz)
     # rows that overflow the Jacobian storage return before setting their rownnz: keep them empty

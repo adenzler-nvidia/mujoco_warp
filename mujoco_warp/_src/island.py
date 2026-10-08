@@ -1065,56 +1065,67 @@ def _ntile16(n: int) -> int:
   return (n + 15) // 16
 
 
-@wp.kernel
-def _island_groups(
-  # Model:
-  ntree: int,
-  # Data in:
-  nisland_in: wp.array[int],
-  island_idofadr_in: wp.array2d[int],
-  island_nv_in: wp.array2d[int],
-  island_nefc_in: wp.array2d[int],
-  island_iefcadr_in: wp.array2d[int],
-  # In:
-  merge: bool,
-  # Out:
-  ngroup_out: wp.array[int],
-  island_group_out: wp.array2d[int],
-  group_idofadr_out: wp.array2d[int],
-  group_nv_out: wp.array2d[int],
-  group_nefc_out: wp.array2d[int],
-  group_iefcadr_out: wp.array2d[int],
-):
-  """Pack consecutive islands into groups where that saves a 16-DOF tile (serial per world)."""
-  worldid = wp.tid()
-  g = int(-1)
-  gnv = int(0)
-  gnefc = int(0)
-  for i in range(nisland_in[worldid]):
-    n = island_nv_in[worldid, i]
-    if g >= 0 and merge and _ntile16(gnv + n) < _ntile16(gnv) + _ntile16(n):
-      gnv += n
-      gnefc += island_nefc_in[worldid, i]
-    else:
-      if g >= 0:
-        group_nv_out[worldid, g] = gnv
-        group_nefc_out[worldid, g] = gnefc
-      g += 1
-      gnv = n
-      gnefc = island_nefc_in[worldid, i]
-      group_idofadr_out[worldid, g] = island_idofadr_in[worldid, i]
-      group_iefcadr_out[worldid, g] = island_iefcadr_in[worldid, i]
-    island_group_out[worldid, i] = g
-  if g >= 0:
-    group_nv_out[worldid, g] = gnv
-    group_nefc_out[worldid, g] = gnefc
-  ngroup_out[worldid] = g + 1
-  # the tiled kernels read all ntree entries
-  for k in range(g + 1, ntree):
-    group_nv_out[worldid, k] = 0
-    group_nefc_out[worldid, k] = 0
-    group_idofadr_out[worldid, k] = 0
-    group_iefcadr_out[worldid, k] = 0
+@cache_kernel
+def _island_groups(ntree: int):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    nisland_in: wp.array[int],
+    island_idofadr_in: wp.array2d[int],
+    island_nv_in: wp.array2d[int],
+    island_nefc_in: wp.array2d[int],
+    island_iefcadr_in: wp.array2d[int],
+    # In:
+    merge: bool,
+    # Out:
+    ngroup_out: wp.array[int],
+    island_group_out: wp.array2d[int],
+    group_idofadr_out: wp.array2d[int],
+    group_nv_out: wp.array2d[int],
+    group_nefc_out: wp.array2d[int],
+    group_iefcadr_out: wp.array2d[int],
+  ):
+    """Pack consecutive islands into groups where that saves a 16-DOF tile.
+
+    Greedy, so serial per world: one lane, from the island sizes in shared memory.
+    """
+    worldid, lane = wp.tid()
+    idofadr = wp.tile_load(island_idofadr_in[worldid], shape=ntree, storage="shared")
+    nv = wp.tile_load(island_nv_in[worldid], shape=ntree, storage="shared")
+    nefc = wp.tile_load(island_nefc_in[worldid], shape=ntree, storage="shared")
+    iefcadr = wp.tile_load(island_iefcadr_in[worldid], shape=ntree, storage="shared")
+    if lane != 0:
+      return
+    g = int(-1)
+    gnv = int(0)
+    gnefc = int(0)
+    for i in range(nisland_in[worldid]):
+      n = nv[i]
+      if g >= 0 and merge and _ntile16(gnv + n) < _ntile16(gnv) + _ntile16(n):
+        gnv += n
+        gnefc += nefc[i]
+      else:
+        if g >= 0:
+          group_nv_out[worldid, g] = gnv
+          group_nefc_out[worldid, g] = gnefc
+        g += 1
+        gnv = n
+        gnefc = nefc[i]
+        group_idofadr_out[worldid, g] = idofadr[i]
+        group_iefcadr_out[worldid, g] = iefcadr[i]
+      island_group_out[worldid, i] = g
+    if g >= 0:
+      group_nv_out[worldid, g] = gnv
+      group_nefc_out[worldid, g] = gnefc
+    ngroup_out[worldid] = g + 1
+    # the tiled kernels read all ntree entries
+    for k in range(g + 1, ntree):
+      group_nv_out[worldid, k] = 0
+      group_nefc_out[worldid, k] = 0
+      group_idofadr_out[worldid, k] = 0
+      group_iefcadr_out[worldid, k] = 0
+
+  return kernel
 
 
 @cache_kernel
@@ -1252,11 +1263,12 @@ def assign_slots(m: types.Model, d: types.Data, efc_nnz: wp.array) -> SlotBuffer
   island_dofs(m, d)
   buf = slot_buffers(m, d)
   buf.island_group.fill_(-1)
-  wp.launch(
-    _island_groups,
+  wp.launch_tiled(
+    _island_groups(m.ntree),
     dim=d.nworld,
-    inputs=[m.ntree, d.nisland, d.island_idofadr, d.island_nv, d.island_nefc, d.island_iefcadr, MERGE],
+    inputs=[d.nisland, d.island_idofadr, d.island_nv, d.island_nefc, d.island_iefcadr, MERGE],
     outputs=[buf.ngroup, buf.island_group, buf.group_idofadr, buf.group_nv, buf.group_nefc, buf.group_iefcadr],
+    block_dim=types.BlockDim.island_scan_sizes,
   )
   wp.launch_tiled(
     _island_blocks(m.ntree),
@@ -1395,53 +1407,48 @@ def _reset_tree_nrow(
   tree_nrow_out[worldid, slot] = 0
 
 
-@wp.kernel
-def _island_row_layout(
-  # Model:
-  ntree: int,
-  # Data in:
-  nisland_in: wp.array[int],
-  tree_island_in: wp.array2d[int],
-  # In:
-  tree_nrow_in: wp.array2d[int],
-  # Data out:
-  island_nefc_out: wp.array2d[int],
-  island_ne_out: wp.array2d[int],
-  island_nf_out: wp.array2d[int],
-  # Out:
-  island_rowadr_out: wp.array2d[int],
-  island_cursor_out: wp.array2d[int],
-):
-  """Row addresses per island and class, in island order (serial per world, ntree is small)."""
-  worldid = wp.tid()
-  nisland = nisland_in[worldid]
-  for slot in range(ntree * ROW_CLASSES):
-    island_rowadr_out[worldid, slot] = 0
-    island_cursor_out[worldid, slot] = 0
-  for i in range(ntree):
-    island_nefc_out[worldid, i] = 0
-    island_ne_out[worldid, i] = 0
-    island_nf_out[worldid, i] = 0
-  # rows per island and class
-  for tree in range(ntree):
-    islandid = tree_island_in[worldid, tree]
-    if islandid >= 0:
-      for c in range(ROW_CLASSES):
-        island_rowadr_out[worldid, islandid * ROW_CLASSES + c] += tree_nrow_in[worldid, tree * ROW_CLASSES + c]
-  # exclusive scan over (island, class)
-  adr = int(0)
-  for islandid in range(nisland):
-    start = adr
-    for c in range(ROW_CLASSES):
-      slot = islandid * ROW_CLASSES + c
-      n = island_rowadr_out[worldid, slot]
-      island_rowadr_out[worldid, slot] = adr
-      adr += n
-      if c == ROW_EQUALITY:
-        island_ne_out[worldid, islandid] = n
-      elif c == ROW_FRICTION:
-        island_nf_out[worldid, islandid] = n
-    island_nefc_out[worldid, islandid] = adr - start
+@cache_kernel
+def _island_row_layout(ntree: int):
+  NT = ntree * ROW_CLASSES
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    tree_island_in: wp.array2d[int],
+    # In:
+    tree_nrow_in: wp.array2d[int],
+    # Data out:
+    island_nefc_out: wp.array2d[int],
+    island_ne_out: wp.array2d[int],
+    island_nf_out: wp.array2d[int],
+    # Out:
+    island_rowadr_out: wp.array2d[int],
+    island_cursor_out: wp.array2d[int],
+  ):
+    """Row addresses per island and class, in island order (one block per world)."""
+    worldid, lane = wp.tid()
+    lanes = wp.block_dim()
+    # rows per island and class: every lane takes part in each scatter
+    counts = wp.tile_zeros(shape=NT, dtype=int, storage="shared")
+    for it in range((NT + lanes - 1) // lanes):
+      e = it * lanes + lane
+      valid = e < NT
+      ec = wp.where(valid, e, 0)
+      islandid = tree_island_in[worldid, ec // ROW_CLASSES]
+      valid = valid and islandid >= 0
+      pos = wp.where(valid, islandid * ROW_CLASSES + ec % ROW_CLASSES, 0)
+      wp.tile_scatter_add(counts, pos, wp.where(valid, tree_nrow_in[worldid, ec], 0), valid)
+    # exclusive scan over (island, class)
+    wp.tile_store(island_rowadr_out[worldid], wp.tile_scan_exclusive(counts))
+    wp.tile_store(island_cursor_out[worldid], wp.tile_zeros(shape=NT, dtype=int))
+    for i in range(lane, ntree, lanes):
+      ne = counts[i * ROW_CLASSES + ROW_EQUALITY]
+      nf = counts[i * ROW_CLASSES + ROW_FRICTION]
+      island_ne_out[worldid, i] = ne
+      island_nf_out[worldid, i] = nf
+      island_nefc_out[worldid, i] = ne + nf + counts[i * ROW_CLASSES + ROW_LIMIT] + counts[i * ROW_CLASSES + ROW_CONTACT]
+
+  return kernel
 
 
 def rows_finalize(m: types.Model, d: types.Data, island_parent: wp.array2d[int]):
