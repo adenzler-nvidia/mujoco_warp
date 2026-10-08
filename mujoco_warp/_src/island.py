@@ -1088,6 +1088,18 @@ def _island_slots(
 
 
 @wp.kernel
+def _slot_nslot(
+  # In:
+  slot_count_in: wp.array[int],
+  class_in: wp.array2d[int],
+  # Out:
+  nslot_out: wp.array[int],
+):
+  c = wp.tid()
+  nslot_out[c] = wp.min(slot_count_in[c], class_in[c, 1])
+
+
+@wp.kernel
 def _dof_slotcol(
   # Data in:
   dof_island_in: wp.array2d[int],
@@ -1118,6 +1130,7 @@ class SlotBuffers:
     # dense kernels read whole tiles of rows, past a world's last row
     self.J = wp.zeros((d.nworld, d.njmax + types.TILE_SIZE_JTDAJ_DENSE, width), dtype=float)
     self.count = wp.zeros(ncls, dtype=int)
+    self.nslot = wp.zeros(ncls, dtype=int)  # count clamped to the capacity
     self.world = wp.empty((ncls, cap), dtype=int)
     self.island = wp.empty((ncls, cap), dtype=int)
     self.class_info = wp.array(self.classes, dtype=int)
@@ -1142,6 +1155,7 @@ def assign_slots(m: types.Model, d: types.Data) -> SlotBuffers:
     inputs=[d.nisland, d.island_nv, _slots[0], buf.class_info],
     outputs=[buf.island_slot, buf.count, buf.world, buf.island],
   )
+  wp.launch(_slot_nslot, dim=len(buf.classes), inputs=[buf.count, buf.class_info], outputs=[buf.nslot])
   wp.launch(
     _dof_slotcol, dim=(d.nworld, m.nv), inputs=[d.dof_island, d.island_idofadr, d.map_dof2idof], outputs=[buf.dof_slotcol]
   )

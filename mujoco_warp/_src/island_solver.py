@@ -908,22 +908,29 @@ def _classify(
 
 
 @wp.func
-def _slot_island(
+def _dof_slot(
+  # Data in:
+  dof_island_in: wp.array2d[int],
+  island_idofadr_in: wp.array2d[int],
+  map_dof2idof_in: wp.array2d[int],
   # In:
-  c: int,
-  slot: int,
-  slot_count_in: wp.array[int],
-  slot_world_in: wp.array2d[int],
-  slot_island_in: wp.array2d[int],
-) -> wp.vec2i:
-  """World and island of a slot; island -1 if the slot is empty."""
-  if slot >= wp.min(slot_count_in[c], slot_world_in.shape[1]):
-    return wp.vec2i(0, -1)
-  return wp.vec2i(slot_world_in[c, slot], slot_island_in[c, slot])
+  width: int,
+  worldid: int,
+  dofid: int,
+  island_slot_in: wp.array2d[wp.vec2i],
+) -> wp.vec3i:
+  """(island, slot, local index) of a DOF whose island is in class width; slot -1 otherwise."""
+  islandid = dof_island_in[worldid, dofid]
+  if islandid < 0:
+    return wp.vec3i(-1, -1, 0)
+  slot = island_slot_in[worldid, islandid]
+  if slot[0] != width:
+    return wp.vec3i(islandid, -1, 0)
+  return wp.vec3i(islandid, slot[1], map_dof2idof_in[worldid, dofid] - island_idofadr_in[worldid, islandid])
 
 
 @cache_kernel
-def _slot_dofs(N: int, c: int):
+def _slot_scalars(N: int):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
@@ -931,10 +938,8 @@ def _slot_dofs(N: int, c: int):
     opt_ls_tolerance: wp.array[float],
     M_elemid: wp.array2d[int],
     # Data in:
-    qacc_warmstart_in: wp.array2d[float],
+    nisland_in: wp.array[int],
     M_in: wp.array2d[float],
-    qfrc_smooth_in: wp.array2d[float],
-    qacc_smooth_in: wp.array2d[float],
     island_idofadr_in: wp.array2d[int],
     island_nv_in: wp.array2d[int],
     island_nefc_in: wp.array2d[int],
@@ -943,13 +948,8 @@ def _slot_dofs(N: int, c: int):
     island_iefcadr_in: wp.array2d[int],
     map_idof2dof_in: wp.array2d[int],
     # In:
-    slot_count_in: wp.array[int],
-    slot_world_in: wp.array2d[int],
-    slot_island_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec2i],
     # Out:
-    slot_qacc_warmstart_out: wp.array2d[float],
-    slot_qfrc_smooth_out: wp.array2d[float],
-    slot_qacc_smooth_out: wp.array2d[float],
     slot_nefc_out: wp.array[int],
     slot_ne_out: wp.array[int],
     slot_nf_out: wp.array[int],
@@ -959,51 +959,110 @@ def _slot_dofs(N: int, c: int):
     slot_efc_world_out: wp.array[int],
     slot_efc_rowoff_out: wp.array[int],
   ):
-    """DOF vectors of a slot (zero on padding), its rows, sizes and tolerances."""
-    slot, i = wp.tid()
-    wi = _slot_island(c, slot, slot_count_in, slot_world_in, slot_island_in)
-    worldid = wi[0]
-    islandid = wi[1]
-    n = int(0)
-    idofadr = int(0)
-    if islandid >= 0:
-      n = island_nv_in[worldid, islandid]
-      idofadr = island_idofadr_in[worldid, islandid]
-    warmstart = float(0.0)
-    smooth_frc = float(0.0)
-    smooth_acc = float(0.0)
-    if i < n:
-      dofid = map_idof2dof_in[worldid, idofadr + i]
-      warmstart = qacc_warmstart_in[worldid, dofid]
-      smooth_frc = qfrc_smooth_in[worldid, dofid]
-      smooth_acc = qacc_smooth_in[worldid, dofid]
-    slot_qacc_warmstart_out[slot, i] = warmstart
-    slot_qfrc_smooth_out[slot, i] = smooth_frc
-    slot_qacc_smooth_out[slot, i] = smooth_acc
+    """Sizes, rows and tolerances of the slots of class N, one thread per island."""
+    worldid, islandid = wp.tid()
+    if islandid >= nisland_in[worldid]:
+      return
+    slot = island_slot_in[worldid, islandid]
+    if slot[0] != N:
+      return
+    p = slot[1]
+    slot_nefc_out[p] = island_nefc_in[worldid, islandid]
+    slot_ne_out[p] = island_ne_in[worldid, islandid]
+    slot_nf_out[p] = island_nf_in[worldid, islandid]
+    slot_efc_world_out[p] = worldid
+    slot_efc_rowoff_out[p] = island_iefcadr_in[worldid, islandid]
+    # MuJoCo scales an island's convergence tests by its inertia trace: meaninertia * nv = trace
+    idofadr = island_idofadr_in[worldid, islandid]
+    trace = float(0.0)
+    for k in range(island_nv_in[worldid, islandid]):
+      dofk = map_idof2dof_in[worldid, idofadr + k]
+      trace += M_in[worldid, M_elemid[dofk, dofk]]
+    slot_meaninertia_out[p] = trace / float(N)
+    slot_tolerance_out[p] = opt_tolerance[worldid % opt_tolerance.shape[0]]
+    slot_ls_tolerance_out[p] = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
+
+  return kernel
+
+
+@cache_kernel
+def _slot_dofs(N: int):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    qacc_warmstart_in: wp.array2d[float],
+    qfrc_smooth_in: wp.array2d[float],
+    qacc_smooth_in: wp.array2d[float],
+    dof_island_in: wp.array2d[int],
+    island_idofadr_in: wp.array2d[int],
+    island_nv_in: wp.array2d[int],
+    map_dof2idof_in: wp.array2d[int],
+    # In:
+    island_slot_in: wp.array2d[wp.vec2i],
+    # Out:
+    slot_qacc_warmstart_out: wp.array2d[float],
+    slot_qfrc_smooth_out: wp.array2d[float],
+    slot_qacc_smooth_out: wp.array2d[float],
+    slot_problem_dof_out: wp.array2d[int],
+    slot_dof_problem_out: wp.array2d[int],
+  ):
+    """DOF vectors and maps of the slots of class N, one thread per world DOF.
+
+    The thread of local DOF i also writes padding entries n + i, n + i + n, ...
+    """
+    worldid, dofid = wp.tid()
+    s = _dof_slot(dof_island_in, island_idofadr_in, map_dof2idof_in, N, worldid, dofid, island_slot_in)
+    p = s[1]
+    slot_dof_problem_out[worldid, dofid] = p
+    if p < 0:
+      return
+    i = s[2]
+    slot_qacc_warmstart_out[p, i] = qacc_warmstart_in[worldid, dofid]
+    slot_qfrc_smooth_out[p, i] = qfrc_smooth_in[worldid, dofid]
+    slot_qacc_smooth_out[p, i] = qacc_smooth_in[worldid, dofid]
+    slot_problem_dof_out[p, i] = dofid
+    n = island_nv_in[worldid, s[0]]
+    for r in range(n + i, N, n):
+      slot_qacc_warmstart_out[p, r] = 0.0
+      slot_qfrc_smooth_out[p, r] = 0.0
+      slot_qacc_smooth_out[p, r] = 0.0
+      slot_problem_dof_out[p, r] = -1
+
+  return kernel
+
+
+@cache_kernel
+def _slot_scatter(N: int):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    dof_island_in: wp.array2d[int],
+    island_idofadr_in: wp.array2d[int],
+    map_dof2idof_in: wp.array2d[int],
+    # In:
+    island_slot_in: wp.array2d[wp.vec2i],
+    slot_qacc_in: wp.array2d[float],
+    slot_qfrc_constraint_in: wp.array2d[float],
+    slot_niter_in: wp.array[int],
+    slot_overflow_in: wp.array[int],
+    # Data out:
+    solver_niter_out: wp.array[int],
+    qacc_out: wp.array2d[float],
+    qfrc_constraint_out: wp.array2d[float],
+    overflow_out: wp.array[int],
+  ):
+    """Copy the slots' solution to their islands' DOFs (rows' force and state are in place)."""
+    worldid, dofid = wp.tid()
+    s = _dof_slot(dof_island_in, island_idofadr_in, map_dof2idof_in, N, worldid, dofid, island_slot_in)
+    p = s[1]
+    if p < 0:
+      return
+    i = s[2]
+    qacc_out[worldid, dofid] = slot_qacc_in[p, i]
+    qfrc_constraint_out[worldid, dofid] = slot_qfrc_constraint_in[p, i]
     if i == 0:
-      nefc = int(0)
-      ne = int(0)
-      nf = int(0)
-      rowoff = int(0)
-      # MuJoCo scales an island's convergence tests by its inertia trace: meaninertia * nv = trace
-      trace = float(N)
-      if islandid >= 0:
-        nefc = island_nefc_in[worldid, islandid]
-        ne = island_ne_in[worldid, islandid]
-        nf = island_nf_in[worldid, islandid]
-        rowoff = island_iefcadr_in[worldid, islandid]
-        trace = float(0.0)
-        for k in range(n):
-          dofk = map_idof2dof_in[worldid, idofadr + k]
-          trace += M_in[worldid, M_elemid[dofk, dofk]]
-      slot_nefc_out[slot] = nefc
-      slot_ne_out[slot] = ne
-      slot_nf_out[slot] = nf
-      slot_efc_world_out[slot] = worldid
-      slot_efc_rowoff_out[slot] = rowoff
-      slot_meaninertia_out[slot] = trace / float(N)
-      slot_tolerance_out[slot] = opt_tolerance[worldid % opt_tolerance.shape[0]]
-      slot_ls_tolerance_out[slot] = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
+      wp.atomic_max(solver_niter_out, worldid, slot_niter_in[p])
+      wp.atomic_or(overflow_out, worldid, slot_overflow_in[p])
 
   return kernel
 
@@ -1034,83 +1093,13 @@ def _slot_rowmap(width: int):
   return kernel
 
 
-@cache_kernel
-def _slot_M(c: int):
-  @wp.kernel(module="unique", enable_backward=False)
-  def kernel(
-    # Model:
-    M_elemid: wp.array2d[int],
-    # Data in:
-    M_in: wp.array2d[float],
-    island_idofadr_in: wp.array2d[int],
-    island_nv_in: wp.array2d[int],
-    map_idof2dof_in: wp.array2d[int],
-    # In:
-    slot_count_in: wp.array[int],
-    slot_world_in: wp.array2d[int],
-    slot_island_in: wp.array2d[int],
-    # Out:
-    slot_M_out: wp.array3d[float],
-  ):
-    """Dense slot inertia, identity on padding (and for empty slots)."""
-    slot, i, j = wp.tid()
-    wi = _slot_island(c, slot, slot_count_in, slot_world_in, slot_island_in)
-    worldid = wi[0]
-    islandid = wi[1]
-    mij = wp.where(i == j, 1.0, 0.0)
-    if islandid >= 0:
-      n = island_nv_in[worldid, islandid]
-      if i < n and j < n:
-        idofadr = island_idofadr_in[worldid, islandid]
-        dofi = map_idof2dof_in[worldid, idofadr + i]
-        dofj = map_idof2dof_in[worldid, idofadr + j]
-        mij = 0.0
-        elemid = M_elemid[wp.max(dofi, dofj), wp.min(dofi, dofj)]
-        if elemid >= 0:
-          mij = M_in[worldid, elemid]
-    slot_M_out[slot, i, j] = mij
-
-  return kernel
-
-
-@cache_kernel
-def _slot_scatter(c: int):
-  @wp.kernel(module="unique", enable_backward=False)
-  def kernel(
-    # Data in:
-    island_idofadr_in: wp.array2d[int],
-    island_nv_in: wp.array2d[int],
-    map_idof2dof_in: wp.array2d[int],
-    # In:
-    slot_count_in: wp.array[int],
-    slot_world_in: wp.array2d[int],
-    slot_island_in: wp.array2d[int],
-    slot_qacc_in: wp.array2d[float],
-    slot_qfrc_constraint_in: wp.array2d[float],
-    slot_niter_in: wp.array[int],
-    slot_overflow_in: wp.array[int],
-    # Data out:
-    solver_niter_out: wp.array[int],
-    qacc_out: wp.array2d[float],
-    qfrc_constraint_out: wp.array2d[float],
-    overflow_out: wp.array[int],
-  ):
-    """Copy a slot's solution to its island's DOFs (its rows' force and state are in place)."""
-    slot, i = wp.tid()
-    wi = _slot_island(c, slot, slot_count_in, slot_world_in, slot_island_in)
-    worldid = wi[0]
-    islandid = wi[1]
-    if islandid < 0:
-      return
-    if i < island_nv_in[worldid, islandid]:
-      dofid = map_idof2dof_in[worldid, island_idofadr_in[worldid, islandid] + i]
-      qacc_out[worldid, dofid] = slot_qacc_in[slot, i]
-      qfrc_constraint_out[worldid, dofid] = slot_qfrc_constraint_in[slot, i]
-    if i == 0:
-      wp.atomic_max(solver_niter_out, worldid, slot_niter_in[slot])
-      wp.atomic_or(overflow_out, worldid, slot_overflow_in[slot])
-
-  return kernel
+@wp.kernel
+def _identity(
+  # Out:
+  eye_out: wp.array3d[float],
+):
+  i = wp.tid()
+  eye_out[0, i, i] = 1.0
 
 
 @dataclasses.dataclass
@@ -1153,7 +1142,6 @@ def _create_slots(m: types.Model, d: types.Data, c: int, rows: dict) -> _Slots:
   d_slot = dataclasses.replace(
     d,
     nworld=ns,
-    M=wp.empty((ns, N, N), dtype=float),
     nefc=wp.empty(ns, dtype=int),
     ne=wp.empty(ns, dtype=int),
     nf=wp.empty(ns, dtype=int),
@@ -1174,7 +1162,13 @@ def _create_slots(m: types.Model, d: types.Data, c: int, rows: dict) -> _Slots:
     efc_world=wp.empty(ns, dtype=int),
     efc_rowoff=wp.empty(ns, dtype=int),
     efc_problem=wp.empty((d.nworld, d.njmax), dtype=int),
+    nproblem=buf.nslot[c : c + 1],
+    problem_dof=wp.empty((ns, N), dtype=int),
+    dof_problem=wp.empty((d.nworld, m.nv), dtype=int),
+    dof_local=buf.dof_slotcol,
+    h_init=wp.zeros((1, N, N), dtype=float),
   )
+  wp.launch(_identity, dim=N, outputs=[ctx.h_init])
   return _Slots(c=c, nv=N, cap=ns, m=m_slot, d=d_slot, ctx=ctx, nsolving=wp.empty(1, dtype=int))
 
 
@@ -1182,21 +1176,18 @@ def _solve_slots(m: types.Model, d: types.Data, slots: _Slots):
   """Fill a class's slots, run the dense world solver on them and scatter the results back."""
   from mujoco_warp._src import solver  # noqa: PLC0415
 
-  c, N, ns = slots.c, slots.nv, slots.cap
+  N = slots.nv
   ms, ds, ctx = slots.m, slots.d, slots.ctx
   buf = island.slot_buffers(m, d)
-  smap = [buf.count, buf.world, buf.island]
   wp.launch(
-    _slot_dofs(N, c),
-    dim=(ns, N),
+    _slot_scalars(N),
+    dim=(d.nworld, m.ntree),
     inputs=[
       m.opt.tolerance,
       m.opt.ls_tolerance,
       m.M_elemid,
-      d.qacc_warmstart,
+      d.nisland,
       d.M,
-      d.qfrc_smooth,
-      d.qacc_smooth,
       d.island_idofadr,
       d.island_nv,
       d.island_nefc,
@@ -1204,21 +1195,24 @@ def _solve_slots(m: types.Model, d: types.Data, slots: _Slots):
       d.island_nf,
       d.island_iefcadr,
       d.map_idof2dof,
-      *smap,
+      buf.island_slot,
     ],
-    outputs=[
-      ds.qacc_warmstart,
-      ds.qfrc_smooth,
-      ds.qacc_smooth,
-      ds.nefc,
-      ds.ne,
-      ds.nf,
-      ms.stat.meaninertia,
-      ms.opt.tolerance,
-      ms.opt.ls_tolerance,
-      ctx.efc_world,
-      ctx.efc_rowoff,
+    outputs=[ds.nefc, ds.ne, ds.nf, ms.stat.meaninertia, ms.opt.tolerance, ms.opt.ls_tolerance, ctx.efc_world, ctx.efc_rowoff],
+  )
+  wp.launch(
+    _slot_dofs(N),
+    dim=(d.nworld, m.nv),
+    inputs=[
+      d.qacc_warmstart,
+      d.qfrc_smooth,
+      d.qacc_smooth,
+      d.dof_island,
+      d.island_idofadr,
+      d.island_nv,
+      d.map_dof2idof,
+      buf.island_slot,
     ],
+    outputs=[ds.qacc_warmstart, ds.qfrc_smooth, ds.qacc_smooth, ctx.problem_dof, ctx.dof_problem],
   )
   wp.launch(
     _slot_rowmap(N),
@@ -1226,21 +1220,15 @@ def _solve_slots(m: types.Model, d: types.Data, slots: _Slots):
     inputs=[d.nefc, d.efc.island, buf.island_slot],
     outputs=[ctx.efc_problem],
   )
-  wp.launch(
-    _slot_M(c),
-    dim=(ns, N, N),
-    inputs=[m.M_elemid, d.M, d.island_idofadr, d.island_nv, d.map_idof2dof, *smap],
-    outputs=[ds.M],
-  )
   solver._solve(ms, ds, ctx, compact=True, nsolving=slots.nsolving)
   wp.launch(
-    _slot_scatter(c),
-    dim=(ns, N),
+    _slot_scatter(N),
+    dim=(d.nworld, m.nv),
     inputs=[
+      d.dof_island,
       d.island_idofadr,
-      d.island_nv,
-      d.map_idof2dof,
-      *smap,
+      d.map_dof2idof,
+      buf.island_slot,
       ds.qacc,
       ds.qfrc_constraint,
       ds.solver_niter,
@@ -1538,7 +1526,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   if m.opt.graph_conditional:
     wp.capture_if(island_path_flag, on_true=island_path)
     for sc in slot_classes:
-      wp.capture_if(buf.count[sc.c : sc.c + 1], on_true=lambda sc=sc: _solve_slots(m, d, sc))
+      wp.capture_if(buf.nslot[sc.c : sc.c + 1], on_true=lambda sc=sc: _solve_slots(m, d, sc))
   else:
     island_path()
     for sc in slot_classes:

@@ -1752,6 +1752,8 @@ def _solve_init_dof(warmstart: bool, sparse: bool):
 
 @wp.kernel(grid_stride=True)
 def _solve_init_efc(
+  # In:
+  ctx_nproblem_in: wp.array[int],
   # Data out:
   solver_niter_out: wp.array[int],
   # Out:
@@ -1760,7 +1762,11 @@ def _solve_init_efc(
 ):
   worldid = wp.tid()
   solver_niter_out[worldid] = 0
-  ctx_done_out[worldid] = False
+  # problems past nproblem are empty and done from the start
+  done = False
+  if ctx_nproblem_in:
+    done = worldid >= ctx_nproblem_in[0]
+  ctx_done_out[worldid] = done
   ctx_search_dot_out[worldid] = 0.0
 
 
@@ -2225,6 +2231,49 @@ def _update_gradient_h_incremental(ragged: bool = False):
 
     if delta != 0.0:
       ctx_h_out[worldid, row, col] += delta
+
+  return kernel
+
+
+@cache_kernel
+def _update_gradient_h_incremental_rows(nv: int):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    efc_J_in: wp.array3d[float],
+    efc_D_in: wp.array2d[float],
+    efc_state_in: wp.array2d[int],
+    # In:
+    quad_changed_ids_in: wp.array2d[int],
+    quad_changed_count_in: wp.array[int],
+    ctx_efc_rowoff_in: wp.array[int],
+    ctx_efc_problem_in: wp.array2d[int],
+    # Out:
+    ctx_h_out: wp.array3d[float],
+  ):
+    """Ragged incremental H update, one thread per changed row.
+
+    A problem's changed-row list lives in its rows' range, so the thread of row g handles list entry
+    g - rowoff.
+    """
+    worldid, g = wp.tid()
+    problem = ctx_efc_problem_in[worldid, g]
+    if problem < 0:
+      return
+    if g - ctx_efc_rowoff_in[problem] >= quad_changed_count_in[problem]:
+      return
+    efcid = quad_changed_ids_in[worldid, g]
+    D = efc_D_in[worldid, efcid]
+    if efc_state_in[worldid, efcid] != types.ConstraintState.QUADRATIC.value:
+      D = -D
+    for i in range(wp.static(nv)):
+      Ji = efc_J_in[worldid, efcid, i]
+      if Ji != 0.0:
+        DJi = D * Ji
+        for j in range(i, wp.static(nv)):
+          Jj = efc_J_in[worldid, efcid, j]
+          if Jj != 0.0:
+            wp.atomic_add(ctx_h_out[problem, i], j, DJi * Jj)
 
   return kernel
 
@@ -2803,7 +2852,9 @@ def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njma
       ro = ctx_efc_rowoff_in[worldid]
 
     # Load full symmetric compact inertia tile (Cholesky only reads upper triangle).
-    sum_val = wp.tile_load(M_in[worldid], shape=(wp.static(nv_pad), wp.static(nv_pad)), bounds_check=True)
+    # ragged: M_in is the identity, then _add_M_ragged replaces the problem's DOFs' rows with the
+    # world's M
+    sum_val = wp.tile_load(M_in[wp.where(RAGGED, 0, worldid)], shape=(wp.static(nv_pad), wp.static(nv_pad)), bounds_check=True)
 
     for k in range(0, njmax, TILE_SIZE_K):
       if k >= nefc:
@@ -3700,7 +3751,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
           dim=d.nworld,
           inputs=[
             d.nefc,
-            m_mat,
+            m_mat if ctx.efc_world is None else ctx.h_init,
             d.efc.J,
             d.efc.D,
             d.efc.state,
@@ -3711,6 +3762,13 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
           outputs=[ctx.h],
           block_dim=m.block_dim.update_gradient_JTDAJ_dense,
         )
+        if ctx.efc_world is not None:
+          wp.launch(
+            _add_M_ragged(m.nv),
+            dim=ctx.dof_problem.shape,
+            inputs=[m.M_mulm_rowadr, m.M_mulm_col, m.M_mulm_madr, d.M, ctx.done, ctx.dof_problem, ctx.dof_local],
+            outputs=[ctx.h],
+          )
       else:
         wp.launch_tiled(
           _update_gradient_JTDAJ_dense_tiled(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax, m.M_colind.shape[0]),
@@ -3879,6 +3937,13 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
         ctx.quad_changed_count,
         slots,
       ],
+      outputs=[ctx.h],
+    )
+  elif ctx.efc_problem is not None:
+    wp.launch(
+      _update_gradient_h_incremental_rows(m.nv),
+      dim=ctx.efc_problem.shape,
+      inputs=[d.efc.J, d.efc.D, d.efc.state, ctx.quad_changed_ids, ctx.quad_changed_count, ctx.efc_rowoff, ctx.efc_problem],
       outputs=[ctx.h],
     )
   else:
@@ -4223,6 +4288,7 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
   wp.launch(
     _solve_init_efc,
     dim=d.nworld,
+    inputs=[getattr(ctx, "nproblem", None)],
     outputs=[d.solver_niter, ctx.search_dot, ctx.done],
   )
 
@@ -5743,7 +5809,10 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
       # left over from the previous solve.
       ctx.search_unchanged.zero_()
 
-    nsolving.fill_(d.nworld)
+    if ctx.nproblem is None:
+      nsolving.fill_(d.nworld)
+    else:
+      wp.copy(nsolving, ctx.nproblem)
 
     # CG search = -Mgrad
     if m.opt.solver == types.SolverType.CG:
@@ -5868,6 +5937,81 @@ def _mul_m_sparse_compact(
   res[worldid, ci] = acc
 
 
+@wp.kernel
+def _mul_m_sparse_ragged(
+  # Model:
+  M_mulm_rowadr: wp.array[int],
+  M_mulm_col: wp.array[int],
+  M_mulm_madr: wp.array[int],
+  # Data in:
+  M_in: wp.array2d[float],
+  # In:
+  ctx_nproblem_in: wp.array[int],
+  ctx_efc_world_in: wp.array[int],
+  ctx_problem_dof_in: wp.array2d[int],
+  ctx_dof_local_in: wp.array2d[int],
+  vec: wp.array2d[float],
+  skip: wp.array[bool],
+  # Out:
+  res: wp.array2d[float],
+):
+  """Res = M @ vec per problem via its world's sparse M (identity on padding DOFs)."""
+  problem, i = wp.tid()
+
+  # empty problems have no DOF maps
+  if problem >= ctx_nproblem_in[0] or skip[problem]:
+    return
+
+  dof = ctx_problem_dof_in[problem, i]
+  if dof < 0:
+    res[problem, i] = vec[problem, i]
+    return
+
+  worldid = ctx_efc_world_in[problem]
+  acc = float(0.0)
+  for k in range(M_mulm_rowadr[dof], M_mulm_rowadr[dof + 1]):
+    acc += M_in[worldid, M_mulm_madr[k]] * vec[problem, ctx_dof_local_in[worldid, M_mulm_col[k]]]
+  res[problem, i] = acc
+
+
+@cache_kernel
+def _add_M_ragged(nv: int):  # noqa: ARG001 (one kernel per class)
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    M_mulm_rowadr: wp.array[int],
+    M_mulm_col: wp.array[int],
+    M_mulm_madr: wp.array[int],
+    # Data in:
+    M_in: wp.array2d[float],
+    # In:
+    ctx_done_in: wp.array[bool],
+    ctx_dof_problem_in: wp.array2d[int],
+    ctx_dof_local_in: wp.array2d[int],
+    # Out:
+    ctx_h_out: wp.array3d[float],
+  ):
+    """Add each world DOF's M row to the upper triangle of its problem's H, one thread per DOF.
+
+    H starts as J'DJ plus the identity (padding DOFs keep it), so diagonals add M_ii - 1.
+    """
+    worldid, dofid = wp.tid()
+    problem = ctx_dof_problem_in[worldid, dofid]
+    if problem < 0:
+      return
+    if ctx_done_in[problem]:
+      return
+    i = ctx_dof_local_in[worldid, dofid]
+    for k in range(M_mulm_rowadr[dofid], M_mulm_rowadr[dofid + 1]):
+      j = ctx_dof_local_in[worldid, M_mulm_col[k]]
+      if j > i:
+        ctx_h_out[problem, i, j] += M_in[worldid, M_mulm_madr[k]]
+      elif j == i:
+        ctx_h_out[problem, i, j] += M_in[worldid, M_mulm_madr[k]] - 1.0
+
+  return kernel
+
+
 def _sparse_compact(ctx: SolverContext | InverseContext) -> bool:
   """Whether this solve is compact over a sparse full model (full J structures exist)."""
   return ctx.compact_d_full is not None and ctx.compact_m_full.is_sparse
@@ -5877,6 +6021,25 @@ def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | Inv
   """M @ vec: full-coordinate sparse walk under compact, support.mul_m natively."""
   if m.opt.integrator == types.IntegratorType.DISCRETE:
     derivative.eff_mul_m(m, d, res, vec, skip=skip)
+    return
+  if getattr(ctx, "dof_problem", None) is not None:
+    wp.launch(
+      _mul_m_sparse_ragged,
+      dim=ctx.problem_dof.shape,
+      inputs=[
+        m.M_mulm_rowadr,
+        m.M_mulm_col,
+        m.M_mulm_madr,
+        d.M,
+        ctx.nproblem,
+        ctx.efc_world,
+        ctx.problem_dof,
+        ctx.dof_local,
+        vec,
+        skip,
+      ],
+      outputs=[res],
+    )
     return
   dfull = ctx.compact_d_full
   if dfull is not None:
