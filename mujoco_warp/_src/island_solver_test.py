@@ -27,7 +27,7 @@ from mujoco_warp._src import island
 from mujoco_warp._src import island_solver
 
 
-def _fixture(slots: bool = True):
+def _fixture():
   """Islands of every kind: single boxes, stacks (2 and 3 tiles per side), a weld, an arm."""
   pos = {
     "s0": "0 0 .049",
@@ -62,12 +62,9 @@ def _fixture(slots: bool = True):
     xml=xml, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
   )
   m.opt.island_solve = True
-  # rows in island order
-  if slots:
-    mjw.make_constraint(m, d)
-  else:
-    with island.no_slots():
-      mjw.make_constraint(m, d)
+  # rows in island order; the dense rows' buffer is not initialized, and no stale entry may be used
+  island.slot_buffers(m, d).J.fill_(np.nan)
+  mjw.make_constraint(m, d)
   # start away from the solution so every island iterates
   d.qacc_warmstart.zero_()
   return mjm, mjd, m, d
@@ -165,7 +162,7 @@ class IslandSolverTest(absltest.TestCase):
       self.assertEqual(d.island_nefc.numpy()[0, i], len(cls))
 
   def test_slot_rows(self):
-    """Islands in slots write their rows only there, dense with island-local columns."""
+    """Island rows are written only as dense rows of whole tiles with island-local columns."""
     rows_fixture = test_data.fixture(
       xml=_ROWS_XML, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
     )
@@ -191,27 +188,26 @@ class IslandSolverTest(absltest.TestCase):
       island_slot, slot_J = slots.island_slot.numpy()[0], slots.J.numpy()[0]
       nv, nefc, iefcadr = d.island_nv.numpy()[0], d.island_nefc.numpy()[0], d.island_iefcadr.numpy()[0]
       rownnz = d.efc.J_rownnz.numpy()[0]
-      widths.update(island_slot[: d.nisland.numpy()[0], 0])
-      for i in np.nonzero(island_slot[:, 0])[0]:
+      nisland = d.nisland.numpy()[0]
+      np.testing.assert_array_equal(island_slot[:nisland, 0], (nv[:nisland] + 15) // 16 * 16)
+      widths.update(island_slot[:nisland, 0])
+      for i in range(nisland):
         r0, r1 = iefcadr[i], iefcadr[i] + nefc[i]
         np.testing.assert_array_equal(rownnz[r0:r1], 0)
         np.testing.assert_array_equal(slot_J[r0:r1, nv[i] : island_slot[i, 0]], 0.0)
-    # islands in each class: single boxes and the arm, short stacks, the tall stack
-    self.assertEqual(sorted(widths), [8, 16, 32, 64])
+    # one, two and three tiles
+    self.assertEqual(sorted(widths), [16, 32, 48])
 
   def test_solve(self):
-    """The island solve reaches MuJoCo's solution, with and without slots for small islands."""
-    for use_slots in (True, False):
-      mjm, mjd, m, d = _fixture(use_slots)
-      island_solver.solve(m, d)
-      np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3, err_msg=f"slots {use_slots}")
-      np.testing.assert_allclose(
-        d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3, err_msg=f"slots {use_slots}"
-      )
+    """The island solve reaches MuJoCo's solution."""
+    mjm, mjd, m, d = _fixture()
+    island_solver.solve(m, d)
+    np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
 
   def test_hessian(self):
     """Each island's H block is M + J'DJ over its quadratic rows, after incremental updates."""
-    mjm, mjd, m, d = _fixture(slots=False)
+    mjm, mjd, m, d = _fixture()
     ctx = island_solver.solve(m, d)
     self.assertGreater(ctx.niter.numpy()[0].max(), 1)
 
@@ -247,7 +243,7 @@ class IslandSolverTest(absltest.TestCase):
     Islands whose rows keep their states keep their search direction and gradient (scaled), as in
     the world solver's stable-state fast path; the welded pair has only equality rows.
     """
-    _, _, m, d = _fixture(slots=False)
+    _, _, m, d = _fixture()
     ctx = island_solver.solve(m, d)
     nisland = d.nisland.numpy()[0]
     grad_true = ctx.Ma.numpy()[0] - ctx.qfrc_smooth.numpy()[0] - ctx.frc.numpy()[0]
@@ -260,7 +256,7 @@ class IslandSolverTest(absltest.TestCase):
 
   def test_islands_converge_independently(self):
     """Islands stop at their own iteration; the world reports the slowest."""
-    _, _, m, d = _fixture(slots=False)
+    _, _, m, d = _fixture()
     ctx = island_solver.solve(m, d)
     niter = ctx.niter.numpy()[0, : d.nisland.numpy()[0]]
     self.assertLess(niter.min(), niter.max())

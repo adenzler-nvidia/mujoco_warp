@@ -969,28 +969,19 @@ ROW_FRICTION = 1
 ROW_LIMIT = 2
 ROW_CONTACT = 3
 
-# Islands of up to 128 DOFs are solved by the dense world solver, one run per DOF class, each
-# island a world ("slot") whose rows are its rows in the efc arrays; their Jacobian rows are
-# written only to a dense array, with island-local columns. The island Newton solver takes the
-# others.
-SLOT_WIDTHS = (8, 16, 32, 64, 128)
+# The island solver reads each island's rows as dense rows of ntile * 16 island-local columns
+# (ntile = ceil(island DOFs / 16)); the row kernels write them only there.
 _slots = [True]
 
 
 @contextlib.contextmanager
 def no_slots():
-  """Build rows without slots, so the island solver takes every island (for tests)."""
+  """Build sparse rows only (for tests of code that reads the sparse Jacobian)."""
   _slots[0] = False
   try:
     yield
   finally:
     _slots[0] = True
-
-
-def slot_widths(m: types.Model) -> tuple:
-  """DOF classes, the last one the smallest that holds a whole world."""
-  top = (m.nv + 15) // 16 * 16
-  return tuple(w for w in SLOT_WIDTHS if w < top) + ((top,) if top <= SLOT_WIDTHS[-1] else ())
 
 
 @wp.func
@@ -1003,7 +994,7 @@ def rows_slot(
   efcid: int,
   island_slot_in: wp.array2d[wp.vec2i],
 ) -> wp.vec2i:
-  """Row and class width of a constraint's first row in the slot Jacobian (width 0: no slot)."""
+  """Row and width of a constraint's first row in the dense Jacobian (width 0: sparse)."""
   if tree < 0:
     return wp.vec2i(-1, 0)
   width = island_slot_in[worldid, tree_island_in[worldid, tree]][0]
@@ -1041,19 +1032,9 @@ def slot_set(
   # Out:
   slot_J_out: wp.array3d[float],
 ):
-  """Value of row k past a slot row at a DOF's column (srow < 0: not in a slot)."""
+  """Value of row k past a dense row at a DOF's column (srow < 0: sparse)."""
   if srow >= 0:
     slot_J_out[worldid, srow + k, dof_slotcol_in[worldid, dofid]] = value
-
-
-def _slot_class_info(m: types.Model, nworld: int):
-  """(width, capacity) per class: a world has at most nv // lo islands of at least lo DOFs."""
-  info = []
-  lo = 1
-  for w in slot_widths(m):
-    info.append((w, nworld * max(1, min(m.ntree, m.nv // lo))))
-    lo = w + 1
-  return info
 
 
 @wp.kernel
@@ -1063,40 +1044,15 @@ def _island_slots(
   island_nv_in: wp.array2d[int],
   # In:
   use_slots: bool,
-  class_in: wp.array2d[int],
   # Out:
   island_slot_out: wp.array2d[wp.vec2i],
-  slot_count_out: wp.array[int],
-  slot_world_out: wp.array2d[int],
-  slot_island_out: wp.array2d[int],
 ):
-  """Slot (class width, index) of each island in the smallest class that holds its DOFs."""
+  """Dense row width of each island: its DOFs rounded up to whole tiles."""
   worldid, islandid = wp.tid()
-  out = wp.vec2i(0, -1)
+  width = int(0)
   if use_slots and islandid < nisland_in[worldid]:
-    ndof = island_nv_in[worldid, islandid]
-    for c in range(class_in.shape[0]):
-      width = class_in[c, 0]
-      if ndof <= width:
-        slot = wp.atomic_add(slot_count_out, c, 1)
-        if slot < class_in[c, 1]:
-          out = wp.vec2i(width, slot)
-          slot_world_out[c, slot] = worldid
-          slot_island_out[c, slot] = islandid
-        break
-  island_slot_out[worldid, islandid] = out
-
-
-@wp.kernel
-def _slot_nslot(
-  # In:
-  slot_count_in: wp.array[int],
-  class_in: wp.array2d[int],
-  # Out:
-  nslot_out: wp.array[int],
-):
-  c = wp.tid()
-  nslot_out[c] = wp.min(slot_count_in[c], class_in[c, 1])
+    width = (island_nv_in[worldid, islandid] + 15) // 16 * 16
+  island_slot_out[worldid, islandid] = wp.vec2i(width, 0)
 
 
 @wp.kernel
@@ -1117,23 +1073,15 @@ def _dof_slotcol(
 
 
 class SlotBuffers:
-  """Slot arrays shared by make_constraint (rows) and the island solve."""
+  """Dense island rows, shared by make_constraint and the island solve."""
 
   def __init__(self, m: types.Model, d: types.Data):
     self.key = (d.nworld, m.ntree, m.nv, d.njmax)
-    self.classes = _slot_class_info(m, d.nworld)
-    ncls = len(self.classes)
-    cap = max(c[1] for c in self.classes)
-    width = self.classes[-1][0]
     self.island_slot = wp.empty((d.nworld, m.ntree), dtype=wp.vec2i)
     self.dof_slotcol = wp.empty((d.nworld, m.nv), dtype=int)
-    # dense kernels read whole tiles of rows, past a world's last row
-    self.J = wp.zeros((d.nworld, d.njmax + types.TILE_SIZE_JTDAJ_DENSE, width), dtype=float)
-    self.count = wp.zeros(ncls, dtype=int)
-    self.nslot = wp.zeros(ncls, dtype=int)  # count clamped to the capacity
-    self.world = wp.empty((ncls, cap), dtype=int)
-    self.island = wp.empty((ncls, cap), dtype=int)
-    self.class_info = wp.array(self.classes, dtype=int)
+    # tile kernels read whole tiles of rows, past a world's last row (and mask them). Not zeroed:
+    # this may be allocated in a graph capture, where a fill would run every step.
+    self.J = wp.empty((d.nworld, d.njmax + types.TILE_SIZE_JTDAJ_DENSE, (m.nv + 15) // 16 * 16), dtype=float)
 
 
 def slot_buffers(m: types.Model, d: types.Data) -> SlotBuffers:
@@ -1145,17 +1093,10 @@ def slot_buffers(m: types.Model, d: types.Data) -> SlotBuffers:
 
 
 def assign_slots(m: types.Model, d: types.Data) -> SlotBuffers:
-  """Island DOF maps and slots, from the row layout, before the rows are written."""
+  """Island DOF maps and dense row widths, from the row layout, before the rows are written."""
   island_dofs(m, d)
   buf = slot_buffers(m, d)
-  buf.count.zero_()
-  wp.launch(
-    _island_slots,
-    dim=(d.nworld, m.ntree),
-    inputs=[d.nisland, d.island_nv, _slots[0], buf.class_info],
-    outputs=[buf.island_slot, buf.count, buf.world, buf.island],
-  )
-  wp.launch(_slot_nslot, dim=len(buf.classes), inputs=[buf.count, buf.class_info], outputs=[buf.nslot])
+  wp.launch(_island_slots, dim=(d.nworld, m.ntree), inputs=[d.nisland, d.island_nv, _slots[0]], outputs=[buf.island_slot])
   wp.launch(
     _dof_slotcol, dim=(d.nworld, m.nv), inputs=[d.dof_island, d.island_idofadr, d.map_dof2idof], outputs=[buf.dof_slotcol]
   )
