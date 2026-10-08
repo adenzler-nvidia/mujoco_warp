@@ -23,6 +23,7 @@ import numpy as np
 import warp as wp
 
 from mujoco_warp._src import history
+from mujoco_warp._src import island
 from mujoco_warp._src import sleep
 from mujoco_warp._src import support
 from mujoco_warp._src import types
@@ -1537,6 +1538,16 @@ def _calculate_max_contact_nnz(mjm: mujoco.MjModel) -> int:
   return max_contact_nnz
 
 
+def _island_dense_nnz(mjm: mujoco.MjModel, njmax: int) -> int:
+  """Room for opt.island_solve's dense Jacobian blocks (island.DENSE_NV) besides the sparse rows.
+
+  A row is stored dense (at most this wide) or sparse, so this plus the sparse estimate bounds both.
+  """
+  if mjm.ntree < 2:
+    return 0
+  return njmax * min((mjm.nv + 15) // 16 * 16, island.DENSE_NV)
+
+
 def _default_njmax_nnz(mjm: mujoco.MjModel, nconmax: int, njmax: int) -> int:
   """Returns a heuristic estimate for the number of non-zeros in the sparse constraint Jacobian.
 
@@ -1912,7 +1923,7 @@ def make_data(
 
   if njmax_nnz is None:
     if is_sparse(mjm):
-      njmax_nnz = _default_njmax_nnz(mjm, nconmax, njmax)
+      njmax_nnz = _default_njmax_nnz(mjm, nconmax, njmax) + _island_dense_nnz(mjm, njmax)
     else:
       njmax_nnz = njmax * mjm.nv
 
@@ -2142,7 +2153,7 @@ def put_data(
 
   if njmax_nnz is None:
     if is_sparse(mjm):
-      njmax_nnz = _default_njmax_nnz(mjm, nconmax, njmax)
+      njmax_nnz = _default_njmax_nnz(mjm, nconmax, njmax) + _island_dense_nnz(mjm, njmax)
     else:
       njmax_nnz = njmax * mjm.nv
 
@@ -2340,14 +2351,16 @@ def put_data(
 
 
 def _island_slot_rows(efc_J: np.ndarray, d: types.Data, slots, worldid: int):
-  """Fill the rows of islands solved in slots (dense, island-local columns, in slots.J)."""
-  island_slot, slot_J = slots.island_slot.numpy()[worldid], slots.J.numpy()[worldid]
-  island_nv, island_nefc = d.island_nv.numpy()[worldid], d.island_nefc.numpy()[worldid]
-  idofadr, iefcadr = d.island_idofadr.numpy()[worldid], d.island_iefcadr.numpy()[worldid]
+  """Fill the rows of islands with a dense Jacobian block (see island.DENSE_NV)."""
+  island_slot, J = slots.island_slot.numpy()[worldid], d.efc.J.numpy()[worldid, 0]
+  island_nv, idofadr = d.island_nv.numpy()[worldid], d.island_idofadr.numpy()[worldid]
   idof2dof = d.map_idof2dof.numpy()[worldid]
   for i in np.nonzero(island_slot[:, 0])[0]:
-    r0, r1, n = iefcadr[i], iefcadr[i] + island_nefc[i], island_nv[i]
-    efc_J[r0:r1, idof2dof[idofadr[i] : idofadr[i] + n]] = slot_J[r0:r1, :n]
+    width, base, nrow, rowadr = island_slot[i]
+    n = island_nv[i]
+    # tiles of 16 columns, each all rows x 16
+    block = J[base : base + width * nrow].reshape(width // 16, nrow, 16).transpose(1, 0, 2).reshape(nrow, width)
+    efc_J[rowadr : rowadr + nrow, idof2dof[idofadr[i] : idofadr[i] + n]] = block[:, :n]
 
 
 def get_data_into(

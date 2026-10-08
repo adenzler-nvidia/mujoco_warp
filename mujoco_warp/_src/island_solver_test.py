@@ -27,7 +27,7 @@ from mujoco_warp._src import island
 from mujoco_warp._src import island_solver
 
 
-def _fixture():
+def _fixture(dense_nv: int = island.DENSE_NV):
   """Islands of every kind: single boxes, stacks (2 and 3 tiles per side), a weld, an arm."""
   pos = {
     "s0": "0 0 .049",
@@ -62,9 +62,14 @@ def _fixture():
     xml=xml, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
   )
   m.opt.island_solve = True
-  # rows in island order; the dense rows' buffer is not initialized, and no stale entry may be used
-  island.slot_buffers(m, d).J.fill_(np.nan)
-  mjw.make_constraint(m, d)
+  # rows in island order, dense blocks for islands up to dense_nv DOFs; no stale Jacobian entry
+  # may be used
+  d.efc.J.fill_(np.nan)
+  default, island.DENSE_NV = island.DENSE_NV, dense_nv
+  try:
+    mjw.make_constraint(m, d)
+  finally:
+    island.DENSE_NV = default
   # start away from the solution so every island iterates
   d.qacc_warmstart.zero_()
   return mjm, mjd, m, d
@@ -161,8 +166,8 @@ class IslandSolverTest(absltest.TestCase):
       self.assertEqual(d.island_nf.numpy()[0, i], cls.count(1))
       self.assertEqual(d.island_nefc.numpy()[0, i], len(cls))
 
-  def test_slot_rows(self):
-    """Island rows are written only as dense rows of whole tiles with island-local columns."""
+  def test_dense_rows(self):
+    """Narrow islands store their rows as one dense block of whole tiles, island-local columns."""
     rows_fixture = test_data.fixture(
       xml=_ROWS_XML, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
     )
@@ -179,35 +184,41 @@ class IslandSolverTest(absltest.TestCase):
       with island.no_slots():
         mjw.make_constraint(m, d)
       expect = rows()
-      # every slot entry must be written (stale rows from other steps are not zero)
-      slots = island.slot_buffers(m, d)
-      slots.J.fill_(np.nan)
+      # every entry of a block must be written (stale values from other steps are not zero)
+      d.efc.J.fill_(np.nan)
       mjw.make_constraint(m, d)
       np.testing.assert_allclose(rows(), expect, atol=1e-6)
 
-      island_slot, slot_J = slots.island_slot.numpy()[0], slots.J.numpy()[0]
-      nv, nefc, iefcadr = d.island_nv.numpy()[0], d.island_nefc.numpy()[0], d.island_iefcadr.numpy()[0]
-      rownnz = d.efc.J_rownnz.numpy()[0]
+      island_slot, J = island.slot_buffers(m, d).island_slot.numpy()[0], d.efc.J.numpy()[0, 0]
+      nv, rownnz = d.island_nv.numpy()[0], d.efc.J_rownnz.numpy()[0]
       nisland = d.nisland.numpy()[0]
       np.testing.assert_array_equal(island_slot[:nisland, 0], (nv[:nisland] + 15) // 16 * 16)
       widths.update(island_slot[:nisland, 0])
       for i in range(nisland):
-        r0, r1 = iefcadr[i], iefcadr[i] + nefc[i]
-        np.testing.assert_array_equal(rownnz[r0:r1], 0)
-        np.testing.assert_array_equal(slot_J[r0:r1, nv[i] : island_slot[i, 0]], 0.0)
+        width, base, nrow, rowadr = island_slot[i]
+        np.testing.assert_array_equal(rownnz[rowadr : rowadr + nrow], 0)
+        block = J[base : base + width * nrow].reshape(width // 16, nrow, 16).transpose(1, 0, 2).reshape(nrow, width)
+        np.testing.assert_array_equal(block[:, nv[i] :], 0.0)
     # one, two and three tiles
     self.assertEqual(sorted(widths), [16, 32, 48])
 
   def test_solve(self):
-    """The island solve reaches MuJoCo's solution."""
-    mjm, mjd, m, d = _fixture()
-    island_solver.solve(m, d)
-    np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
-    np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
+    """The island solve reaches MuJoCo's solution, with dense, mixed and sparse islands."""
+    for dense_nv in (64, 32, 0):
+      with self.subTest(dense_nv=dense_nv):
+        mjm, mjd, m, d = _fixture(dense_nv)
+        island_solver.solve(m, d)
+        np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
+        np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
 
   def test_hessian(self):
     """Each island's H block is M + J'DJ over its quadratic rows, after incremental updates."""
-    mjm, mjd, m, d = _fixture()
+    for dense_nv in (64, 0):
+      with self.subTest(dense_nv=dense_nv):
+        self._check_hessian(dense_nv)
+
+  def _check_hessian(self, dense_nv):
+    mjm, mjd, m, d = _fixture(dense_nv)
     ctx = island_solver.solve(m, d)
     self.assertGreater(ctx.niter.numpy()[0].max(), 1)
 

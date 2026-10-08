@@ -14,11 +14,12 @@
 # ==============================================================================
 """Newton constraint solver over islands (opt.island_solve).
 
-make_constraint writes an island's rows contiguously and its Jacobian as dense rows of whole 16-DOF
-tiles with island-local columns. Each step, an island's DOFs are gathered into tile-aligned rows,
-and its inertia and Hessian are dense blocks of 16x16 tiles in a per-world pool. Every island is
-solved with its own step size and convergence test, as MuJoCo's island solver does. Kernels run over
-the work that exists: rows, DOFs, islands and the tile pairs of each island's Hessian.
+make_constraint writes an island's rows contiguously. Islands of up to island.DENSE_NV DOFs store
+their Jacobian as one dense block of whole 16-DOF tiles (island-local columns), wider ones as sparse
+rows. Each step, an island's DOFs are gathered into tile-aligned rows, and its inertia and Hessian
+are dense blocks of 16x16 tiles in a per-world pool. Every island is solved with its own step size
+and convergence test, as MuJoCo's island solver does. Kernels run over the work that exists: rows,
+DOFs, islands and the tile pairs of each island's Hessian.
 """
 
 import dataclasses
@@ -31,6 +32,7 @@ from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_pool_cholesky_newton_func
 from mujoco_warp._src.block_cholesky import solve_search_sums
 from mujoco_warp._src.solver import _ALPHA_NOISE_EPS
+from mujoco_warp._src.solver import _JTDAJ_THREADS_PER_GROUP
 from mujoco_warp._src.solver import _ROW_EQUALITY
 from mujoco_warp._src.solver import _ROW_FRICTION
 from mujoco_warp._src.solver import _ROW_OTHER
@@ -42,6 +44,8 @@ from mujoco_warp._src.solver import _in_bracket
 from mujoco_warp._src.solver import _island_pool_init
 from mujoco_warp._src.solver import _island_pool_maps
 from mujoco_warp._src.solver import _island_pool_size
+from mujoco_warp._src.solver import _JTDACJ_sparse
+from mujoco_warp._src.solver import _jtdaj_groups_per_world
 from mujoco_warp._src.solver import _row_eval_pt
 from mujoco_warp._src.solver import _row_eval_pt_alpha_zero
 from mujoco_warp._src.types import OverflowType
@@ -152,6 +156,12 @@ def _in_class(ntile: int, sizeclass: int) -> int:
 
 
 @wp.func
+def _block_adr(block: wp.vec4i, r: int, c: int) -> int:
+  """Address of entry (row r, island column c) of an island's dense block (see island.rows_slot)."""
+  return block[1] + ((c // 16) * block[2] + r) * 16 + c % 16
+
+
+@wp.func
 def _select(keep: float, x: float) -> float:
   return wp.where(keep != 0.0, x, 0.0)
 
@@ -219,12 +229,16 @@ def _gather_dofs(
 def _init_rows(
   # Data in:
   nefc_in: wp.array[int],
+  efc_J_rownnz_in: wp.array2d[int],
+  efc_J_rowadr_in: wp.array2d[int],
+  efc_J_colind_in: wp.array3d[int],
+  efc_J_in: wp.array3d[float],
   efc_aref_in: wp.array2d[float],
   efc_island_in: wp.array2d[int],
   # In:
-  ntile_in: wp.array2d[int],
+  island_slot_in: wp.array2d[wp.vec4i],
   vbase_in: wp.array2d[int],
-  iJ_in: wp.array3d[float],
+  dof2row_in: wp.array2d[int],
   iqacc_in: wp.array2d[float],
   # Out:
   row_jaref_out: wp.array2d[float],
@@ -234,10 +248,18 @@ def _init_rows(
   if row >= nefc_in[worldid]:
     return
   islandid = efc_island_in[worldid, row]
-  vbase = vbase_in[worldid, islandid]
+  block = island_slot_in[worldid, islandid]
   jaref = -efc_aref_in[worldid, row]
-  for c in range(ntile_in[worldid, islandid] * _TILE):
-    jaref += iJ_in[worldid, row, c] * iqacc_in[worldid, vbase + c]
+  if block[0] > 0:
+    vbase = vbase_in[worldid, islandid]
+    r = row - block[3]
+    for c in range(block[0]):
+      jaref += efc_J_in[worldid, 0, _block_adr(block, r, c)] * iqacc_in[worldid, vbase + c]
+  else:
+    rowadr = efc_J_rowadr_in[worldid, row]
+    for k in range(efc_J_rownnz_in[worldid, row]):
+      adr = rowadr + k
+      jaref += efc_J_in[worldid, 0, adr] * iqacc_in[worldid, dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
   row_jaref_out[worldid, row] = jaref
 
 
@@ -407,6 +429,67 @@ def _rows(initial: bool):
 
 
 @cache_kernel
+def _sparse_rows(initial: bool):
+  INITIAL = initial
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    nefc_in: wp.array[int],
+    efc_J_rownnz_in: wp.array2d[int],
+    efc_J_rowadr_in: wp.array2d[int],
+    efc_J_colind_in: wp.array3d[int],
+    efc_J_in: wp.array3d[float],
+    efc_force_in: wp.array2d[float],
+    efc_island_in: wp.array2d[int],
+    # In:
+    island_slot_in: wp.array2d[wp.vec4i],
+    tilebase_in: wp.array2d[int],
+    ntile_in: wp.array2d[int],
+    vbase_in: wp.array2d[int],
+    done_in: wp.array2d[bool],
+    dof2row_in: wp.array2d[int],
+    row_w_in: wp.array2d[float],
+    # Out:
+    frc_out: wp.array2d[float],
+    H_out: wp.array3d[float],
+  ):
+    """Rows of sparse islands: add J'force to frc and, where the row flipped, w J'J to H.
+
+    The initial H is assembled by _JTDACJ_sparse.
+    """
+    worldid, row = wp.tid()
+    if row >= nefc_in[worldid]:
+      return
+    islandid = efc_island_in[worldid, row]
+    if island_slot_in[worldid, islandid][0] > 0 or done_in[worldid, islandid]:
+      return
+    force = efc_force_in[worldid, row]
+    w = float(0.0)
+    if wp.static(not INITIAL):
+      w = row_w_in[worldid, row]
+    rowadr = efc_J_rowadr_in[worldid, row]
+    rownnz = efc_J_rownnz_in[worldid, row]
+    dof2row = dof2row_in[worldid]
+    colind = efc_J_colind_in[worldid, 0]
+    tilebase = tilebase_in[worldid, islandid]
+    ntile = ntile_in[worldid, islandid]
+    vbase = vbase_in[worldid, islandid]
+    for k in range(rownnz):
+      cola = dof2row[colind[rowadr + k]]
+      Ja = efc_J_in[worldid, 0, rowadr + k]
+      if force != 0.0:
+        wp.atomic_add(frc_out[worldid], cola, Ja * force)
+      if w != 0.0:
+        Jaw = Ja * w
+        for kb in range(k, rownnz):
+          rc = _pool_rc(tilebase, ntile, cola - vbase, dof2row[colind[rowadr + kb]] - vbase)
+          wp.atomic_add(H_out[worldid, rc[0]], rc[1], Jaw * efc_J_in[worldid, 0, rowadr + kb])
+
+  return kernel
+
+
+@cache_kernel
 def _jtdj(initial: bool):
   INITIAL = initial
 
@@ -422,7 +505,8 @@ def _jtdj(initial: bool):
     pairbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
     changed_in: wp.array2d[bool],
-    iJ_in: wp.array3d[float],
+    island_slot_in: wp.array2d[wp.vec4i],
+    J16_in: wp.array3d[float],
     row_w_in: wp.array2d[float],
     nblock: int,
     # Out:
@@ -433,14 +517,14 @@ def _jtdj(initial: bool):
     Pairs are numbered per world in island order; nblock blocks per world stride over them and each
     pair's tile is written by one block.
     """
-    worldid, block, lane = wp.tid()
+    worldid, bid, lane = wp.tid()
     nisland = nisland_in[worldid]
     if nisland == 0:
       return
     last = nisland - 1
     npair = pairbase_in[worldid, last] + _npair(ntile_in[worldid, last])
     # blocks stride over the world's pairs
-    for pair in range(block, npair, nblock):
+    for pair in range(bid, npair, nblock):
       # the island of this pair: the last one whose first pair is at or before it
       lo = int(0)
       hi = last
@@ -451,7 +535,8 @@ def _jtdj(initial: bool):
         else:
           hi = mid - 1
       islandid = lo
-      if done_in[worldid, islandid]:
+      block = island_slot_in[worldid, islandid]
+      if block[0] == 0 or done_in[worldid, islandid]:
         continue
       if wp.static(not INITIAL):
         if not changed_in[worldid, islandid]:
@@ -475,9 +560,14 @@ def _jtdj(initial: bool):
           # updates touch only the rows that flipped
           if wp.tile_reduce(wp.add, wp.tile_map(wp.abs, w))[0] == 0.0:
             continue
-        Ja = wp.tile_load(iJ_in[worldid], shape=(_TILE, _TILE), offset=(rowadr + r, _TILE * bi), bounds_check=False)
-        Jb = wp.tile_load(iJ_in[worldid], shape=(_TILE, _TILE), offset=(rowadr + r, _TILE * bj), bounds_check=False)
-        # rows past the world's rows are uninitialized: select, not multiply
+        # tile (r, b) of the block: 16 rows of 16 values from row base / 16 + b * nrow + r
+        Ja = wp.tile_load(
+          J16_in[worldid], shape=(_TILE, _TILE), offset=(block[1] // _TILE + bi * nrow + r, 0), bounds_check=True
+        )
+        Jb = wp.tile_load(
+          J16_in[worldid], shape=(_TILE, _TILE), offset=(block[1] // _TILE + bj * nrow + r, 0), bounds_check=True
+        )
+        # rows past the block are other data, possibly uninitialized: select, not multiply
         rows = wp.tile_broadcast(wp.tile_reshape(active, shape=(_TILE, 1)), shape=(_TILE, _TILE))
         Ja = wp.tile_map(_select, rows, Ja)
         Jb = wp.tile_map(_select, rows, Jb)
@@ -497,14 +587,13 @@ def _grad(final: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Data in:
+    efc_J_in: wp.array3d[float],
     efc_force_in: wp.array2d[float],
     dof_island_in: wp.array2d[int],
-    island_nefc_in: wp.array2d[int],
-    island_iefcadr_in: wp.array2d[int],
     # In:
+    island_slot_in: wp.array2d[wp.vec4i],
     row2dof_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
-    iJ_in: wp.array3d[float],
     done_in: wp.array2d[bool],
     niter_in: wp.array2d[int],
     state_changed_in: wp.array2d[bool],
@@ -514,9 +603,10 @@ def _grad(final: bool):
     frc_out: wp.array2d[float],
     grad_out: wp.array2d[float],
   ):
-    """J'force and the gradient of an aligned island DOF row (zero on padding).
+    """J'force (dense islands) and the gradient of an aligned island DOF row (zero on padding).
 
-    The final pass only computes J'force (qfrc_constraint) for every island.
+    Sparse islands' J'force is accumulated by _sparse_rows. The final pass only computes J'force
+    (qfrc_constraint) of dense islands.
     """
     worldid, row = wp.tid()
     dofid = row2dof_in[worldid, row]
@@ -528,14 +618,19 @@ def _grad(final: bool):
     if wp.static(not FINAL):
       if done_in[worldid, islandid] or _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
         return
-    col = row - vbase_in[worldid, islandid]
-    rowadr = island_iefcadr_in[worldid, islandid]
+    block = island_slot_in[worldid, islandid]
     frc = float(0.0)
-    for r in range(rowadr, rowadr + island_nefc_in[worldid, islandid]):
-      force = efc_force_in[worldid, r]
-      if force != 0.0:
-        frc += iJ_in[worldid, r, col] * force
-    frc_out[worldid, row] = frc
+    if block[0] > 0:
+      col = row - vbase_in[worldid, islandid]
+      for r in range(block[2]):
+        force = efc_force_in[worldid, block[3] + r]
+        if force != 0.0:
+          frc += efc_J_in[worldid, 0, _block_adr(block, r, col)] * force
+      frc_out[worldid, row] = frc
+    elif wp.static(FINAL):
+      return
+    else:
+      frc = frc_out[worldid, row]
     if wp.static(not FINAL):
       grad_out[worldid, row] = Ma_in[worldid, row] - iqfrc_smooth_in[worldid, row] - frc
 
@@ -666,6 +761,10 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     # Data in:
     nisland_in: wp.array[int],
     efc_type_in: wp.array2d[int],
+    efc_J_rownnz_in: wp.array2d[int],
+    efc_J_rowadr_in: wp.array2d[int],
+    efc_J_colind_in: wp.array3d[int],
+    efc_J_in: wp.array3d[float],
     efc_D_in: wp.array2d[float],
     efc_frictionloss_in: wp.array2d[float],
     island_nv_in: wp.array2d[int],
@@ -679,7 +778,8 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     iqfrc_smooth_in: wp.array2d[float],
     iM_in: wp.array3d[float],
     search_in: wp.array2d[float],
-    iJ_in: wp.array3d[float],
+    island_slot_in: wp.array2d[wp.vec4i],
+    dof2row_in: wp.array2d[int],
     grad_in: wp.array2d[float],
     search_dot_in: wp.array2d[float],
     newton_decrement_in: wp.array2d[float],
@@ -694,6 +794,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     improvement_out: wp.array2d[float],
     iqacc_out: wp.array2d[float],
     Ma_out: wp.array2d[float],
+    frc_out: wp.array2d[float],
     mv_out: wp.array2d[float],
     row_jaref_out: wp.array2d[float],
     row_jv_out: wp.array2d[float],
@@ -714,6 +815,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     ntile = ntile_in[worldid, islandid]
     vbase = vbase_in[worldid, islandid]
     scale = scale_in[worldid, islandid]
+    block = island_slot_in[worldid, islandid]
     tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
     ls_tolerance = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
     niter = niter_out[worldid, islandid]
@@ -770,8 +872,14 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
       if stable:
         jv = row_jv_out[worldid, row]
       else:
-        for c in range(ntile * _TILE):
-          jv += iJ_in[worldid, row, c] * search[vbase + c]
+        if block[0] > 0:
+          for c in range(block[0]):
+            jv += efc_J_in[worldid, 0, _block_adr(block, r, c)] * search[vbase + c]
+        else:
+          rowadr = efc_J_rowadr_in[worldid, row]
+          for k in range(efc_J_rownnz_in[worldid, row]):
+            adr = rowadr + k
+            jv += efc_J_in[worldid, 0, adr] * search[dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
         row_jv_out[worldid, row] = jv
       category = _row_category(efc_type_in[worldid, row])
       D = efc_D_in[worldid, row]
@@ -922,11 +1030,13 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
         )
       wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.LS_ITERATIONS))
 
-    # --- update ---
+    # --- update; sparse islands' J'force is accumulated again at the new point ---
     for la in range(lane, ndof, nthread):
       row = vbase + la
       iqacc_out[worldid, row] += alpha * search[row]
       Ma_out[worldid, row] += alpha * mv_out[worldid, row]
+      if block[0] == 0:
+        frc_out[worldid, row] = 0.0
     for r in range(lane, nrow, nthread):
       row = rowadr0 + r
       row_jaref_out[worldid, row] += alpha * row_jv_out[worldid, row]
@@ -1015,7 +1125,30 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
   )
 
 
-def _update_h(m: types.Model, d: types.Data, ctx: IslandContext, iJ: wp.array3d, initial: bool):
+def _j16(d: types.Data) -> wp.array3d:
+  """efc.J viewed as rows of 16 values (whole dense tiles; a partial last row is not used)."""
+  J = d.efc.J
+  return wp.array(
+    ptr=J.ptr,
+    shape=(d.nworld, J.shape[2] // _TILE, _TILE),
+    strides=(J.strides[0], _TILE * J.strides[2], J.strides[2]),
+    dtype=float,
+    device=J.device,
+  )
+
+
+def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.array2d, initial: bool):
+  """Constraint state at the current point, J'force of sparse islands and the H updates."""
+  if not initial:
+    ctx.state_changed.zero_()
+    ctx.changed.zero_()
+  wp.launch(
+    _rows(initial),
+    dim=(d.nworld, d.njmax),
+    inputs=[d.nefc, d.efc.type, d.efc.D, d.efc.frictionloss, d.efc.island, ctx.done, ctx.row_jaref],
+    outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.row_w, ctx.changed, ctx.state_changed],
+  )
+  # dense islands: one block per tile pair of H
   wp.launch_tiled(
     _jtdj(initial),
     dim=(d.nworld, m.ntree),
@@ -1028,42 +1161,78 @@ def _update_h(m: types.Model, d: types.Data, ctx: IslandContext, iJ: wp.array3d,
       ctx.pairbase,
       ctx.done,
       ctx.changed,
-      iJ,
+      slots,
+      _j16(d),
       ctx.row_w,
       m.ntree,
     ],
     outputs=[ctx.H],
     block_dim=_PAIR_THREADS,
   )
-
-
-def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, iJ: wp.array3d, initial: bool):
-  """Constraint state at the current point and the H update for rows whose curvature flipped."""
-  if not initial:
-    ctx.state_changed.zero_()
-    ctx.changed.zero_()
+  # sparse islands: by rows
   wp.launch(
-    _rows(initial),
+    _sparse_rows(initial),
     dim=(d.nworld, d.njmax),
-    inputs=[d.nefc, d.efc.type, d.efc.D, d.efc.frictionloss, d.efc.island, ctx.done, ctx.row_jaref],
-    outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.row_w, ctx.changed, ctx.state_changed],
+    inputs=[
+      d.nefc,
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.efc.J_colind,
+      d.efc.J,
+      d.efc.force,
+      d.efc.island,
+      slots,
+      ctx.tilebase,
+      ctx.ntile,
+      ctx.vbase,
+      ctx.done,
+      ctx.dof2row,
+      ctx.row_w,
+    ],
+    outputs=[ctx.frc, ctx.H],
   )
-  _update_h(m, d, ctx, iJ, initial)
+  if initial:
+    # dense rows have no constraint groups
+    wp.launch(
+      _JTDACJ_sparse(False, m.opt.cone, 3, True),
+      dim=(d.nworld, _jtdaj_groups_per_world(d.nworld, d.njmax), _JTDAJ_THREADS_PER_GROUP),
+      inputs=[
+        m.opt.impratio_invsqrt,
+        d.contact.friction,
+        d.contact.dim,
+        d.efc.id,
+        d.efc.jtdaj_adr,
+        d.efc.jtdaj_nrow,
+        d.efc.jtdaj_nblock,
+        d.efc.J_rownnz,
+        d.efc.J_rowadr,
+        d.efc.J_colind,
+        d.efc.J,
+        d.efc.D,
+        d.efc.state,
+        ctx.dof_poolrow,
+        ctx.dof_local,
+        ctx.row_jaref,
+        wp.zeros(d.nworld, dtype=bool),
+        _jtdaj_groups_per_world(d.nworld, d.njmax),
+      ],
+      outputs=[ctx.H],
+      block_dim=m.block_dim.update_gradient_JTDAJ_sparse,
+    )
 
 
-def _launch_grad(d: types.Data, ctx: IslandContext, iJ: wp.array3d, final: bool):
+def _launch_grad(d: types.Data, ctx: IslandContext, slots: wp.array2d, final: bool):
   nrow = ctx.qacc.shape[1]
   wp.launch(
     _grad(final),
     dim=(d.nworld, nrow),
     inputs=[
+      d.efc.J,
       d.efc.force,
       d.dof_island,
-      d.island_nefc,
-      d.island_iefcadr,
+      slots,
       ctx.row2dof,
       ctx.vbase,
-      iJ,
       ctx.done,
       ctx.niter,
       ctx.state_changed,
@@ -1074,10 +1243,10 @@ def _launch_grad(d: types.Data, ctx: IslandContext, iJ: wp.array3d, final: bool)
   )
 
 
-def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, iJ: wp.array3d):
+def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.array2d):
   nrow = ctx.qacc.shape[1]
   ctx.nsolving.zero_()
-  _launch_grad(d, ctx, iJ, final=False)
+  _launch_grad(d, ctx, slots, final=False)
 
   def dense_factor(ntile: int):
     wp.launch_tiled(
@@ -1123,6 +1292,10 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, iJ: wp.array3d
       m.opt.iterations,
       d.nisland,
       d.efc.type,
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.efc.J_colind,
+      d.efc.J,
       d.efc.D,
       d.efc.frictionloss,
       d.island_nv,
@@ -1135,7 +1308,8 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, iJ: wp.array3d
       ctx.qfrc_smooth,
       ctx.M,
       ctx.search.reshape((d.nworld, nrow)),
-      iJ,
+      slots,
+      ctx.dof2row,
       ctx.grad.reshape((d.nworld, nrow)),
       ctx.search_dot,
       ctx.newton_decrement,
@@ -1150,6 +1324,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, iJ: wp.array3d
       ctx.improvement,
       ctx.qacc,
       ctx.Ma,
+      ctx.frc,
       ctx.mv,
       ctx.row_jaref,
       ctx.row_jv,
@@ -1159,7 +1334,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, iJ: wp.array3d
     block_dim=_LINESEARCH_THREADS,
   )
   # constraint evaluation at the updated point, for the next iteration
-  _evaluate(m, d, ctx, iJ, initial=False)
+  _evaluate(m, d, ctx, slots, initial=False)
 
 
 def solve(m: types.Model, d: types.Data) -> IslandContext:
@@ -1167,7 +1342,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   # make_constraint found the islands and wrote the rows in island order
   ctx = _create_context(m, d)
   nrow = ctx.qacc.shape[1]
-  iJ = island.slot_buffers(m, d).J
+  slots = island.slot_buffers(m, d).island_slot
   d.solver_niter.zero_()
   wp.launch(_free_dofs, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, d.dof_island], outputs=[d.qacc, d.qfrc_constraint])
 
@@ -1212,7 +1387,19 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   wp.launch(
     _init_rows,
     dim=(d.nworld, d.njmax),
-    inputs=[d.nefc, d.efc.aref, d.efc.island, ctx.ntile, ctx.vbase, iJ, ctx.qacc],
+    inputs=[
+      d.nefc,
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.efc.J_colind,
+      d.efc.J,
+      d.efc.aref,
+      d.efc.island,
+      slots,
+      ctx.vbase,
+      ctx.dof2row,
+      ctx.qacc,
+    ],
     outputs=[ctx.row_jaref],
   )
   wp.launch_tiled(
@@ -1223,18 +1410,18 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     block_dim=_ISLAND_THREADS,
   )
   # initial constraint evaluation; H = M + J'DJ over the quadratic rows
-  _evaluate(m, d, ctx, iJ, initial=True)
+  _evaluate(m, d, ctx, slots, initial=True)
 
   # each body ends with ctx.nsolving = the number of islands still iterating
   if m.opt.graph_conditional:
-    wp.capture_while(ctx.nsolving, while_body=_iteration, m=m, d=d, ctx=ctx, iJ=iJ)
+    wp.capture_while(ctx.nsolving, while_body=_iteration, m=m, d=d, ctx=ctx, slots=slots)
   else:
     # the last pass only marks islands at the iteration limit as done
     for _ in range(m.opt.iterations + 1):
-      _iteration(m, d, ctx, iJ)
+      _iteration(m, d, ctx, slots)
 
   # J'force at the solution (stable iterations skip it), then scatter back
-  _launch_grad(d, ctx, iJ, final=True)
+  _launch_grad(d, ctx, slots, final=True)
   wp.launch(_scatter_dofs, dim=(d.nworld, nrow), inputs=[ctx.row2dof, ctx.qacc, ctx.frc], outputs=[d.qacc, d.qfrc_constraint])
   support.mul_m(m, d, d.efc.Ma, d.qacc)
   return ctx
