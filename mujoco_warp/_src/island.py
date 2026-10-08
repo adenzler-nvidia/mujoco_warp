@@ -969,12 +969,10 @@ ROW_FRICTION = 1
 ROW_LIMIT = 2
 ROW_CONTACT = 3
 
-# Islands of up to SLOT_NV DOFs and SLOT_NEFC rows are solved by the dense world solver, one world
-# per slot (slot = world * ntree + island); their rows are also written there as dense rows with
-# island-local columns.
-SLOT_NV = 32
-SLOT_NEFC = 64
-NO_SLOT = -(1 << 30)
+# Islands that fit a slot class (DOFs, rows) are solved by the dense world solver, one world per
+# slot; their rows are written only there, as dense rows with island-local columns. The island
+# Newton solver takes the others.
+SLOT_CLASSES = ((8, 16), (16, 32), (32, 64))
 _slots = [True]
 
 
@@ -989,11 +987,6 @@ def no_slots():
 
 
 @wp.func
-def in_slot(ndof: int, nrow: int) -> bool:
-  return ndof > 0 and ndof <= SLOT_NV and nrow <= SLOT_NEFC
-
-
-@wp.func
 def rows_slot(
   # Data in:
   tree_island_in: wp.array2d[int],
@@ -1001,29 +994,29 @@ def rows_slot(
   worldid: int,
   tree: int,
   efcid: int,
-  island_slotrow_in: wp.array2d[int],
-) -> int:
-  """Slot row of a constraint's first row, or -1 if its island is not in a slot."""
+  island_slot_in: wp.array2d[wp.vec2i],
+) -> wp.vec2i:
+  """Slot address and width of a constraint's first row; width 0 if its island is not in a slot."""
   if tree < 0:
-    return -1
-  base = island_slotrow_in[worldid, tree_island_in[worldid, tree]]
-  if base == NO_SLOT:
-    return -1
-  return base + efcid
+    return wp.vec2i(-1, 0)
+  slot = island_slot_in[worldid, tree_island_in[worldid, tree]]
+  if slot[1] == 0:
+    return wp.vec2i(-1, 0)
+  return wp.vec2i(slot[0] + efcid * slot[1], slot[1])
 
 
 @wp.func
 def slot_zero(
   # In:
   srow: int,
+  snv: int,
   nrow: int,
   # Out:
-  slot_J_out: wp.array2d[float],
+  slot_J_out: wp.array[float],
 ):
   if srow >= 0:
-    for r in range(nrow):
-      for c in range(SLOT_NV):
-        slot_J_out[srow + r, c] = 0.0
+    for k in range(nrow * snv):
+      slot_J_out[srow + k] = 0.0
 
 
 @wp.func
@@ -1031,41 +1024,70 @@ def slot_set(
   # In:
   worldid: int,
   srow: int,
+  snv: int,
   k: int,
   dofid: int,
   value: float,
   dof_slotcol_in: wp.array2d[int],
   # Out:
-  slot_J_out: wp.array2d[float],
+  slot_J_out: wp.array[float],
 ):
-  """Value of row srow + k at a DOF's slot column (srow < 0: not in a slot)."""
+  """Value of row k past a slot row at a DOF's column (srow < 0: not in a slot)."""
   if srow >= 0:
-    slot_J_out[srow + k, dof_slotcol_in[worldid, dofid]] = value
+    slot_J_out[srow + k * snv + dof_slotcol_in[worldid, dofid]] = value
+
+
+def _slot_class_info(m: types.Model, nworld: int):
+  """Capacity, J offset and slot offset per class."""
+  info = []
+  joff = soff = 0
+  lo = 1
+  for nv, nefc in SLOT_CLASSES:
+    # a world has at most nv(world) // lo islands of at least lo DOFs
+    cap = nworld * max(1, min(m.ntree, m.nv // lo))
+    info.append((nv, nefc, cap, joff, soff))
+    joff += cap * nefc * nv
+    soff += cap
+    lo = nv + 1
+  return info, joff, soff
 
 
 @wp.kernel
 def _island_slots(
-  # Model:
-  ntree: int,
   # Data in:
   nisland_in: wp.array[int],
-  island_idofadr_in: wp.array2d[int],
   island_nv_in: wp.array2d[int],
   island_nefc_in: wp.array2d[int],
   island_iefcadr_in: wp.array2d[int],
   # In:
   use_slots: bool,
+  class_in: wp.array2d[int],
   # Out:
-  island_slotrow_out: wp.array2d[int],
+  island_slot_out: wp.array2d[wp.vec2i],
+  slot_count_out: wp.array[int],
+  slot_world_out: wp.array[int],
+  slot_island_out: wp.array[int],
 ):
-  """Slot row base (slot row = base + efcid) of islands solved in slots."""
+  """Slot of each island in the smallest class it fits (address base, width), compacted.
+
+  class_in rows: DOFs, rows, capacity, J offset, slot offset.
+  """
   worldid, islandid = wp.tid()
-  base = int(NO_SLOT)
-  if (
-    use_slots and islandid < nisland_in[worldid] and in_slot(island_nv_in[worldid, islandid], island_nefc_in[worldid, islandid])
-  ):
-    base = (worldid * ntree + islandid) * SLOT_NEFC - island_iefcadr_in[worldid, islandid]
-  island_slotrow_out[worldid, islandid] = base
+  out = wp.vec2i(0, 0)
+  if use_slots and islandid < nisland_in[worldid]:
+    ndof = island_nv_in[worldid, islandid]
+    nrow = island_nefc_in[worldid, islandid]
+    for c in range(class_in.shape[0]):
+      cnv = class_in[c, 0]
+      if ndof <= cnv and nrow <= class_in[c, 1]:
+        slot = wp.atomic_add(slot_count_out, c, 1)
+        if slot < class_in[c, 2]:
+          base = class_in[c, 3] + slot * class_in[c, 1] * cnv
+          out = wp.vec2i(base - island_iefcadr_in[worldid, islandid] * cnv, cnv)
+          slot_world_out[class_in[c, 4] + slot] = worldid
+          slot_island_out[class_in[c, 4] + slot] = islandid
+        break
+  island_slot_out[worldid, islandid] = out
 
 
 @wp.kernel
@@ -1089,11 +1111,15 @@ class SlotBuffers:
   """Slot arrays shared by make_constraint (rows) and the island solve."""
 
   def __init__(self, m: types.Model, d: types.Data):
-    ns = d.nworld * m.ntree
     self.key = (d.nworld, m.ntree, m.nv)
-    self.island_slotrow = wp.empty((d.nworld, m.ntree), dtype=int)
+    self.classes, nJ, nslot = _slot_class_info(m, d.nworld)
+    self.island_slot = wp.empty((d.nworld, m.ntree), dtype=wp.vec2i)
     self.dof_slotcol = wp.empty((d.nworld, m.nv), dtype=int)
-    self.J = wp.zeros((ns * SLOT_NEFC, SLOT_NV), dtype=float)
+    self.J = wp.zeros(nJ, dtype=float)
+    self.count = wp.zeros(len(SLOT_CLASSES), dtype=int)
+    self.world = wp.empty(nslot, dtype=int)
+    self.island = wp.empty(nslot, dtype=int)
+    self.class_info = wp.array(self.classes, dtype=int)
 
 
 def slot_buffers(m: types.Model, d: types.Data) -> SlotBuffers:
@@ -1108,11 +1134,12 @@ def assign_slots(m: types.Model, d: types.Data) -> SlotBuffers:
   """Island DOF maps and slots, from the row layout, before the rows are written."""
   island_dofs(m, d)
   buf = slot_buffers(m, d)
+  buf.count.zero_()
   wp.launch(
     _island_slots,
     dim=(d.nworld, m.ntree),
-    inputs=[m.ntree, d.nisland, d.island_idofadr, d.island_nv, d.island_nefc, d.island_iefcadr, _slots[0]],
-    outputs=[buf.island_slotrow],
+    inputs=[d.nisland, d.island_nv, d.island_nefc, d.island_iefcadr, _slots[0], buf.class_info],
+    outputs=[buf.island_slot, buf.count, buf.world, buf.island],
   )
   wp.launch(
     _dof_slotcol, dim=(d.nworld, m.nv), inputs=[d.dof_island, d.island_idofadr, d.map_dof2idof], outputs=[buf.dof_slotcol]

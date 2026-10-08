@@ -2339,6 +2339,19 @@ def put_data(
   return d
 
 
+def _island_slot_rows(efc_J: np.ndarray, d: types.Data, slots, worldid: int):
+  """Fill the rows of islands solved in slots (island_slot: J address base, width)."""
+  island_slot, slot_J = slots.island_slot.numpy()[worldid], slots.J.numpy()
+  island_nv, island_nefc = d.island_nv.numpy()[worldid], d.island_nefc.numpy()[worldid]
+  idofadr, iefcadr = d.island_idofadr.numpy()[worldid], d.island_iefcadr.numpy()[worldid]
+  idof2dof = d.map_idof2dof.numpy()[worldid]
+  for i in np.nonzero(island_slot[:, 1])[0]:
+    base, width = island_slot[i]
+    r0, r1, n = iefcadr[i], iefcadr[i] + island_nefc[i], island_nv[i]
+    rows = slot_J[base + r0 * width : base + r1 * width].reshape(r1 - r0, width)
+    efc_J[r0:r1, idof2dof[idofadr[i] : idofadr[i] + n]] = rows[:, :n]
+
+
 def get_data_into(
   result: mujoco.MjData,
   mjm: mujoco.MjModel,
@@ -2536,18 +2549,7 @@ def get_data_into(
       # islands solved in slots keep their rows only there, dense with island-local columns
       slots = d.__dict__.get("_island_slots")
       if slots is not None:
-        from mujoco_warp._src import island  # noqa: PLC0415
-
-        slotrow = slots.island_slotrow.numpy()[world_id]
-        slot_J = slots.J.numpy()
-        idofadr, iefcadr = d.island_idofadr.numpy()[world_id], d.island_iefcadr.numpy()[world_id]
-        island_nv, island_nefc = d.island_nv.numpy()[world_id], d.island_nefc.numpy()[world_id]
-        idof2dof = d.map_idof2dof.numpy()[world_id]
-        for i in np.nonzero(slotrow != island.NO_SLOT)[0]:
-          rows = slice(iefcadr[i], iefcadr[i] + island_nefc[i])
-          efc_J[rows, idof2dof[idofadr[i] : idofadr[i] + island_nv[i]]] = slot_J[
-            slotrow[i] + rows.start : slotrow[i] + rows.stop, : island_nv[i]
-          ]
+        _island_slot_rows(efc_J, d, slots, world_id)
     else:
       efc_J = d.efc.J.numpy()[world_id, :nefc, : mjm.nv]
 

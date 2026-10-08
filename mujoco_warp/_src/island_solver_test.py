@@ -22,6 +22,7 @@ import mujoco_warp as mjw
 from mujoco_warp import ConeType
 from mujoco_warp import SolverType
 from mujoco_warp import test_data
+from mujoco_warp._src import io
 from mujoco_warp._src import island
 from mujoco_warp._src import island_solver
 
@@ -83,13 +84,7 @@ def _dense_J(d):
     out[r, colind[rowadr[r] : rowadr[r] + rownnz[r]]] = J[rowadr[r] : rowadr[r] + rownnz[r]]
   slots = d.__dict__.get("_island_slots")
   if slots is not None:
-    slotrow, slot_J = slots.island_slotrow.numpy()[0], slots.J.numpy()
-    island_nv, island_nefc = d.island_nv.numpy()[0], d.island_nefc.numpy()[0]
-    idofadr, iefcadr = d.island_idofadr.numpy()[0], d.island_iefcadr.numpy()[0]
-    idof2dof = d.map_idof2dof.numpy()[0]
-    for i in np.nonzero(slotrow != island.NO_SLOT)[0]:
-      r0, r1, n = iefcadr[i], iefcadr[i] + island_nefc[i], island_nv[i]
-      out[r0:r1, idof2dof[idofadr[i] : idofadr[i] + n]] = slot_J[slotrow[i] + r0 : slotrow[i] + r1, :n]
+    io._island_slot_rows(out, d, slots, 0)
   return out
 
 
@@ -174,6 +169,7 @@ class IslandSolverTest(absltest.TestCase):
     rows_fixture = test_data.fixture(
       xml=_ROWS_XML, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
     )
+    widths = set()
     for _, _, m, d in (rows_fixture, _fixture()):
       m.opt.island_solve = True
 
@@ -192,15 +188,18 @@ class IslandSolverTest(absltest.TestCase):
       mjw.make_constraint(m, d)
       np.testing.assert_allclose(rows(), expect, atol=1e-6)
 
-      slotrow, slot_J = slots.island_slotrow.numpy()[0], slots.J.numpy()
+      island_slot, slot_J = slots.island_slot.numpy()[0], slots.J.numpy()
       nv, nefc, iefcadr = d.island_nv.numpy()[0], d.island_nefc.numpy()[0], d.island_iefcadr.numpy()[0]
       rownnz = d.efc.J_rownnz.numpy()[0]
-      in_slot = np.nonzero(slotrow != island.NO_SLOT)[0]
-      self.assertGreater(len(in_slot), 1)
-      for i in in_slot:
+      widths.update(island_slot[: d.nisland.numpy()[0], 1])
+      for i in np.nonzero(island_slot[:, 1])[0]:
+        base, width = island_slot[i]
         r0, r1 = iefcadr[i], iefcadr[i] + nefc[i]
         np.testing.assert_array_equal(rownnz[r0:r1], 0)
-        np.testing.assert_array_equal(slot_J[slotrow[i] + r0 : slotrow[i] + r1, nv[i] :], 0.0)
+        rows = slot_J[base + r0 * width : base + r1 * width].reshape(nefc[i], width)
+        np.testing.assert_array_equal(rows[:, nv[i] :], 0.0)
+    # every class is used, and some islands are left to the island solver
+    self.assertEqual(sorted(widths), [0, 8, 16, 32])
 
   def test_solve(self):
     """The island solve reaches MuJoCo's solution, with and without slots for small islands."""
