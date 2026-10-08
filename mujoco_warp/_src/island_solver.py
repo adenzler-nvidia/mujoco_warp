@@ -109,8 +109,9 @@ class IslandContext:
   # the world solver's stable-state fast path
   state_changed: wp.array2d[bool]
   grad_scale: wp.array2d[float]
-  # per size class (one tile per side, two, more): 1 if any island has it
-  classes: wp.array[int]
+  # compacted lists of (world * ntree + group): all groups, then those of 1, 2 and >= 3 tiles
+  group_count: wp.array[int]
+  group_list: wp.array2d[int]
   nsolving: wp.array[int]
 
 
@@ -148,14 +149,6 @@ def _ntile(ndof: int) -> int:
 
 
 @wp.func
-def _in_class(ntile: int, sizeclass: int) -> int:
-  """Size class 0: one tile per side, 1: two (both factored as one tile), 2: more (blocked)."""
-  if ntile == 0:
-    return 0
-  return wp.where(wp.min(ntile, 3) - 1 == sizeclass, 1, 0)
-
-
-@wp.func
 def _block_adr(block: wp.vec4i, r: int, c: int) -> int:
   """Address of entry (row r, island column c) of an island's dense block (see island.rows_slot)."""
   return block[1] + ((c // 16) * block[2] + r) * 16 + c % 16
@@ -182,20 +175,37 @@ def _layout(ntree: int):
     ntile_out: wp.array2d[int],
     vbase_out: wp.array2d[int],
     pairbase_out: wp.array2d[int],
-    classes_out: wp.array[int],
   ):
     """Per island: tiles per side, first pool tile, first aligned DOF row and first tile pair."""
     worldid = wp.tid()
     ntile = wp.tile_map(_ntile, wp.tile_load(island_nv_in[worldid], shape=ntree))
-    for c in range(3):
-      if wp.tile_reduce(wp.add, wp.tile_map(_in_class, ntile, wp.tile_full(shape=ntree, value=c, dtype=int)))[0] > 0:
-        classes_out[c] = 1
     wp.tile_store(ntile_out[worldid], ntile)
     wp.tile_store(tilebase_out[worldid], wp.tile_scan_exclusive(wp.tile_map(wp.mul, ntile, ntile)))
     wp.tile_store(vbase_out[worldid], wp.tile_scan_exclusive(ntile) * _TILE)
     wp.tile_store(pairbase_out[worldid], wp.tile_scan_exclusive(wp.tile_map(_npair, ntile)))
 
   return kernel
+
+
+@wp.kernel
+def _group_lists(
+  # Model:
+  ntree: int,
+  # In:
+  ngroup_in: wp.array[int],
+  ntile_in: wp.array2d[int],
+  # Out:
+  group_count_out: wp.array[int],
+  group_list_out: wp.array2d[int],
+):
+  """Compacted lists of the groups that exist: all, and by tiles per side (1, 2, >= 3)."""
+  worldid, g = wp.tid()
+  if g >= ngroup_in[worldid]:
+    return
+  packed = worldid * ntree + g
+  group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed
+  c = wp.min(ntile_in[worldid, g], 3)
+  group_list_out[c, wp.atomic_add(group_count_out, c, 1)] = packed
 
 
 @wp.kernel
@@ -309,10 +319,16 @@ def _sync():
 
 @wp.kernel
 def _init_islands(
+  # Model:
+  ntree: int,
   # Data in:
   nisland_in: wp.array[int],
   island_nv_in: wp.array2d[int],
   # In:
+  group_count_in: wp.array[int],
+  group_list_in: wp.array2d[int],
+  cls: int,
+  nblock: int,
   tilebase_in: wp.array2d[int],
   ntile_in: wp.array2d[int],
   vbase_in: wp.array2d[int],
@@ -329,31 +345,34 @@ def _init_islands(
   nsolving_out: wp.array[int],
 ):
   """Start every island: M qacc, H = M, and its convergence scale (the inertia trace)."""
-  worldid, islandid, lane = wp.tid()
-  if islandid >= nisland_in[worldid]:
+  bid, lane = wp.tid()
+  for e in range(bid, group_count_in[cls], nblock):
+    worldid = group_list_in[cls, e] // ntree
+    islandid = group_list_in[cls, e] % ntree
+    if islandid >= nisland_in[worldid]:
+      if lane == 0:
+        done_out[worldid, islandid] = True
+      continue
+    nthread = wp.block_dim()
+    ndof = island_nv_in[worldid, islandid]
+    tilebase = tilebase_in[worldid, islandid]
+    ntile = ntile_in[worldid, islandid]
+    vbase = vbase_in[worldid, islandid]
+    trace = float(0.0)
+    for la in range(lane, ndof, nthread):
+      Ma_out[worldid, vbase + la] = _block_matvec(iM_in[worldid], tilebase, ntile, vbase, ndof, iqacc_in[worldid], la)
+      rc = _pool_rc(tilebase, ntile, la, la)
+      trace += iM_in[worldid, rc[0], rc[1]]
+    _copy_upper_tiles(lane, nthread, tilebase, ntile, iM_in[worldid], H_out[worldid])
+    # MuJoCo scales an island's convergence tests by its inertia trace instead of meaninertia * nv
+    trace = wp.tile_reduce(wp.add, wp.tile(trace))[0]
     if lane == 0:
-      done_out[worldid, islandid] = True
-    return
-  nthread = wp.block_dim()
-  ndof = island_nv_in[worldid, islandid]
-  tilebase = tilebase_in[worldid, islandid]
-  ntile = ntile_in[worldid, islandid]
-  vbase = vbase_in[worldid, islandid]
-  trace = float(0.0)
-  for la in range(lane, ndof, nthread):
-    Ma_out[worldid, vbase + la] = _block_matvec(iM_in[worldid], tilebase, ntile, vbase, ndof, iqacc_in[worldid], la)
-    rc = _pool_rc(tilebase, ntile, la, la)
-    trace += iM_in[worldid, rc[0], rc[1]]
-  _copy_upper_tiles(lane, nthread, tilebase, ntile, iM_in[worldid], H_out[worldid])
-  # MuJoCo scales an island's convergence tests by its inertia trace instead of meaninertia * nv
-  trace = wp.tile_reduce(wp.add, wp.tile(trace))[0]
-  if lane == 0:
-    scale_out[worldid, islandid] = trace
-    done_out[worldid, islandid] = False
-    niter_out[worldid, islandid] = 0
-    alpha_out[worldid, islandid] = 0.0
-    improvement_out[worldid, islandid] = 0.0
-    wp.atomic_add(nsolving_out, 0, 1)
+      scale_out[worldid, islandid] = trace
+      done_out[worldid, islandid] = False
+      niter_out[worldid, islandid] = 0
+      alpha_out[worldid, islandid] = 0.0
+      improvement_out[worldid, islandid] = 0.0
+      wp.atomic_add(nsolving_out, 0, 1)
 
 
 @cache_kernel
@@ -495,46 +514,33 @@ def _jtdj(initial: bool):
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
+    # Model:
+    ntree: int,
     # Data in:
-    nisland_in: wp.array[int],
     island_nefc_in: wp.array2d[int],
     island_iefcadr_in: wp.array2d[int],
     # In:
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
-    pairbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
     changed_in: wp.array2d[bool],
     island_slot_in: wp.array2d[wp.vec4i],
     J16_in: wp.array3d[float],
     row_w_in: wp.array2d[float],
+    group_count_in: wp.array[int],
+    group_list_in: wp.array2d[int],
     nblock: int,
     # Out:
     H_out: wp.array3d[float],
   ):
-    """H tile (bi, bj) of an island += sum over its rows of w J[:, bi]' J[:, bj] (block per pair).
+    """H tiles (bi, bj) of a group += sum over its rows of w J[:, bi]' J[:, bj].
 
-    Pairs are numbered per world in island order; nblock blocks per world stride over them and each
-    pair's tile is written by one block.
+    nblock blocks stride over the groups; a group's tiles are written by one block.
     """
-    worldid, bid, lane = wp.tid()
-    nisland = nisland_in[worldid]
-    if nisland == 0:
-      return
-    last = nisland - 1
-    npair = pairbase_in[worldid, last] + _npair(ntile_in[worldid, last])
-    # blocks stride over the world's pairs
-    for pair in range(bid, npair, nblock):
-      # the island of this pair: the last one whose first pair is at or before it
-      lo = int(0)
-      hi = last
-      while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if pairbase_in[worldid, mid] <= pair:
-          lo = mid
-        else:
-          hi = mid - 1
-      islandid = lo
+    bid, lane = wp.tid()
+    for e in range(bid, group_count_in[0], nblock):
+      worldid = group_list_in[0, e] // ntree
+      islandid = group_list_in[0, e] % ntree
       block = island_slot_in[worldid, islandid]
       if block[0] == 0 or done_in[worldid, islandid]:
         continue
@@ -542,40 +548,43 @@ def _jtdj(initial: bool):
         if not changed_in[worldid, islandid]:
           continue
       ntile = ntile_in[worldid, islandid]
-      bi = int(0)
-      rem = pair - pairbase_in[worldid, islandid]
-      while rem >= ntile - bi:
-        rem -= ntile - bi
-        bi += 1
-      bj = bi + rem
-      nrow = island_nefc_in[worldid, islandid]
-      rowadr = island_iefcadr_in[worldid, islandid]
-      acc = wp.tile_zeros(shape=(_TILE, _TILE), dtype=float)
-      for r in range(0, nrow, _TILE):
-        w = wp.tile_load(row_w_in[worldid], shape=_TILE, offset=rowadr + r, bounds_check=True)
-        # rows past the island's are the next island's
-        active = wp.tile_map(_active_check, wp.tile_arange(_TILE, dtype=int), wp.tile_ones(shape=_TILE, dtype=int) * (nrow - r))
-        w = wp.tile_map(wp.mul, active, w)
-        if wp.static(not INITIAL):
-          # updates touch only the rows that flipped
-          if wp.tile_reduce(wp.add, wp.tile_map(wp.abs, w))[0] == 0.0:
-            continue
-        # tile (r, b) of the block: 16 rows of 16 values from row base / 16 + b * nrow + r
-        Ja = wp.tile_load(
-          J16_in[worldid], shape=(_TILE, _TILE), offset=(block[1] // _TILE + bi * nrow + r, 0), bounds_check=True
-        )
-        Jb = wp.tile_load(
-          J16_in[worldid], shape=(_TILE, _TILE), offset=(block[1] // _TILE + bj * nrow + r, 0), bounds_check=True
-        )
-        # rows past the block are other data, possibly uninitialized: select, not multiply
-        rows = wp.tile_broadcast(wp.tile_reshape(active, shape=(_TILE, 1)), shape=(_TILE, _TILE))
-        Ja = wp.tile_map(_select, rows, Ja)
-        Jb = wp.tile_map(_select, rows, Jb)
-        JaTw = wp.tile_map(wp.mul, wp.tile_transpose(Ja), wp.tile_broadcast(w, shape=(_TILE, _TILE)))
-        acc += wp.tile_matmul(JaTw, Jb)
-      row0 = _TILE * (tilebase_in[worldid, islandid] + bi * ntile + bj)
-      H = wp.tile_load(H_out[worldid], shape=(_TILE, _TILE), offset=(row0, 0), bounds_check=False)
-      wp.tile_store(H_out[worldid], H + acc, offset=(row0, 0), bounds_check=False)
+      for pair in range(_npair(ntile)):
+        bi = int(0)
+        rem = pair
+        while rem >= ntile - bi:
+          rem -= ntile - bi
+          bi += 1
+        bj = bi + rem
+        nrow = island_nefc_in[worldid, islandid]
+        rowadr = island_iefcadr_in[worldid, islandid]
+        acc = wp.tile_zeros(shape=(_TILE, _TILE), dtype=float)
+        for r in range(0, nrow, _TILE):
+          w = wp.tile_load(row_w_in[worldid], shape=_TILE, offset=rowadr + r, bounds_check=True)
+          # rows past the island's are the next island's
+          active = wp.tile_map(
+            _active_check, wp.tile_arange(_TILE, dtype=int), wp.tile_ones(shape=_TILE, dtype=int) * (nrow - r)
+          )
+          w = wp.tile_map(wp.mul, active, w)
+          if wp.static(not INITIAL):
+            # updates touch only the rows that flipped
+            if wp.tile_reduce(wp.add, wp.tile_map(wp.abs, w))[0] == 0.0:
+              continue
+          # tile (r, b) of the block: 16 rows of 16 values from row base / 16 + b * nrow + r
+          Ja = wp.tile_load(
+            J16_in[worldid], shape=(_TILE, _TILE), offset=(block[1] // _TILE + bi * nrow + r, 0), bounds_check=True
+          )
+          Jb = wp.tile_load(
+            J16_in[worldid], shape=(_TILE, _TILE), offset=(block[1] // _TILE + bj * nrow + r, 0), bounds_check=True
+          )
+          # rows past the block are other data, possibly uninitialized: select, not multiply
+          rows = wp.tile_broadcast(wp.tile_reshape(active, shape=(_TILE, 1)), shape=(_TILE, _TILE))
+          Ja = wp.tile_map(_select, rows, Ja)
+          Jb = wp.tile_map(_select, rows, Jb)
+          JaTw = wp.tile_map(wp.mul, wp.tile_transpose(Ja), wp.tile_broadcast(w, shape=(_TILE, _TILE)))
+          acc += wp.tile_matmul(JaTw, Jb)
+        row0 = _TILE * (tilebase_in[worldid, islandid] + bi * ntile + bj)
+        H = wp.tile_load(H_out[worldid], shape=(_TILE, _TILE), offset=(row0, 0), bounds_check=False)
+        wp.tile_store(H_out[worldid], H + acc, offset=(row0, 0), bounds_check=False)
 
   return kernel
 
@@ -644,9 +653,15 @@ def _factor(max_size: int):
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
+    # Model:
+    ntree: int,
     # Data in:
     nisland_in: wp.array[int],
     # In:
+    group_count_in: wp.array[int],
+    group_list_in: wp.array2d[int],
+    cls: int,
+    nblock: int,
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
@@ -664,28 +679,35 @@ def _factor(max_size: int):
     grad_scale_out: wp.array2d[float],
   ):
     """Newton search direction of an island over two tiles per side (blocked Cholesky)."""
-    worldid, islandid, lane = wp.tid()
-    if islandid >= nisland_in[worldid]:
-      return
-    if done_in[worldid, islandid]:
-      return
-    ntile = ntile_in[worldid, islandid]
-    if ntile <= 2:
-      return
-    if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
-      return
-    vbase = vbase_in[worldid, islandid]
-    tilebase = tilebase_in[worldid, islandid]
-    if changed_out[worldid, islandid] or niter_in[worldid, islandid] == 0:
-      sums = wp.static(factorize)(H_in[worldid], grad_in[worldid], tilebase, ntile, vbase, U_out[worldid], search_out[worldid])
-    else:
-      sums = wp.static(solve_only)(H_in[worldid], grad_in[worldid], tilebase, ntile, vbase, U_out[worldid], search_out[worldid])
-    _sync()  # every thread has read the flag
-    if lane == 0:
-      changed_out[worldid, islandid] = False
-      search_dot_out[worldid, islandid] = sums[0]
-      newton_decrement_out[worldid, islandid] = sums[1]
-      grad_scale_out[worldid, islandid] = 1.0
+    bid, lane = wp.tid()
+    for e in range(bid, group_count_in[cls], nblock):
+      worldid = group_list_in[cls, e] // ntree
+      islandid = group_list_in[cls, e] % ntree
+      if islandid >= nisland_in[worldid]:
+        continue
+      if done_in[worldid, islandid]:
+        continue
+      ntile = ntile_in[worldid, islandid]
+      if ntile <= 2:
+        continue
+      if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
+        continue
+      vbase = vbase_in[worldid, islandid]
+      tilebase = tilebase_in[worldid, islandid]
+      if changed_out[worldid, islandid] or niter_in[worldid, islandid] == 0:
+        sums = wp.static(factorize)(
+          H_in[worldid], grad_in[worldid], tilebase, ntile, vbase, U_out[worldid], search_out[worldid]
+        )
+      else:
+        sums = wp.static(solve_only)(
+          H_in[worldid], grad_in[worldid], tilebase, ntile, vbase, U_out[worldid], search_out[worldid]
+        )
+      _sync()  # every thread has read the flag
+      if lane == 0:
+        changed_out[worldid, islandid] = False
+        search_dot_out[worldid, islandid] = sums[0]
+        newton_decrement_out[worldid, islandid] = sums[1]
+        grad_scale_out[worldid, islandid] = 1.0
 
   return kernel
 
@@ -696,9 +718,15 @@ def _dense_factor(ntile: int):
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
+    # Model:
+    ntree: int,
     # Data in:
     nisland_in: wp.array[int],
     # In:
+    group_count_in: wp.array[int],
+    group_list_in: wp.array2d[int],
+    cls: int,
+    nblock: int,
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
@@ -718,32 +746,37 @@ def _dense_factor(ntile: int):
     As _update_gradient_cholesky for a world: the island's H (the pool's upper tiles) is factored
     in shared memory every iteration.
     """
-    worldid, islandid, lane = wp.tid()
-    if islandid >= nisland_in[worldid]:
-      return
-    if done_in[worldid, islandid]:
-      return
-    if ntile_in[worldid, islandid] != wp.static(ntile):
-      return
-    if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
-      return
-    vbase = vbase_in[worldid, islandid]
-    row0 = _TILE * tilebase_in[worldid, islandid]
-    # the block's upper tiles (0, 0), (0, 1), (1, 1); the factorization reads no others
-    U = wp.tile_zeros(shape=(N, N), dtype=float, storage="shared")
-    wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0, 0)), offset=(0, 0))
-    if wp.static(ntile == 2):
-      wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
-      wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
-    wp.tile_cholesky_inplace(U, fill_mode="upper")
-    b = wp.tile_load(grad_in[worldid], shape=N, offset=vbase)
-    x = wp.tile_cholesky_solve(U, b, fill_mode="upper")
-    wp.tile_store(search_out[worldid], wp.tile_map(wp.neg, x), offset=vbase)
-    sums = wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b, x))[0]
-    if lane == 0:
-      search_dot_out[worldid, islandid] = sums[0]
-      newton_decrement_out[worldid, islandid] = sums[1]
-      grad_scale_out[worldid, islandid] = 1.0
+    bid, lane = wp.tid()
+    for e in range(bid, group_count_in[cls], nblock):
+      worldid = group_list_in[cls, e] // ntree
+      islandid = group_list_in[cls, e] % ntree
+      if islandid >= nisland_in[worldid]:
+        continue
+      if done_in[worldid, islandid]:
+        continue
+      if ntile_in[worldid, islandid] != wp.static(ntile):
+        continue
+      if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
+        continue
+      vbase = vbase_in[worldid, islandid]
+      row0 = _TILE * tilebase_in[worldid, islandid]
+      # the block's upper tiles (0, 0), (0, 1), (1, 1); the factorization reads no others
+      U = wp.tile_zeros(shape=(N, N), dtype=float, storage="shared")
+      wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0, 0)), offset=(0, 0))
+      if wp.static(ntile == 2):
+        wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
+        wp.tile_assign(
+          U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE)
+        )
+      wp.tile_cholesky_inplace(U, fill_mode="upper")
+      b = wp.tile_load(grad_in[worldid], shape=N, offset=vbase)
+      x = wp.tile_cholesky_solve(U, b, fill_mode="upper")
+      wp.tile_store(search_out[worldid], wp.tile_map(wp.neg, x), offset=vbase)
+      sums = wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b, x))[0]
+      if lane == 0:
+        search_dot_out[worldid, islandid] = sums[0]
+        newton_decrement_out[worldid, islandid] = sums[1]
+        grad_scale_out[worldid, islandid] = 1.0
 
   return kernel
 
@@ -755,6 +788,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
+    ntree: int,
     opt_tolerance: wp.array[float],
     opt_ls_tolerance: wp.array[float],
     opt_iterations: int,
@@ -771,6 +805,10 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     island_nefc_in: wp.array2d[int],
     island_iefcadr_in: wp.array2d[int],
     # In:
+    group_count_in: wp.array[int],
+    group_list_in: wp.array2d[int],
+    cls: int,
+    nblock: int,
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
@@ -802,250 +840,253 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     grad_scale_out: wp.array2d[float],
   ):
     """Convergence test, linesearch and update of one island (see _linesearch_iterative_kernel)."""
-    worldid, islandid, lane = wp.tid()
-    if islandid >= nisland_in[worldid]:
-      return
-    if done_out[worldid, islandid]:
-      return
-    nthread = wp.block_dim()
-    ndof = island_nv_in[worldid, islandid]
-    nrow = island_nefc_in[worldid, islandid]
-    rowadr0 = island_iefcadr_in[worldid, islandid]
-    tilebase = tilebase_in[worldid, islandid]
-    ntile = ntile_in[worldid, islandid]
-    vbase = vbase_in[worldid, islandid]
-    scale = scale_in[worldid, islandid]
-    block = island_slot_in[worldid, islandid]
-    tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
-    ls_tolerance = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
-    niter = niter_out[worldid, islandid]
+    bid, lane = wp.tid()
+    for e in range(bid, group_count_in[cls], nblock):
+      worldid = group_list_in[cls, e] // ntree
+      islandid = group_list_in[cls, e] % ntree
+      if islandid >= nisland_in[worldid]:
+        continue
+      if done_out[worldid, islandid]:
+        continue
+      nthread = wp.block_dim()
+      ndof = island_nv_in[worldid, islandid]
+      nrow = island_nefc_in[worldid, islandid]
+      rowadr0 = island_iefcadr_in[worldid, islandid]
+      tilebase = tilebase_in[worldid, islandid]
+      ntile = ntile_in[worldid, islandid]
+      vbase = vbase_in[worldid, islandid]
+      scale = scale_in[worldid, islandid]
+      block = island_slot_in[worldid, islandid]
+      tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
+      ls_tolerance = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
+      niter = niter_out[worldid, islandid]
 
-    # --- termination (see _solve_done); the gradient is grad_scale * the stored one ---
-    stable = _stable(niter, state_changed_in[worldid, islandid])
-    grad_scale = grad_scale_out[worldid, islandid]
-    grad_dot = float(0.0)
-    for la in range(lane, ndof, nthread):
-      grad_dot += grad_in[worldid, vbase + la] * grad_in[worldid, vbase + la]
-    grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0] * grad_scale * grad_scale
-    converged = False
-    if niter > 0:
-      improvement = improvement_out[worldid, islandid]
-      converged = (
-        (alpha_out[worldid, islandid] == 0.0)
-        or (improvement > 0.0 and improvement / scale < tolerance)
-        or (wp.sqrt(grad_dot) / scale < tolerance)
-        or (0.5 * newton_decrement_in[worldid, islandid] * grad_scale * grad_scale / scale < tolerance)
-      )
-    if converged or niter >= opt_iterations:
+      # --- termination (see _solve_done); the gradient is grad_scale * the stored one ---
+      stable = _stable(niter, state_changed_in[worldid, islandid])
+      grad_scale = grad_scale_out[worldid, islandid]
+      grad_dot = float(0.0)
+      for la in range(lane, ndof, nthread):
+        grad_dot += grad_in[worldid, vbase + la] * grad_in[worldid, vbase + la]
+      grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0] * grad_scale * grad_scale
+      converged = False
+      if niter > 0:
+        improvement = improvement_out[worldid, islandid]
+        converged = (
+          (alpha_out[worldid, islandid] == 0.0)
+          or (improvement > 0.0 and improvement / scale < tolerance)
+          or (wp.sqrt(grad_dot) / scale < tolerance)
+          or (0.5 * newton_decrement_in[worldid, islandid] * grad_scale * grad_scale / scale < tolerance)
+        )
+      if converged or niter >= opt_iterations:
+        if lane == 0:
+          done_out[worldid, islandid] = True
+          if not converged and opt_iterations > 0:
+            if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
+              wp.printf(
+                "solver iterations limit reached - please increase iterations beyond %u\n"
+                "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)\n",
+                opt_iterations,
+              )
+            wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
+          wp.atomic_max(solver_niter_out, worldid, niter)
+        continue
+
+      # --- linesearch along search ---
+      search = search_in[worldid]
+      local_dof = wp.vec2(0.0)
+      for la in range(lane, ndof, nthread):
+        row = vbase + la
+        # an unchanged search direction keeps its M search and J search
+        mv = float(0.0)
+        if stable:
+          mv = mv_out[worldid, row]
+        else:
+          mv = _block_matvec(iM_in[worldid], tilebase, ntile, vbase, ndof, search, la)
+          mv_out[worldid, row] = mv
+        s = search[row]
+        local_dof += wp.vec2(s * (Ma_out[worldid, row] - iqfrc_smooth_in[worldid, row]), s * mv)
+      local_gauss = wp.vec2(0.0)
+      local_p0 = wp.vec3(0.0)
+      for r in range(lane, nrow, nthread):
+        row = rowadr0 + r
+        jv = float(0.0)
+        if stable:
+          jv = row_jv_out[worldid, row]
+        else:
+          if block[0] > 0:
+            for c in range(block[0]):
+              jv += efc_J_in[worldid, 0, _block_adr(block, r, c)] * search[vbase + c]
+          else:
+            rowadr = efc_J_rowadr_in[worldid, row]
+            for k in range(efc_J_rownnz_in[worldid, row]):
+              adr = rowadr + k
+              jv += efc_J_in[worldid, 0, adr] * search[dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
+          row_jv_out[worldid, row] = jv
+        category = _row_category(efc_type_in[worldid, row])
+        D = efc_D_in[worldid, row]
+        jaref = row_jaref_out[worldid, row]
+        if category == _ROW_EQUALITY:
+          jvD = jv * D
+          local_gauss += wp.vec2(jvD * jaref, 0.5 * jv * jvD)
+        else:
+          local_p0 += _row_eval_pt_alpha_zero(category, D, efc_frictionloss_in[worldid, row], jaref, jv)
+      dof_sums = wp.tile_reduce(wp.add, wp.tile(local_dof, preserve_type=True))[0]
+      gauss_rows = wp.tile_reduce(wp.add, wp.tile(local_gauss, preserve_type=True))[0]
+      p0_rows = wp.tile_reduce(wp.add, wp.tile(local_p0, preserve_type=True))[0]
+      _sync()  # jv of all rows is written
+
+      gauss1 = gauss_rows[0] + dof_sums[0]
+      gauss2 = gauss_rows[1] + 0.5 * dof_sums[1]
+      quad_gauss = wp.vec3(0.0, gauss1, gauss2)
+
+      gtol = wp.max(tolerance * ls_tolerance * wp.sqrt(search_dot_in[worldid, islandid]) * scale, 1e-6)
+      p0 = wp.vec3(0.0, gauss1, 2.0 * gauss2) + p0_rows
+      p0_delta = wp.vec3(0.0, p0[1], p0[2])
+      q1_abs = wp.sqrt(2.0 * wp.max(p0_rows[0], 0.0) * wp.max(p0_rows[2], 0.0)) + wp.abs(gauss1)
+      gtol_accept = wp.max(gtol, _ALPHA_NOISE_EPS * q1_abs)
+
+      lo_alpha_in = -wp.where(p0[2] != 0.0, p0[1] / p0[2], 0.0)
+      local_lo_in = wp.vec3(0.0)
+      for r in range(lane, nrow, nthread):
+        row = rowadr0 + r
+        category = _row_category(efc_type_in[worldid, row])
+        if category != _ROW_EQUALITY:
+          local_lo_in += _row_eval_pt(
+            category,
+            lo_alpha_in,
+            efc_D_in[worldid, row],
+            efc_frictionloss_in[worldid, row],
+            row_jaref_out[worldid, row],
+            row_jv_out[worldid, row],
+          )
+      lo_in = _eval_pt(quad_gauss, lo_alpha_in) + wp.tile_reduce(wp.add, wp.tile(local_lo_in, preserve_type=True))[0]
+
+      alpha = float(0.0)
+      improvement = float(0.0)
+      # a slope at alpha = 0 below rounding noise means the start is already the line minimum
+      stationary = wp.abs(p0[1]) < _ALPHA_NOISE_EPS * q1_abs
+      ls_converged = stationary or (wp.abs(lo_in[1]) < gtol_accept and lo_in[0] < 0.0)
+      if stationary:
+        pass
+      elif ls_converged:
+        alpha = lo_alpha_in
+        improvement = -lo_in[0]
+      else:
+        lo_less = lo_in[1] < p0[1]
+        lo = wp.where(lo_less, lo_in, p0_delta)
+        lo_alpha = wp.where(lo_less, lo_alpha_in, 0.0)
+        hi = wp.where(lo_less, p0_delta, lo_in)
+        hi_alpha = wp.where(lo_less, 0.0, lo_alpha_in)
+
+        for _ in range(LS_ITERATIONS):
+          lo_next_alpha = lo_alpha - wp.where(lo[2] != 0.0, lo[1] / lo[2], 0.0)
+          hi_next_alpha = hi_alpha - wp.where(hi[2] != 0.0, hi[1] / hi[2], 0.0)
+          mid_alpha = 0.5 * (lo_alpha + hi_alpha)
+
+          local_combined = wp.mat33(0.0)
+          for r in range(lane, nrow, nthread):
+            row = rowadr0 + r
+            category = _row_category(efc_type_in[worldid, row])
+            if category != _ROW_EQUALITY:
+              D = efc_D_in[worldid, row]
+              f = efc_frictionloss_in[worldid, row]
+              jaref = row_jaref_out[worldid, row]
+              jv = row_jv_out[worldid, row]
+              plo = _row_eval_pt(category, lo_next_alpha, D, f, jaref, jv)
+              phi = _row_eval_pt(category, hi_next_alpha, D, f, jaref, jv)
+              pmid = _row_eval_pt(category, mid_alpha, D, f, jaref, jv)
+              # columns: lo, hi, mid
+              local_combined += wp.mat33(plo[0], phi[0], pmid[0], plo[1], phi[1], pmid[1], plo[2], phi[2], pmid[2])
+          result = wp.tile_reduce(wp.add, wp.tile(local_combined, preserve_type=True))[0]
+          gauss_lo, gauss_hi, gauss_mid = _eval_pt_3alphas(quad_gauss, lo_next_alpha, hi_next_alpha, mid_alpha)
+          lo_next = gauss_lo + wp.vec3(result[0, 0], result[1, 0], result[2, 0])
+          hi_next = gauss_hi + wp.vec3(result[0, 1], result[1, 1], result[2, 1])
+          mid = gauss_mid + wp.vec3(result[0, 2], result[1, 2], result[2, 2])
+
+          conv_lo = wp.abs(lo_next[1]) < gtol_accept and lo_next[0] < 0.0
+          conv_hi = wp.abs(hi_next[1]) < gtol_accept and hi_next[0] < 0.0
+          conv_mid = wp.abs(mid[1]) < gtol_accept and mid[0] < 0.0
+          any_converged = conv_lo or conv_hi or conv_mid
+          swap_lo = False
+          swap_hi = False
+          if any_converged:
+            conv_pt = wp.vec3(types.MJ_MAXVAL, 0.0, 0.0)
+            conv_alpha = float(0.0)
+            if conv_lo and lo_next[0] < conv_pt[0]:
+              conv_pt = lo_next
+              conv_alpha = lo_next_alpha
+            if conv_hi and hi_next[0] < conv_pt[0]:
+              conv_pt = hi_next
+              conv_alpha = hi_next_alpha
+            if conv_mid and mid[0] < conv_pt[0]:
+              conv_pt = mid
+              conv_alpha = mid_alpha
+            lo = conv_pt
+            lo_alpha = conv_alpha
+            hi = conv_pt
+            hi_alpha = conv_alpha
+          else:
+            swap_lo_lo_next = _in_bracket(lo, lo_next)
+            lo = wp.where(swap_lo_lo_next, lo_next, lo)
+            lo_alpha = wp.where(swap_lo_lo_next, lo_next_alpha, lo_alpha)
+            swap_lo_mid = _in_bracket(lo, mid)
+            lo = wp.where(swap_lo_mid, mid, lo)
+            lo_alpha = wp.where(swap_lo_mid, mid_alpha, lo_alpha)
+            swap_lo_hi_next = _in_bracket(lo, hi_next)
+            lo = wp.where(swap_lo_hi_next, hi_next, lo)
+            lo_alpha = wp.where(swap_lo_hi_next, hi_next_alpha, lo_alpha)
+            swap_lo = swap_lo_lo_next or swap_lo_mid or swap_lo_hi_next
+
+            swap_hi_hi_next = _in_bracket(hi, hi_next) or (hi[1] < 0.0 and hi_next[1] > 0.0)
+            hi = wp.where(swap_hi_hi_next, hi_next, hi)
+            hi_alpha = wp.where(swap_hi_hi_next, hi_next_alpha, hi_alpha)
+            swap_hi_mid = _in_bracket(hi, mid)
+            hi = wp.where(swap_hi_mid, mid, hi)
+            hi_alpha = wp.where(swap_hi_mid, mid_alpha, hi_alpha)
+            swap_hi_lo_next = _in_bracket(hi, lo_next)
+            hi = wp.where(swap_hi_lo_next, lo_next, hi)
+            hi_alpha = wp.where(swap_hi_lo_next, lo_next_alpha, hi_alpha)
+            swap_hi = swap_hi_hi_next or swap_hi_mid or swap_hi_lo_next
+
+          ls_done = (
+            any_converged
+            or (not swap_lo and not swap_hi)
+            or (lo[0] < 0.0 and lo[1] < 0.0 and lo[1] > -gtol)
+            or (hi[0] < 0.0 and hi[1] > 0.0 and hi[1] < gtol)
+          )
+          improved = lo[0] < 0.0 or hi[0] < 0.0
+          lo_better = lo[0] < hi[0]
+          alpha = wp.where(improved, wp.where(lo_better, lo_alpha, hi_alpha), alpha)
+          improvement = wp.where(improved, -wp.where(lo_better, lo[0], hi[0]), improvement)
+          if ls_done:
+            ls_converged = True
+            break
+
+      if not ls_converged and lane == 0:
+        if wp.static(bool(warn_overflow & OverflowType.LS_ITERATIONS)):
+          wp.printf(
+            "linesearch iterations limit reached - please increase ls_iterations beyond %u\n"
+            "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.LS_ITERATIONS (or = 0 for all)\n",
+            wp.static(LS_ITERATIONS),
+          )
+        wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.LS_ITERATIONS))
+
+      # --- update; sparse islands' J'force is accumulated again at the new point ---
+      for la in range(lane, ndof, nthread):
+        row = vbase + la
+        iqacc_out[worldid, row] += alpha * search[row]
+        Ma_out[worldid, row] += alpha * mv_out[worldid, row]
+        if block[0] == 0:
+          frc_out[worldid, row] = 0.0
+      for r in range(lane, nrow, nthread):
+        row = rowadr0 + r
+        row_jaref_out[worldid, row] += alpha * row_jv_out[worldid, row]
       if lane == 0:
-        done_out[worldid, islandid] = True
-        if not converged and opt_iterations > 0:
-          if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
-            wp.printf(
-              "solver iterations limit reached - please increase iterations beyond %u\n"
-              "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)\n",
-              opt_iterations,
-            )
-          wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
-        wp.atomic_max(solver_niter_out, worldid, niter)
-      return
-
-    # --- linesearch along search ---
-    search = search_in[worldid]
-    local_dof = wp.vec2(0.0)
-    for la in range(lane, ndof, nthread):
-      row = vbase + la
-      # an unchanged search direction keeps its M search and J search
-      mv = float(0.0)
-      if stable:
-        mv = mv_out[worldid, row]
-      else:
-        mv = _block_matvec(iM_in[worldid], tilebase, ntile, vbase, ndof, search, la)
-        mv_out[worldid, row] = mv
-      s = search[row]
-      local_dof += wp.vec2(s * (Ma_out[worldid, row] - iqfrc_smooth_in[worldid, row]), s * mv)
-    local_gauss = wp.vec2(0.0)
-    local_p0 = wp.vec3(0.0)
-    for r in range(lane, nrow, nthread):
-      row = rowadr0 + r
-      jv = float(0.0)
-      if stable:
-        jv = row_jv_out[worldid, row]
-      else:
-        if block[0] > 0:
-          for c in range(block[0]):
-            jv += efc_J_in[worldid, 0, _block_adr(block, r, c)] * search[vbase + c]
-        else:
-          rowadr = efc_J_rowadr_in[worldid, row]
-          for k in range(efc_J_rownnz_in[worldid, row]):
-            adr = rowadr + k
-            jv += efc_J_in[worldid, 0, adr] * search[dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
-        row_jv_out[worldid, row] = jv
-      category = _row_category(efc_type_in[worldid, row])
-      D = efc_D_in[worldid, row]
-      jaref = row_jaref_out[worldid, row]
-      if category == _ROW_EQUALITY:
-        jvD = jv * D
-        local_gauss += wp.vec2(jvD * jaref, 0.5 * jv * jvD)
-      else:
-        local_p0 += _row_eval_pt_alpha_zero(category, D, efc_frictionloss_in[worldid, row], jaref, jv)
-    dof_sums = wp.tile_reduce(wp.add, wp.tile(local_dof, preserve_type=True))[0]
-    gauss_rows = wp.tile_reduce(wp.add, wp.tile(local_gauss, preserve_type=True))[0]
-    p0_rows = wp.tile_reduce(wp.add, wp.tile(local_p0, preserve_type=True))[0]
-    _sync()  # jv of all rows is written
-
-    gauss1 = gauss_rows[0] + dof_sums[0]
-    gauss2 = gauss_rows[1] + 0.5 * dof_sums[1]
-    quad_gauss = wp.vec3(0.0, gauss1, gauss2)
-
-    gtol = wp.max(tolerance * ls_tolerance * wp.sqrt(search_dot_in[worldid, islandid]) * scale, 1e-6)
-    p0 = wp.vec3(0.0, gauss1, 2.0 * gauss2) + p0_rows
-    p0_delta = wp.vec3(0.0, p0[1], p0[2])
-    q1_abs = wp.sqrt(2.0 * wp.max(p0_rows[0], 0.0) * wp.max(p0_rows[2], 0.0)) + wp.abs(gauss1)
-    gtol_accept = wp.max(gtol, _ALPHA_NOISE_EPS * q1_abs)
-
-    lo_alpha_in = -wp.where(p0[2] != 0.0, p0[1] / p0[2], 0.0)
-    local_lo_in = wp.vec3(0.0)
-    for r in range(lane, nrow, nthread):
-      row = rowadr0 + r
-      category = _row_category(efc_type_in[worldid, row])
-      if category != _ROW_EQUALITY:
-        local_lo_in += _row_eval_pt(
-          category,
-          lo_alpha_in,
-          efc_D_in[worldid, row],
-          efc_frictionloss_in[worldid, row],
-          row_jaref_out[worldid, row],
-          row_jv_out[worldid, row],
-        )
-    lo_in = _eval_pt(quad_gauss, lo_alpha_in) + wp.tile_reduce(wp.add, wp.tile(local_lo_in, preserve_type=True))[0]
-
-    alpha = float(0.0)
-    improvement = float(0.0)
-    # a slope at alpha = 0 below rounding noise means the start is already the line minimum
-    stationary = wp.abs(p0[1]) < _ALPHA_NOISE_EPS * q1_abs
-    ls_converged = stationary or (wp.abs(lo_in[1]) < gtol_accept and lo_in[0] < 0.0)
-    if stationary:
-      pass
-    elif ls_converged:
-      alpha = lo_alpha_in
-      improvement = -lo_in[0]
-    else:
-      lo_less = lo_in[1] < p0[1]
-      lo = wp.where(lo_less, lo_in, p0_delta)
-      lo_alpha = wp.where(lo_less, lo_alpha_in, 0.0)
-      hi = wp.where(lo_less, p0_delta, lo_in)
-      hi_alpha = wp.where(lo_less, 0.0, lo_alpha_in)
-
-      for _ in range(LS_ITERATIONS):
-        lo_next_alpha = lo_alpha - wp.where(lo[2] != 0.0, lo[1] / lo[2], 0.0)
-        hi_next_alpha = hi_alpha - wp.where(hi[2] != 0.0, hi[1] / hi[2], 0.0)
-        mid_alpha = 0.5 * (lo_alpha + hi_alpha)
-
-        local_combined = wp.mat33(0.0)
-        for r in range(lane, nrow, nthread):
-          row = rowadr0 + r
-          category = _row_category(efc_type_in[worldid, row])
-          if category != _ROW_EQUALITY:
-            D = efc_D_in[worldid, row]
-            f = efc_frictionloss_in[worldid, row]
-            jaref = row_jaref_out[worldid, row]
-            jv = row_jv_out[worldid, row]
-            plo = _row_eval_pt(category, lo_next_alpha, D, f, jaref, jv)
-            phi = _row_eval_pt(category, hi_next_alpha, D, f, jaref, jv)
-            pmid = _row_eval_pt(category, mid_alpha, D, f, jaref, jv)
-            # columns: lo, hi, mid
-            local_combined += wp.mat33(plo[0], phi[0], pmid[0], plo[1], phi[1], pmid[1], plo[2], phi[2], pmid[2])
-        result = wp.tile_reduce(wp.add, wp.tile(local_combined, preserve_type=True))[0]
-        gauss_lo, gauss_hi, gauss_mid = _eval_pt_3alphas(quad_gauss, lo_next_alpha, hi_next_alpha, mid_alpha)
-        lo_next = gauss_lo + wp.vec3(result[0, 0], result[1, 0], result[2, 0])
-        hi_next = gauss_hi + wp.vec3(result[0, 1], result[1, 1], result[2, 1])
-        mid = gauss_mid + wp.vec3(result[0, 2], result[1, 2], result[2, 2])
-
-        conv_lo = wp.abs(lo_next[1]) < gtol_accept and lo_next[0] < 0.0
-        conv_hi = wp.abs(hi_next[1]) < gtol_accept and hi_next[0] < 0.0
-        conv_mid = wp.abs(mid[1]) < gtol_accept and mid[0] < 0.0
-        any_converged = conv_lo or conv_hi or conv_mid
-        swap_lo = False
-        swap_hi = False
-        if any_converged:
-          conv_pt = wp.vec3(types.MJ_MAXVAL, 0.0, 0.0)
-          conv_alpha = float(0.0)
-          if conv_lo and lo_next[0] < conv_pt[0]:
-            conv_pt = lo_next
-            conv_alpha = lo_next_alpha
-          if conv_hi and hi_next[0] < conv_pt[0]:
-            conv_pt = hi_next
-            conv_alpha = hi_next_alpha
-          if conv_mid and mid[0] < conv_pt[0]:
-            conv_pt = mid
-            conv_alpha = mid_alpha
-          lo = conv_pt
-          lo_alpha = conv_alpha
-          hi = conv_pt
-          hi_alpha = conv_alpha
-        else:
-          swap_lo_lo_next = _in_bracket(lo, lo_next)
-          lo = wp.where(swap_lo_lo_next, lo_next, lo)
-          lo_alpha = wp.where(swap_lo_lo_next, lo_next_alpha, lo_alpha)
-          swap_lo_mid = _in_bracket(lo, mid)
-          lo = wp.where(swap_lo_mid, mid, lo)
-          lo_alpha = wp.where(swap_lo_mid, mid_alpha, lo_alpha)
-          swap_lo_hi_next = _in_bracket(lo, hi_next)
-          lo = wp.where(swap_lo_hi_next, hi_next, lo)
-          lo_alpha = wp.where(swap_lo_hi_next, hi_next_alpha, lo_alpha)
-          swap_lo = swap_lo_lo_next or swap_lo_mid or swap_lo_hi_next
-
-          swap_hi_hi_next = _in_bracket(hi, hi_next) or (hi[1] < 0.0 and hi_next[1] > 0.0)
-          hi = wp.where(swap_hi_hi_next, hi_next, hi)
-          hi_alpha = wp.where(swap_hi_hi_next, hi_next_alpha, hi_alpha)
-          swap_hi_mid = _in_bracket(hi, mid)
-          hi = wp.where(swap_hi_mid, mid, hi)
-          hi_alpha = wp.where(swap_hi_mid, mid_alpha, hi_alpha)
-          swap_hi_lo_next = _in_bracket(hi, lo_next)
-          hi = wp.where(swap_hi_lo_next, lo_next, hi)
-          hi_alpha = wp.where(swap_hi_lo_next, lo_next_alpha, hi_alpha)
-          swap_hi = swap_hi_hi_next or swap_hi_mid or swap_hi_lo_next
-
-        ls_done = (
-          any_converged
-          or (not swap_lo and not swap_hi)
-          or (lo[0] < 0.0 and lo[1] < 0.0 and lo[1] > -gtol)
-          or (hi[0] < 0.0 and hi[1] > 0.0 and hi[1] < gtol)
-        )
-        improved = lo[0] < 0.0 or hi[0] < 0.0
-        lo_better = lo[0] < hi[0]
-        alpha = wp.where(improved, wp.where(lo_better, lo_alpha, hi_alpha), alpha)
-        improvement = wp.where(improved, -wp.where(lo_better, lo[0], hi[0]), improvement)
-        if ls_done:
-          ls_converged = True
-          break
-
-    if not ls_converged and lane == 0:
-      if wp.static(bool(warn_overflow & OverflowType.LS_ITERATIONS)):
-        wp.printf(
-          "linesearch iterations limit reached - please increase ls_iterations beyond %u\n"
-          "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.LS_ITERATIONS (or = 0 for all)\n",
-          wp.static(LS_ITERATIONS),
-        )
-      wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.LS_ITERATIONS))
-
-    # --- update; sparse islands' J'force is accumulated again at the new point ---
-    for la in range(lane, ndof, nthread):
-      row = vbase + la
-      iqacc_out[worldid, row] += alpha * search[row]
-      Ma_out[worldid, row] += alpha * mv_out[worldid, row]
-      if block[0] == 0:
-        frc_out[worldid, row] = 0.0
-    for r in range(lane, nrow, nthread):
-      row = rowadr0 + r
-      row_jaref_out[worldid, row] += alpha * row_jv_out[worldid, row]
-    if lane == 0:
-      niter_out[worldid, islandid] = niter + 1
-      alpha_out[worldid, islandid] = alpha
-      grad_scale_out[worldid, islandid] = grad_scale - alpha
-      improvement_out[worldid, islandid] = improvement
-      wp.atomic_add(nsolving_out, 0, 1)
+        niter_out[worldid, islandid] = niter + 1
+        alpha_out[worldid, islandid] = alpha
+        grad_scale_out[worldid, islandid] = grad_scale - alpha
+        improvement_out[worldid, islandid] = improvement
+        wp.atomic_add(nsolving_out, 0, 1)
 
   return kernel
 
@@ -1120,9 +1161,15 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     changed=wp.zeros((nworld, ntree), dtype=bool),
     state_changed=wp.zeros((nworld, ntree), dtype=bool),
     grad_scale=wp.ones((nworld, ntree), dtype=float),
-    classes=wp.zeros(3, dtype=int),
+    group_count=wp.zeros(4, dtype=int),
+    group_list=wp.empty((4, nworld * ntree), dtype=int),
     nsolving=wp.zeros(1, dtype=int),
   )
+
+
+def _nblock(per_sm: int = 1) -> int:
+  """Persistent blocks for the group kernels (they stride over the groups that exist)."""
+  return wp.get_device().sm_count * 32 * per_sm
 
 
 def _j16(d: types.Data) -> wp.array3d:
@@ -1137,7 +1184,7 @@ def _j16(d: types.Data) -> wp.array3d:
   )
 
 
-def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.array2d, initial: bool):
+def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers, initial: bool):
   """Constraint state at the current point, J'force of sparse islands and the H updates."""
   if not initial:
     ctx.state_changed.zero_()
@@ -1145,26 +1192,27 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.array
   wp.launch(
     _rows(initial),
     dim=(d.nworld, d.njmax),
-    inputs=[d.nefc, d.efc.type, d.efc.D, d.efc.frictionloss, d.efc.island, ctx.done, ctx.row_jaref],
+    inputs=[d.nefc, d.efc.type, d.efc.D, d.efc.frictionloss, g.efc_group, ctx.done, ctx.row_jaref],
     outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.row_w, ctx.changed, ctx.state_changed],
   )
   # dense islands: one block per tile pair of H
   wp.launch_tiled(
     _jtdj(initial),
-    dim=(d.nworld, m.ntree),
+    dim=_nblock(),
     inputs=[
-      d.nisland,
-      d.island_nefc,
-      d.island_iefcadr,
+      m.ntree,
+      g.group_nefc,
+      g.group_iefcadr,
       ctx.tilebase,
       ctx.ntile,
-      ctx.pairbase,
       ctx.done,
       ctx.changed,
-      slots,
+      g.group_slot,
       _j16(d),
       ctx.row_w,
-      m.ntree,
+      ctx.group_count,
+      ctx.group_list,
+      _nblock(),
     ],
     outputs=[ctx.H],
     block_dim=_PAIR_THREADS,
@@ -1180,8 +1228,8 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.array
       d.efc.J_colind,
       d.efc.J,
       d.efc.force,
-      d.efc.island,
-      slots,
+      g.efc_group,
+      g.group_slot,
       ctx.tilebase,
       ctx.ntile,
       ctx.vbase,
@@ -1221,7 +1269,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.array
     )
 
 
-def _launch_grad(d: types.Data, ctx: IslandContext, slots: wp.array2d, final: bool):
+def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final: bool):
   nrow = ctx.qacc.shape[1]
   wp.launch(
     _grad(final),
@@ -1229,8 +1277,8 @@ def _launch_grad(d: types.Data, ctx: IslandContext, slots: wp.array2d, final: bo
     inputs=[
       d.efc.J,
       d.efc.force,
-      d.dof_island,
-      slots,
+      g.dof_group,
+      g.group_slot,
       ctx.row2dof,
       ctx.vbase,
       ctx.done,
@@ -1243,17 +1291,22 @@ def _launch_grad(d: types.Data, ctx: IslandContext, slots: wp.array2d, final: bo
   )
 
 
-def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.array2d):
+def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
   nrow = ctx.qacc.shape[1]
   ctx.nsolving.zero_()
-  _launch_grad(d, ctx, slots, final=False)
+  _launch_grad(d, ctx, g, final=False)
 
   def dense_factor(ntile: int):
     wp.launch_tiled(
       _dense_factor(ntile),
-      dim=(d.nworld, m.ntree),
+      dim=_nblock(),
       inputs=[
-        d.nisland,
+        m.ntree,
+        g.ngroup,
+        ctx.group_count,
+        ctx.group_list,
+        ntile,
+        _nblock(),
         ctx.tilebase,
         ctx.ntile,
         ctx.vbase,
@@ -1270,27 +1323,43 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.arra
   def blocked_factor():
     wp.launch_tiled(
       _factor(-(-m.nv // _TILE) * _TILE),
-      dim=(d.nworld, m.ntree),
-      inputs=[d.nisland, ctx.tilebase, ctx.ntile, ctx.vbase, ctx.done, ctx.niter, ctx.state_changed, ctx.grad, ctx.H],
+      dim=_nblock(),
+      inputs=[
+        m.ntree,
+        g.ngroup,
+        ctx.group_count,
+        ctx.group_list,
+        3,
+        _nblock(),
+        ctx.tilebase,
+        ctx.ntile,
+        ctx.vbase,
+        ctx.done,
+        ctx.niter,
+        ctx.state_changed,
+        ctx.grad,
+        ctx.H,
+      ],
       outputs=[ctx.changed, ctx.U, ctx.search, ctx.search_dot, ctx.newton_decrement, ctx.grad_scale],
       block_dim=_ISLAND_THREADS,
     )
 
-  # each size class only when some island has it
-  for sizeclass, launch in ((0, lambda: dense_factor(1)), (1, lambda: dense_factor(2)), (2, blocked_factor)):
+  # each size class only when some group has it
+  for cls, launch in ((1, lambda: dense_factor(1)), (2, lambda: dense_factor(2)), (3, blocked_factor)):
     if m.opt.graph_conditional:
-      wp.capture_if(ctx.classes[sizeclass : sizeclass + 1], on_true=launch)
+      wp.capture_if(ctx.group_count[cls : cls + 1], on_true=launch)
     else:
       launch()
 
   wp.launch_tiled(
     _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow)),
-    dim=(d.nworld, m.ntree),
+    dim=_nblock(2),
     inputs=[
+      m.ntree,
       m.opt.tolerance,
       m.opt.ls_tolerance,
       m.opt.iterations,
-      d.nisland,
+      g.ngroup,
       d.efc.type,
       d.efc.J_rownnz,
       d.efc.J_rowadr,
@@ -1298,9 +1367,13 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.arra
       d.efc.J,
       d.efc.D,
       d.efc.frictionloss,
-      d.island_nv,
-      d.island_nefc,
-      d.island_iefcadr,
+      g.group_nv,
+      g.group_nefc,
+      g.group_iefcadr,
+      ctx.group_count,
+      ctx.group_list,
+      0,
+      _nblock(2),
       ctx.tilebase,
       ctx.ntile,
       ctx.vbase,
@@ -1308,7 +1381,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.arra
       ctx.qfrc_smooth,
       ctx.M,
       ctx.search.reshape((d.nworld, nrow)),
-      slots,
+      g.group_slot,
       ctx.dof2row,
       ctx.grad.reshape((d.nworld, nrow)),
       ctx.search_dot,
@@ -1334,7 +1407,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, slots: wp.arra
     block_dim=_LINESEARCH_THREADS,
   )
   # constraint evaluation at the updated point, for the next iteration
-  _evaluate(m, d, ctx, slots, initial=False)
+  _evaluate(m, d, ctx, g, initial=False)
 
 
 def solve(m: types.Model, d: types.Data) -> IslandContext:
@@ -1342,23 +1415,27 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   # make_constraint found the islands and wrote the rows in island order
   ctx = _create_context(m, d)
   nrow = ctx.qacc.shape[1]
-  slots = island.slot_buffers(m, d).island_slot
+  # islands are solved in groups (see island.MERGE)
+  g = island.slot_buffers(m, d)
   d.solver_niter.zero_()
-  wp.launch(_free_dofs, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, d.dof_island], outputs=[d.qacc, d.qfrc_constraint])
+  wp.launch(_free_dofs, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, g.dof_group], outputs=[d.qacc, d.qfrc_constraint])
 
   # layout and gathers into island order
   wp.launch_tiled(
     _layout(m.ntree),
     dim=d.nworld,
-    inputs=[d.island_nv],
-    outputs=[ctx.tilebase, ctx.ntile, ctx.vbase, ctx.pairbase, ctx.classes],
+    inputs=[g.group_nv],
+    outputs=[ctx.tilebase, ctx.ntile, ctx.vbase, ctx.pairbase],
     block_dim=m.block_dim.island_scan_sizes,
+  )
+  wp.launch(
+    _group_lists, dim=(d.nworld, m.ntree), inputs=[m.ntree, g.ngroup, ctx.ntile], outputs=[ctx.group_count, ctx.group_list]
   )
   ctx.row2dof.fill_(-1)
   wp.launch(
     _island_pool_maps,
     dim=(d.nworld, m.nv),
-    inputs=[d.dof_island, d.island_idofadr, d.map_dof2idof, ctx.tilebase, ctx.ntile, ctx.vbase],
+    inputs=[g.dof_group, g.group_idofadr, d.map_dof2idof, ctx.tilebase, ctx.ntile, ctx.vbase],
     outputs=[ctx.row2dof, ctx.dof2row, ctx.dof_poolrow, ctx.dof_local],
   )
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
@@ -1373,9 +1450,9 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     dim=(d.nworld, nrow),
     inputs=[
       m.M_elemid,
-      d.nisland,
+      g.ngroup,
       d.M,
-      d.island_nv,
+      g.group_nv,
       ctx.row2dof,
       ctx.tilebase,
       ctx.ntile,
@@ -1394,8 +1471,8 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
       d.efc.J_colind,
       d.efc.J,
       d.efc.aref,
-      d.efc.island,
-      slots,
+      g.efc_group,
+      g.group_slot,
       ctx.vbase,
       ctx.dof2row,
       ctx.qacc,
@@ -1404,24 +1481,37 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   )
   wp.launch_tiled(
     _init_islands,
-    dim=(d.nworld, m.ntree),
-    inputs=[d.nisland, d.island_nv, ctx.tilebase, ctx.ntile, ctx.vbase, ctx.qacc, ctx.M],
+    dim=_nblock(),
+    inputs=[
+      m.ntree,
+      g.ngroup,
+      g.group_nv,
+      ctx.group_count,
+      ctx.group_list,
+      0,
+      _nblock(),
+      ctx.tilebase,
+      ctx.ntile,
+      ctx.vbase,
+      ctx.qacc,
+      ctx.M,
+    ],
     outputs=[ctx.Ma, ctx.H, ctx.scale, ctx.done, ctx.niter, ctx.alpha, ctx.improvement, ctx.nsolving],
     block_dim=_ISLAND_THREADS,
   )
   # initial constraint evaluation; H = M + J'DJ over the quadratic rows
-  _evaluate(m, d, ctx, slots, initial=True)
+  _evaluate(m, d, ctx, g, initial=True)
 
   # each body ends with ctx.nsolving = the number of islands still iterating
   if m.opt.graph_conditional:
-    wp.capture_while(ctx.nsolving, while_body=_iteration, m=m, d=d, ctx=ctx, slots=slots)
+    wp.capture_while(ctx.nsolving, while_body=_iteration, m=m, d=d, ctx=ctx, g=g)
   else:
     # the last pass only marks islands at the iteration limit as done
     for _ in range(m.opt.iterations + 1):
-      _iteration(m, d, ctx, slots)
+      _iteration(m, d, ctx, g)
 
   # J'force at the solution (stable iterations skip it), then scatter back
-  _launch_grad(d, ctx, slots, final=True)
+  _launch_grad(d, ctx, g, final=True)
   wp.launch(_scatter_dofs, dim=(d.nworld, nrow), inputs=[ctx.row2dof, ctx.qacc, ctx.frc], outputs=[d.qacc, d.qfrc_constraint])
   support.mul_m(m, d, d.efc.Ma, d.qacc)
   return ctx

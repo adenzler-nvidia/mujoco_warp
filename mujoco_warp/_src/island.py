@@ -974,6 +974,10 @@ ROW_CONTACT = 3
 # so a 16 x 16 tile is 256 contiguous values. Their rows have J_rownnz = 0. Wider islands keep
 # sparse rows.
 DENSE_NV = 64  # read at each make_constraint
+# The island solver solves groups of islands: runs of consecutive islands that share a 16-DOF tile
+# (e.g. two free bodies), with block-diagonal Hessians. Groups are decided with the dense blocks;
+# MERGE = False keeps one island per group.
+MERGE = True  # read at each make_constraint
 _dense = [True]
 
 
@@ -1056,14 +1060,70 @@ def _fits(end: int, nnz_max: int) -> int:
   return wp.where(end <= nnz_max, 1, 0)
 
 
+@wp.func
+def _ntile16(n: int) -> int:
+  return (n + 15) // 16
+
+
+@wp.kernel
+def _island_groups(
+  # Model:
+  ntree: int,
+  # Data in:
+  nisland_in: wp.array[int],
+  island_idofadr_in: wp.array2d[int],
+  island_nv_in: wp.array2d[int],
+  island_nefc_in: wp.array2d[int],
+  island_iefcadr_in: wp.array2d[int],
+  # In:
+  merge: bool,
+  # Out:
+  ngroup_out: wp.array[int],
+  island_group_out: wp.array2d[int],
+  group_idofadr_out: wp.array2d[int],
+  group_nv_out: wp.array2d[int],
+  group_nefc_out: wp.array2d[int],
+  group_iefcadr_out: wp.array2d[int],
+):
+  """Pack consecutive islands into groups where that saves a 16-DOF tile (serial per world)."""
+  worldid = wp.tid()
+  g = int(-1)
+  gnv = int(0)
+  gnefc = int(0)
+  for i in range(nisland_in[worldid]):
+    n = island_nv_in[worldid, i]
+    if g >= 0 and merge and _ntile16(gnv + n) < _ntile16(gnv) + _ntile16(n):
+      gnv += n
+      gnefc += island_nefc_in[worldid, i]
+    else:
+      if g >= 0:
+        group_nv_out[worldid, g] = gnv
+        group_nefc_out[worldid, g] = gnefc
+      g += 1
+      gnv = n
+      gnefc = island_nefc_in[worldid, i]
+      group_idofadr_out[worldid, g] = island_idofadr_in[worldid, i]
+      group_iefcadr_out[worldid, g] = island_iefcadr_in[worldid, i]
+    island_group_out[worldid, i] = g
+  if g >= 0:
+    group_nv_out[worldid, g] = gnv
+    group_nefc_out[worldid, g] = gnefc
+  ngroup_out[worldid] = g + 1
+  # the tiled kernels read all ntree entries
+  for k in range(g + 1, ntree):
+    group_nv_out[worldid, k] = 0
+    group_nefc_out[worldid, k] = 0
+    group_idofadr_out[worldid, k] = 0
+    group_iefcadr_out[worldid, k] = 0
+
+
 @cache_kernel
 def _island_blocks(ntree: int):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
-    # Data in:
-    island_nv_in: wp.array2d[int],
-    island_nefc_in: wp.array2d[int],
     # In:
+    group_nv_in: wp.array2d[int],
+    group_nefc_in: wp.array2d[int],
     dense_nv: int,
     nnz_max: int,
     # Out:
@@ -1071,18 +1131,18 @@ def _island_blocks(ntree: int):
     base_out: wp.array2d[int],
     efc_nnz_out: wp.array[int],
   ):
-    """Dense block width and address of each island, at the start of each world's storage.
+    """Dense block width and address of each group, at the start of each world's storage.
 
-    Sparse rows are allocated after them. Wide islands, and those past the storage, are sparse.
+    Sparse rows are allocated after them. Wide groups, and those past the storage, are sparse.
     """
     worldid = wp.tid()
     width = wp.tile_map(
-      _dense_width, wp.tile_load(island_nv_in[worldid], shape=ntree), wp.tile_full(shape=ntree, value=dense_nv, dtype=int)
+      _dense_width, wp.tile_load(group_nv_in[worldid], shape=ntree), wp.tile_full(shape=ntree, value=dense_nv, dtype=int)
     )
-    size = wp.tile_map(wp.mul, width, wp.tile_load(island_nefc_in[worldid], shape=ntree))
+    size = wp.tile_map(wp.mul, width, wp.tile_load(group_nefc_in[worldid], shape=ntree))
     base = wp.tile_scan_exclusive(size)
     end = wp.tile_map(wp.add, base, size)
-    # blocks are in island order, so those that fit are a prefix
+    # blocks are in group order, so those that fit are a prefix
     fits = wp.tile_map(_fits, end, wp.tile_full(shape=ntree, value=nnz_max, dtype=int))
     wp.tile_store(width_out[worldid], wp.tile_map(wp.mul, width, fits))
     wp.tile_store(base_out[worldid], base)
@@ -1093,78 +1153,137 @@ def _island_blocks(ntree: int):
 
 @wp.kernel
 def _island_slot(
-  # Data in:
-  island_nefc_in: wp.array2d[int],
-  island_iefcadr_in: wp.array2d[int],
   # In:
+  ngroup_in: wp.array[int],
+  island_group_in: wp.array2d[int],
+  group_nefc_in: wp.array2d[int],
+  group_iefcadr_in: wp.array2d[int],
   width_in: wp.array2d[int],
   base_in: wp.array2d[int],
   # Out:
+  group_slot_out: wp.array2d[wp.vec4i],
   island_slot_out: wp.array2d[wp.vec4i],
 ):
+  """Dense block (width, address, rows, first row) of each group, and of each island's group."""
   worldid, i = wp.tid()
-  island_slot_out[worldid, i] = wp.vec4i(
-    width_in[worldid, i], base_in[worldid, i], island_nefc_in[worldid, i], island_iefcadr_in[worldid, i]
-  )
+  block = wp.vec4i(0)
+  if i < ngroup_in[worldid]:
+    block = wp.vec4i(width_in[worldid, i], base_in[worldid, i], group_nefc_in[worldid, i], group_iefcadr_in[worldid, i])
+  group_slot_out[worldid, i] = block
+  g = island_group_in[worldid, i]
+  if g >= 0:
+    island_slot_out[worldid, i] = wp.vec4i(
+      width_in[worldid, g], base_in[worldid, g], group_nefc_in[worldid, g], group_iefcadr_in[worldid, g]
+    )
 
 
 @wp.kernel
 def _dof_slotcol(
   # Data in:
   dof_island_in: wp.array2d[int],
-  island_idofadr_in: wp.array2d[int],
   map_dof2idof_in: wp.array2d[int],
+  # In:
+  island_group_in: wp.array2d[int],
+  group_idofadr_in: wp.array2d[int],
   # Out:
+  dof_group_out: wp.array2d[int],
   dof_slotcol_out: wp.array2d[int],
 ):
+  """Group of a DOF and its column in the group's dense block."""
   worldid, dofid = wp.tid()
   islandid = dof_island_in[worldid, dofid]
+  g = int(-1)
   col = int(0)
   if islandid >= 0:
-    col = map_dof2idof_in[worldid, dofid] - island_idofadr_in[worldid, islandid]
+    g = island_group_in[worldid, islandid]
+    col = map_dof2idof_in[worldid, dofid] - group_idofadr_in[worldid, g]
+  dof_group_out[worldid, dofid] = g
   dof_slotcol_out[worldid, dofid] = col
 
 
+@wp.kernel
+def _efc_group(
+  # Data in:
+  nefc_in: wp.array[int],
+  efc_island_in: wp.array2d[int],
+  # In:
+  island_group_in: wp.array2d[int],
+  # Out:
+  efc_group_out: wp.array2d[int],
+):
+  worldid, efcid = wp.tid()
+  g = int(-1)
+  if efcid < nefc_in[worldid]:
+    g = island_group_in[worldid, efc_island_in[worldid, efcid]]
+  efc_group_out[worldid, efcid] = g
+
+
 class SlotBuffers:
-  """Dense block layout, shared by make_constraint and the island solve."""
+  """Island groups and their dense blocks, shared by make_constraint and the island solve."""
 
   def __init__(self, m: types.Model, d: types.Data):
-    self.key = (d.nworld, m.ntree, m.nv)
-    self.island_slot = wp.empty((d.nworld, m.ntree), dtype=wp.vec4i)
-    self.width = wp.empty((d.nworld, m.ntree), dtype=int)
-    self.base = wp.empty((d.nworld, m.ntree), dtype=int)
+    self.key = (d.nworld, m.ntree, m.nv, d.njmax)
+    shape = (d.nworld, m.ntree)
+    self.ngroup = wp.empty(d.nworld, dtype=int)
+    self.island_group = wp.empty(shape, dtype=int)
+    self.group_idofadr = wp.empty(shape, dtype=int)
+    self.group_nv = wp.empty(shape, dtype=int)
+    self.group_nefc = wp.empty(shape, dtype=int)
+    self.group_iefcadr = wp.empty(shape, dtype=int)
+    self.group_slot = wp.empty(shape, dtype=wp.vec4i)
+    self.island_slot = wp.empty(shape, dtype=wp.vec4i)
+    self.width = wp.empty(shape, dtype=int)
+    self.base = wp.empty(shape, dtype=int)
+    self.dof_group = wp.empty((d.nworld, m.nv), dtype=int)
     self.dof_slotcol = wp.empty((d.nworld, m.nv), dtype=int)
+    self.efc_group = wp.empty((d.nworld, d.njmax), dtype=int)
 
 
 def slot_buffers(m: types.Model, d: types.Data) -> SlotBuffers:
   buf = d.__dict__.get("_island_slots")
-  if buf is None or buf.key != (d.nworld, m.ntree, m.nv):
+  if buf is None or buf.key != (d.nworld, m.ntree, m.nv, d.njmax):
     buf = SlotBuffers(m, d)
     d.__dict__["_island_slots"] = buf
   return buf
 
 
 def assign_slots(m: types.Model, d: types.Data, efc_nnz: wp.array) -> SlotBuffers:
-  """Island DOF maps and dense blocks, from the row layout, before the rows are written."""
+  """Island DOF maps, island groups and their dense blocks, before the rows are written."""
   island_dofs(m, d)
   buf = slot_buffers(m, d)
+  buf.island_group.fill_(-1)
+  wp.launch(
+    _island_groups,
+    dim=d.nworld,
+    inputs=[m.ntree, d.nisland, d.island_idofadr, d.island_nv, d.island_nefc, d.island_iefcadr, MERGE],
+    outputs=[buf.ngroup, buf.island_group, buf.group_idofadr, buf.group_nv, buf.group_nefc, buf.group_iefcadr],
+  )
   wp.launch_tiled(
     _island_blocks(m.ntree),
     dim=d.nworld,
-    inputs=[d.island_nv, d.island_nefc, DENSE_NV if _dense[0] else 0, d.efc.J.shape[2]],
+    inputs=[buf.group_nv, buf.group_nefc, DENSE_NV if _dense[0] else 0, d.efc.J.shape[2]],
     outputs=[buf.width, buf.base, efc_nnz],
     block_dim=types.BlockDim.island_scan_sizes,
   )
   wp.launch(
     _island_slot,
     dim=(d.nworld, m.ntree),
-    inputs=[d.island_nefc, d.island_iefcadr, buf.width, buf.base],
-    outputs=[buf.island_slot],
+    inputs=[buf.ngroup, buf.island_group, buf.group_nefc, buf.group_iefcadr, buf.width, buf.base],
+    outputs=[buf.group_slot, buf.island_slot],
   )
   wp.launch(
-    _dof_slotcol, dim=(d.nworld, m.nv), inputs=[d.dof_island, d.island_idofadr, d.map_dof2idof], outputs=[buf.dof_slotcol]
+    _dof_slotcol,
+    dim=(d.nworld, m.nv),
+    inputs=[d.dof_island, d.map_dof2idof, buf.island_group, buf.group_idofadr],
+    outputs=[buf.dof_group, buf.dof_slotcol],
   )
   return buf
+
+
+def assign_rows(m: types.Model, d: types.Data):
+  """Group of each row, after the rows are written."""
+  buf = slot_buffers(m, d)
+  wp.launch(_efc_group, dim=(d.nworld, d.njmax), inputs=[d.nefc, d.efc.island, buf.island_group], outputs=[buf.efc_group])
 
 
 def island_rows(m: types.Model) -> bool:

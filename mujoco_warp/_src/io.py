@@ -2351,16 +2351,18 @@ def put_data(
 
 
 def _island_slot_rows(efc_J: np.ndarray, d: types.Data, slots, worldid: int):
-  """Fill the rows of islands with a dense Jacobian block (see island.DENSE_NV)."""
-  island_slot, J = slots.island_slot.numpy()[worldid], d.efc.J.numpy()[worldid, 0]
-  island_nv, idofadr = d.island_nv.numpy()[worldid], d.island_idofadr.numpy()[worldid]
+  """Fill the rows of island groups with a dense Jacobian block (see island.DENSE_NV)."""
+  group_slot, J = slots.group_slot.numpy()[worldid], d.efc.J.numpy()[worldid, 0]
+  group_nv, group_idofadr = slots.group_nv.numpy()[worldid], slots.group_idofadr.numpy()[worldid]
   idof2dof = d.map_idof2dof.numpy()[worldid]
-  for i in np.nonzero(island_slot[:, 0])[0]:
-    width, base, nrow, rowadr = island_slot[i]
-    n = island_nv[i]
+  for g in range(slots.ngroup.numpy()[worldid]):
+    width, base, nrow, rowadr = group_slot[g]
+    if width == 0:
+      continue
+    n = group_nv[g]
     # tiles of 16 columns, each all rows x 16
     block = J[base : base + width * nrow].reshape(width // 16, nrow, 16).transpose(1, 0, 2).reshape(nrow, width)
-    efc_J[rowadr : rowadr + nrow, idof2dof[idofadr[i] : idofadr[i] + n]] = block[:, :n]
+    efc_J[rowadr : rowadr + nrow, idof2dof[group_idofadr[g] : group_idofadr[g] + n]] = block[:, :n]
 
 
 def get_data_into(

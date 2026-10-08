@@ -6689,6 +6689,7 @@ def make_constraint(m: types.Model, d: types.Data):
     island_slot, dof_slotcol = slots.island_slot, slots.dof_slotcol
     build(island.ROWS_WRITE)
     island.island_rows_identity(m, d)
+    island.assign_rows(m, d)
   else:
     build(island.ROWS_WORLD)
 
