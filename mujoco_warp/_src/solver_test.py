@@ -1284,6 +1284,9 @@ class SolverTest(parameterized.TestCase):
 
     # tile pool entries outside the island blocks are neither written nor read
     m.opt.island_solve = True
+    # the world solve's island paths read every island's rows from the sparse Jacobian
+    with island.no_slots():
+      mjw.make_constraint(m, d)
     ctx = solver._create_solver_context(m, d, island=True)
     ctx.h.fill_(np.nan)
     ctx.hfactor.fill_(np.nan)

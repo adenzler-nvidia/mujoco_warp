@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import contextlib
+
 import warp as wp
 
 from mujoco_warp._src import types
@@ -967,6 +969,156 @@ ROW_FRICTION = 1
 ROW_LIMIT = 2
 ROW_CONTACT = 3
 
+# Islands of up to SLOT_NV DOFs and SLOT_NEFC rows are solved by the dense world solver, one world
+# per slot (slot = world * ntree + island); their rows are also written there as dense rows with
+# island-local columns.
+SLOT_NV = 32
+SLOT_NEFC = 64
+NO_SLOT = -(1 << 30)
+_slots = [True]
+
+
+@contextlib.contextmanager
+def no_slots():
+  """Build rows without slots, so the island solver takes every island (for tests)."""
+  _slots[0] = False
+  try:
+    yield
+  finally:
+    _slots[0] = True
+
+
+@wp.func
+def in_slot(ndof: int, nrow: int) -> bool:
+  return ndof > 0 and ndof <= SLOT_NV and nrow <= SLOT_NEFC
+
+
+@wp.func
+def rows_slot(
+  # Data in:
+  tree_island_in: wp.array2d[int],
+  # In:
+  worldid: int,
+  tree: int,
+  efcid: int,
+  island_slotrow_in: wp.array2d[int],
+) -> int:
+  """Slot row of a constraint's first row, or -1 if its island is not in a slot."""
+  if tree < 0:
+    return -1
+  base = island_slotrow_in[worldid, tree_island_in[worldid, tree]]
+  if base == NO_SLOT:
+    return -1
+  return base + efcid
+
+
+@wp.func
+def slot_zero(
+  # In:
+  srow: int,
+  nrow: int,
+  # Out:
+  slot_J_out: wp.array2d[float],
+):
+  if srow >= 0:
+    for r in range(nrow):
+      for c in range(SLOT_NV):
+        slot_J_out[srow + r, c] = 0.0
+
+
+@wp.func
+def slot_set(
+  # In:
+  worldid: int,
+  srow: int,
+  k: int,
+  dofid: int,
+  value: float,
+  dof_slotcol_in: wp.array2d[int],
+  # Out:
+  slot_J_out: wp.array2d[float],
+):
+  """Value of row srow + k at a DOF's slot column (srow < 0: not in a slot)."""
+  if srow >= 0:
+    slot_J_out[srow + k, dof_slotcol_in[worldid, dofid]] = value
+
+
+@wp.kernel
+def _island_slots(
+  # Model:
+  ntree: int,
+  # Data in:
+  nisland_in: wp.array[int],
+  island_idofadr_in: wp.array2d[int],
+  island_nv_in: wp.array2d[int],
+  island_nefc_in: wp.array2d[int],
+  island_iefcadr_in: wp.array2d[int],
+  # In:
+  use_slots: bool,
+  # Out:
+  island_slotrow_out: wp.array2d[int],
+):
+  """Slot row base (slot row = base + efcid) of islands solved in slots."""
+  worldid, islandid = wp.tid()
+  base = int(NO_SLOT)
+  if (
+    use_slots and islandid < nisland_in[worldid] and in_slot(island_nv_in[worldid, islandid], island_nefc_in[worldid, islandid])
+  ):
+    base = (worldid * ntree + islandid) * SLOT_NEFC - island_iefcadr_in[worldid, islandid]
+  island_slotrow_out[worldid, islandid] = base
+
+
+@wp.kernel
+def _dof_slotcol(
+  # Data in:
+  dof_island_in: wp.array2d[int],
+  island_idofadr_in: wp.array2d[int],
+  map_dof2idof_in: wp.array2d[int],
+  # Out:
+  dof_slotcol_out: wp.array2d[int],
+):
+  worldid, dofid = wp.tid()
+  islandid = dof_island_in[worldid, dofid]
+  col = int(0)
+  if islandid >= 0:
+    col = map_dof2idof_in[worldid, dofid] - island_idofadr_in[worldid, islandid]
+  dof_slotcol_out[worldid, dofid] = col
+
+
+class SlotBuffers:
+  """Slot arrays shared by make_constraint (rows) and the island solve."""
+
+  def __init__(self, m: types.Model, d: types.Data):
+    ns = d.nworld * m.ntree
+    self.key = (d.nworld, m.ntree, m.nv)
+    self.island_slotrow = wp.empty((d.nworld, m.ntree), dtype=int)
+    self.dof_slotcol = wp.empty((d.nworld, m.nv), dtype=int)
+    self.J = wp.zeros((ns * SLOT_NEFC, SLOT_NV), dtype=float)
+
+
+def slot_buffers(m: types.Model, d: types.Data) -> SlotBuffers:
+  buf = d.__dict__.get("_island_slots")
+  if buf is None or buf.key != (d.nworld, m.ntree, m.nv):
+    buf = SlotBuffers(m, d)
+    d.__dict__["_island_slots"] = buf
+  return buf
+
+
+def assign_slots(m: types.Model, d: types.Data) -> SlotBuffers:
+  """Island DOF maps and slots, from the row layout, before the rows are written."""
+  island_dofs(m, d)
+  buf = slot_buffers(m, d)
+  wp.launch(
+    _island_slots,
+    dim=(d.nworld, m.ntree),
+    inputs=[m.ntree, d.nisland, d.island_idofadr, d.island_nv, d.island_nefc, d.island_iefcadr, _slots[0]],
+    outputs=[buf.island_slotrow],
+  )
+  wp.launch(
+    _dof_slotcol, dim=(d.nworld, m.nv), inputs=[d.dof_island, d.island_idofadr, d.map_dof2idof], outputs=[buf.dof_slotcol]
+  )
+  return buf
+
 
 def island_rows(m: types.Model) -> bool:
   """Whether constraint rows are built in island order."""
@@ -980,6 +1132,9 @@ def island_rows(m: types.Model) -> bool:
     and not (m.opt.disableflags & types.DisableBit.ISLAND)
     and not (m.opt.enableflags & types.EnableBit.SLEEP)
     and m.opt.integrator != types.IntegratorType.DISCRETE
+    # these read the Jacobian, which islands in slots write only to their slot
+    and m.nefmdof == 0
+    and m.actuator_trntype_body_adr.shape[0] == 0
   )
 
 
@@ -1169,8 +1324,8 @@ def _island_rows_identity(
 
 
 @event_scope
-def compute_island_dofs(m: types.Model, d: types.Data):
-  """Island DOF mappings (and identity row maps) when rows are already in island order."""
+def island_dofs(m: types.Model, d: types.Data):
+  """Island DOF mappings from the islands and row counts of the row layout."""
   wp.launch(_zero_island_nv, dim=(d.nworld, m.ntree), outputs=[d.island_nv])
   wp.launch(
     _init_dof_arrays,
@@ -1198,6 +1353,10 @@ def compute_island_dofs(m: types.Model, d: types.Data):
     inputs=[m.dof_treeid, m.tree_dofadr, m.tree_dofnum, d.nidof, d.tree_island, d.island_idofadr],
     outputs=[d.island_dofadr, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
   )
+
+
+def island_rows_identity(m: types.Model, d: types.Data):
+  """Identity row maps, since rows are written in island order."""
   wp.launch(
     _island_rows_identity,
     dim=(d.nworld, d.njmax),

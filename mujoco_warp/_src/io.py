@@ -2533,6 +2533,21 @@ def get_data_into(
         d.efc.J_rowadr.numpy()[world_id, :nefc],
         d.efc.J_colind.numpy()[world_id, 0],
       )
+      # islands solved in slots keep their rows only there, dense with island-local columns
+      slots = d.__dict__.get("_island_slots")
+      if slots is not None:
+        from mujoco_warp._src import island  # noqa: PLC0415
+
+        slotrow = slots.island_slotrow.numpy()[world_id]
+        slot_J = slots.J.numpy()
+        idofadr, iefcadr = d.island_idofadr.numpy()[world_id], d.island_iefcadr.numpy()[world_id]
+        island_nv, island_nefc = d.island_nv.numpy()[world_id], d.island_nefc.numpy()[world_id]
+        idof2dof = d.map_idof2dof.numpy()[world_id]
+        for i in np.nonzero(slotrow != island.NO_SLOT)[0]:
+          rows = slice(iefcadr[i], iefcadr[i] + island_nefc[i])
+          efc_J[rows, idof2dof[idofadr[i] : idofadr[i] + island_nv[i]]] = slot_J[
+            slotrow[i] + rows.start : slotrow[i] + rows.stop, : island_nv[i]
+          ]
     else:
       efc_J = d.efc.J.numpy()[world_id, :nefc, : mjm.nv]
 

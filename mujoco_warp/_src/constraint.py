@@ -29,8 +29,11 @@ from mujoco_warp._src.island import ROWS_DISCOVER
 from mujoco_warp._src.island import ROWS_WRITE
 from mujoco_warp._src.island import rows_discover
 from mujoco_warp._src.island import rows_discover_tendon
+from mujoco_warp._src.island import rows_slot
 from mujoco_warp._src.island import rows_tendon_tree
 from mujoco_warp._src.island import rows_write
+from mujoco_warp._src.island import slot_set
+from mujoco_warp._src.island import slot_zero
 from mujoco_warp._src.types import ConstraintType
 from mujoco_warp._src.types import ContactType
 from mujoco_warp._src.types import DisableBit
@@ -284,6 +287,8 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     ne_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -308,6 +313,7 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     """Calculates constraint rows for connect equality constraints."""
     worldid, eqconnectid = wp.tid()
@@ -329,6 +335,7 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
       rows_discover(worldid, rows_tree0, rows_tree1, 3, ROW_EQUALITY, tree_island_out, island_parent_out, tree_nrow_out)
       return
     wp.atomic_add(ne_out, worldid, 3)
+    srow = int(-1)
     if wp.static(ROWS == ROWS_WRITE):
       rows_body0 = eq_obj1id[eqid]
       rows_body1 = eq_obj2id[eqid]
@@ -348,6 +355,8 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
         island_rowadr_in,
         island_cursor_out,
       )
+      srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+      slot_zero(srow, 3, slot_J_out)
     else:
       efcid = wp.atomic_add(nefc_out, worldid, 3)
 
@@ -355,9 +364,10 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
       return
 
     if wp.static(is_sparse and newton):
-      jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-      efc_jtdaj_adr_out[worldid, jgid] = efcid
-      efc_jtdaj_nrow_out[worldid, jgid] = 3
+      if srow < 0:
+        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+        efc_jtdaj_adr_out[worldid, jgid] = efcid
+        efc_jtdaj_nrow_out[worldid, jgid] = 3
 
     efcid0 = efcid + 0
     efcid1 = efcid + 1
@@ -409,16 +419,16 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
         rownnz += 1
 
       # get rowadr
-      rowadr = wp.atomic_add(efc_nnz_out, worldid, 3 * rownnz)
-      if rowadr + 3 * rownnz > njmax_nnz_in:
+      rowadr = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, 3 * rownnz))
+      if srow < 0 and rowadr + 3 * rownnz > njmax_nnz_in:
         return
       efc_J_rowadr_out[worldid, efcid0] = rowadr
       efc_J_rowadr_out[worldid, efcid1] = rowadr + rownnz
       efc_J_rowadr_out[worldid, efcid2] = rowadr + 2 * rownnz
 
-      efc_J_rownnz_out[worldid, efcid0] = rownnz
-      efc_J_rownnz_out[worldid, efcid1] = rownnz
-      efc_J_rownnz_out[worldid, efcid2] = rownnz
+      efc_J_rownnz_out[worldid, efcid0] = wp.where(srow >= 0, 0, rownnz)
+      efc_J_rownnz_out[worldid, efcid1] = wp.where(srow >= 0, 0, rownnz)
+      efc_J_rownnz_out[worldid, efcid2] = wp.where(srow >= 0, 0, rownnz)
 
       # compute J and colind
       nnz = int(0)
@@ -495,13 +505,22 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
         sparseid1 = rowadr + rownnz + nnz
         sparseid2 = rowadr + 2 * rownnz + nnz
 
-        efc_J_colind_out[worldid, 0, sparseid0] = da
-        efc_J_colind_out[worldid, 0, sparseid1] = da
-        efc_J_colind_out[worldid, 0, sparseid2] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid0] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid1] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid2] = da
 
-        efc_J_out[worldid, 0, sparseid0] = j1mj2[0]
-        efc_J_out[worldid, 0, sparseid1] = j1mj2[1]
-        efc_J_out[worldid, 0, sparseid2] = j1mj2[2]
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid0] = j1mj2[0]
+        slot_set(worldid, srow, 0, da, j1mj2[0], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid1] = j1mj2[1]
+        slot_set(worldid, srow, 1, da, j1mj2[1], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid2] = j1mj2[2]
+        slot_set(worldid, srow, 2, da, j1mj2[2], dof_slotcol_in, slot_J_out)
 
         qvel = qvel_in[worldid, da]
         Jqvel += j1mj2 * qvel
@@ -652,6 +671,8 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     ne_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -676,6 +697,7 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     worldid, eqjntid = wp.tid()
     eqid = eq_jnt_adr[eqjntid]
@@ -692,6 +714,7 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
       rows_discover(worldid, rows_tree0, rows_tree1, 1, ROW_EQUALITY, tree_island_out, island_parent_out, tree_nrow_out)
       return
     wp.atomic_add(ne_out, worldid, 1)
+    srow = int(-1)
     if wp.static(ROWS == ROWS_WRITE):
       rows_tree0 = island_dof_treeid_in[jnt_dofadr[eq_obj1id[eqid]]]
       if eq_obj2id[eqid] >= 0:
@@ -707,6 +730,8 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
         island_rowadr_in,
         island_cursor_out,
       )
+      srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+      slot_zero(srow, 1, slot_J_out)
     else:
       efcid = wp.atomic_add(nefc_out, worldid, 1)
 
@@ -714,9 +739,10 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
       return
 
     if wp.static(is_sparse and newton):
-      jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-      efc_jtdaj_adr_out[worldid, jgid] = efcid
-      efc_jtdaj_nrow_out[worldid, jgid] = 1
+      if srow < 0:
+        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+        efc_jtdaj_adr_out[worldid, jgid] = efcid
+        efc_jtdaj_nrow_out[worldid, jgid] = 1
 
     jntid_1 = eq_obj1id[eqid]
     jntid_2 = eq_obj2id[eqid]
@@ -731,13 +757,16 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
         rownnz = 2
       else:
         rownnz = 1
-      efc_J_rownnz_out[worldid, efcid] = rownnz
-      rowadr = wp.atomic_add(efc_nnz_out, worldid, rownnz)
-      if rowadr + rownnz > njmax_nnz_in:
+      efc_J_rownnz_out[worldid, efcid] = wp.where(srow >= 0, 0, rownnz)
+      rowadr = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, rownnz))
+      if srow < 0 and rowadr + rownnz > njmax_nnz_in:
         return
       efc_J_rowadr_out[worldid, efcid] = rowadr
-      efc_J_colind_out[worldid, 0, rowadr] = dofadr1
-      efc_J_out[worldid, 0, rowadr] = 1.0
+      if srow < 0:
+        efc_J_colind_out[worldid, 0, rowadr] = dofadr1
+      if srow < 0:
+        efc_J_out[worldid, 0, rowadr] = 1.0
+      slot_set(worldid, srow, 0, dofadr1, 1.0, dof_slotcol_in, slot_J_out)
     else:
       for i in range(nv):
         efc_J_out[worldid, efcid, i] = 0.0
@@ -759,8 +788,11 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
 
       if wp.static(is_sparse):
         sparseid = rowadr + 1
-        efc_J_colind_out[worldid, 0, sparseid] = dofadr2
-        efc_J_out[worldid, 0, sparseid] = -deriv_2
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid] = dofadr2
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid] = -deriv_2
+        slot_set(worldid, srow, 0, dofadr2, -deriv_2, dof_slotcol_in, slot_J_out)
       else:
         efc_J_out[worldid, efcid, dofadr2] = -deriv_2
     else:
@@ -832,6 +864,8 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     ne_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -856,6 +890,7 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     worldid, eqtenid = wp.tid()
     eqid = eq_ten_adr[eqtenid]
@@ -892,6 +927,7 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
       rows_discover(worldid, rows_tree0, rows_tree1, 1, ROW_EQUALITY, tree_island_out, island_parent_out, tree_nrow_out)
       return
     wp.atomic_add(ne_out, worldid, 1)
+    srow = int(-1)
     if wp.static(ROWS == ROWS_WRITE):
       rows_tree0 = rows_tendon_tree(island_dof_treeid_in, ten_J_rownnz, ten_J_rowadr, ten_J_colind, eq_obj1id[eqid])
       if rows_tree0 < 0:
@@ -907,6 +943,8 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
         island_rowadr_in,
         island_cursor_out,
       )
+      srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+      slot_zero(srow, 1, slot_J_out)
     else:
       efcid = wp.atomic_add(nefc_out, worldid, 1)
 
@@ -914,9 +952,10 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
       return
 
     if wp.static(is_sparse and newton):
-      jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-      efc_jtdaj_adr_out[worldid, jgid] = efcid
-      efc_jtdaj_nrow_out[worldid, jgid] = 1
+      if srow < 0:
+        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+        efc_jtdaj_adr_out[worldid, jgid] = efcid
+        efc_jtdaj_nrow_out[worldid, jgid] = 1
 
     obj1id = eq_obj1id[eqid]
     obj2id = eq_obj2id[eqid]
@@ -972,8 +1011,8 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
           p2 += 1
         rownnz += 1
 
-      rowadr = wp.atomic_add(efc_nnz_out, worldid, rownnz)
-      if rowadr + rownnz > njmax_nnz_in:
+      rowadr = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, rownnz))
+      if srow < 0 and rowadr + rownnz > njmax_nnz_in:
         return
       efc_J_rowadr_out[worldid, efcid] = rowadr
 
@@ -1004,8 +1043,11 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
       if wp.static(is_sparse):
         if J != 0.0:
           sparseid = rowadr + nnz
-          efc_J_colind_out[worldid, 0, sparseid] = i
-          efc_J_out[worldid, 0, sparseid] = J
+          if srow < 0:
+            efc_J_colind_out[worldid, 0, sparseid] = i
+          if srow < 0:
+            efc_J_out[worldid, 0, sparseid] = J
+          slot_set(worldid, srow, 0, i, J, dof_slotcol_in, slot_J_out)
           nnz += 1
       else:
         efc_J_out[worldid, efcid, i] = J
@@ -1013,7 +1055,7 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
       Jqvel += J * qvel_in[worldid, i]
 
     if wp.static(is_sparse):
-      efc_J_rownnz_out[worldid, efcid] = nnz
+      efc_J_rownnz_out[worldid, efcid] = wp.where(srow >= 0, 0, nnz)
 
     _efc_row(
       opt_disableflags,
@@ -1236,6 +1278,8 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     ne_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -1260,6 +1304,7 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     worldid, eqweldid = wp.tid()
     eqid = eq_wld_adr[eqweldid]
@@ -1280,6 +1325,7 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
       rows_discover(worldid, rows_tree0, rows_tree1, 6, ROW_EQUALITY, tree_island_out, island_parent_out, tree_nrow_out)
       return
     wp.atomic_add(ne_out, worldid, 6)
+    srow = int(-1)
     if wp.static(ROWS == ROWS_WRITE):
       rows_body0 = eq_obj1id[eqid]
       rows_body1 = eq_obj2id[eqid]
@@ -1299,6 +1345,8 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
         island_rowadr_in,
         island_cursor_out,
       )
+      srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+      slot_zero(srow, 6, slot_J_out)
     else:
       efcid = wp.atomic_add(nefc_out, worldid, 6)
 
@@ -1306,9 +1354,10 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
       return
 
     if wp.static(is_sparse and newton):
-      jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-      efc_jtdaj_adr_out[worldid, jgid] = efcid
-      efc_jtdaj_nrow_out[worldid, jgid] = 6
+      if srow < 0:
+        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+        efc_jtdaj_adr_out[worldid, jgid] = efcid
+        efc_jtdaj_nrow_out[worldid, jgid] = 6
 
     efcid0 = efcid + 0
     efcid1 = efcid + 1
@@ -1406,8 +1455,8 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
         rownnz += 1
 
       # get rowadr
-      rowadr = wp.atomic_add(efc_nnz_out, worldid, 6 * rownnz)
-      if rowadr + 6 * rownnz > njmax_nnz_in:
+      rowadr = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, 6 * rownnz))
+      if srow < 0 and rowadr + 6 * rownnz > njmax_nnz_in:
         return
       efc_J_rowadr_out[worldid, efcid0] = rowadr
       efc_J_rowadr_out[worldid, efcid1] = rowadr + rownnz
@@ -1416,12 +1465,12 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
       efc_J_rowadr_out[worldid, efcid4] = rowadr + 4 * rownnz
       efc_J_rowadr_out[worldid, efcid5] = rowadr + 5 * rownnz
 
-      efc_J_rownnz_out[worldid, efcid0] = rownnz
-      efc_J_rownnz_out[worldid, efcid1] = rownnz
-      efc_J_rownnz_out[worldid, efcid2] = rownnz
-      efc_J_rownnz_out[worldid, efcid3] = rownnz
-      efc_J_rownnz_out[worldid, efcid4] = rownnz
-      efc_J_rownnz_out[worldid, efcid5] = rownnz
+      efc_J_rownnz_out[worldid, efcid0] = wp.where(srow >= 0, 0, rownnz)
+      efc_J_rownnz_out[worldid, efcid1] = wp.where(srow >= 0, 0, rownnz)
+      efc_J_rownnz_out[worldid, efcid2] = wp.where(srow >= 0, 0, rownnz)
+      efc_J_rownnz_out[worldid, efcid3] = wp.where(srow >= 0, 0, rownnz)
+      efc_J_rownnz_out[worldid, efcid4] = wp.where(srow >= 0, 0, rownnz)
+      efc_J_rownnz_out[worldid, efcid5] = wp.where(srow >= 0, 0, rownnz)
 
       # compute J and colind
       nnz = int(0)
@@ -1508,19 +1557,37 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
         sparseid4 = rowadr + 4 * rownnz + nnz
         sparseid5 = rowadr + 5 * rownnz + nnz
 
-        efc_J_colind_out[worldid, 0, sparseid0] = da
-        efc_J_colind_out[worldid, 0, sparseid1] = da
-        efc_J_colind_out[worldid, 0, sparseid2] = da
-        efc_J_colind_out[worldid, 0, sparseid3] = da
-        efc_J_colind_out[worldid, 0, sparseid4] = da
-        efc_J_colind_out[worldid, 0, sparseid5] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid0] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid1] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid2] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid3] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid4] = da
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid5] = da
 
-        efc_J_out[worldid, 0, sparseid0] = jacdifp[0]
-        efc_J_out[worldid, 0, sparseid1] = jacdifp[1]
-        efc_J_out[worldid, 0, sparseid2] = jacdifp[2]
-        efc_J_out[worldid, 0, sparseid3] = jacdifr[0]
-        efc_J_out[worldid, 0, sparseid4] = jacdifr[1]
-        efc_J_out[worldid, 0, sparseid5] = jacdifr[2]
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid0] = jacdifp[0]
+        slot_set(worldid, srow, 0, da, jacdifp[0], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid1] = jacdifp[1]
+        slot_set(worldid, srow, 1, da, jacdifp[1], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid2] = jacdifp[2]
+        slot_set(worldid, srow, 2, da, jacdifp[2], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid3] = jacdifr[0]
+        slot_set(worldid, srow, 3, da, jacdifr[0], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid4] = jacdifr[1]
+        slot_set(worldid, srow, 4, da, jacdifr[1], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid5] = jacdifr[2]
+        slot_set(worldid, srow, 5, da, jacdifr[2], dof_slotcol_in, slot_J_out)
 
         Jqvelp += jacdifp * qvel_in[worldid, da]
         Jqvelr += jacdifr * qvel_in[worldid, da]
@@ -2052,6 +2119,8 @@ def _friction_dof(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     nf_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -2076,6 +2145,7 @@ def _friction_dof(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     worldid, dofid = wp.tid()
 
@@ -2091,6 +2161,7 @@ def _friction_dof(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
       rows_discover(worldid, rows_tree0, rows_tree1, 1, ROW_FRICTION, tree_island_out, island_parent_out, tree_nrow_out)
       return
     wp.atomic_add(nf_out, worldid, 1)
+    srow = int(-1)
     if wp.static(ROWS == ROWS_WRITE):
       rows_tree0 = island_dof_treeid_in[dofid]
       wp.atomic_add(nefc_out, worldid, 1)
@@ -2104,6 +2175,8 @@ def _friction_dof(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
         island_rowadr_in,
         island_cursor_out,
       )
+      srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+      slot_zero(srow, 1, slot_J_out)
     else:
       efcid = wp.atomic_add(nefc_out, worldid, 1)
 
@@ -2111,18 +2184,22 @@ def _friction_dof(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
       return
 
     if wp.static(is_sparse and newton):
-      jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-      efc_jtdaj_adr_out[worldid, jgid] = efcid
-      efc_jtdaj_nrow_out[worldid, jgid] = 1
+      if srow < 0:
+        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+        efc_jtdaj_adr_out[worldid, jgid] = efcid
+        efc_jtdaj_nrow_out[worldid, jgid] = 1
 
     if wp.static(is_sparse):
-      efc_J_rownnz_out[worldid, efcid] = 1
-      rowadr = wp.atomic_add(efc_nnz_out, worldid, 1)
-      if rowadr + 1 > njmax_nnz_in:
+      efc_J_rownnz_out[worldid, efcid] = wp.where(srow >= 0, 0, 1)
+      rowadr = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, 1))
+      if srow < 0 and rowadr + 1 > njmax_nnz_in:
         return
       efc_J_rowadr_out[worldid, efcid] = rowadr
-      efc_J_colind_out[worldid, 0, rowadr] = dofid
-      efc_J_out[worldid, 0, rowadr] = 1.0
+      if srow < 0:
+        efc_J_colind_out[worldid, 0, rowadr] = dofid
+      if srow < 0:
+        efc_J_out[worldid, 0, rowadr] = 1.0
+      slot_set(worldid, srow, 0, dofid, 1.0, dof_slotcol_in, slot_J_out)
     else:
       for i in range(nv):
         efc_J_out[worldid, efcid, i] = 0.0
@@ -2189,6 +2266,8 @@ def _friction_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     nf_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -2213,6 +2292,7 @@ def _friction_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     worldid, tenid = wp.tid()
 
@@ -2240,6 +2320,7 @@ def _friction_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
       rows_discover(worldid, rows_tree0, rows_tree1, 1, ROW_FRICTION, tree_island_out, island_parent_out, tree_nrow_out)
       return
     wp.atomic_add(nf_out, worldid, 1)
+    srow = int(-1)
     if wp.static(ROWS == ROWS_WRITE):
       rows_tree0 = rows_tendon_tree(island_dof_treeid_in, ten_J_rownnz, ten_J_rowadr, ten_J_colind, tenid)
       wp.atomic_add(nefc_out, worldid, 1)
@@ -2253,6 +2334,8 @@ def _friction_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
         island_rowadr_in,
         island_cursor_out,
       )
+      srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+      slot_zero(srow, 1, slot_J_out)
     else:
       efcid = wp.atomic_add(nefc_out, worldid, 1)
 
@@ -2260,18 +2343,19 @@ def _friction_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
       return
 
     if wp.static(is_sparse and newton):
-      jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-      efc_jtdaj_adr_out[worldid, jgid] = efcid
-      efc_jtdaj_nrow_out[worldid, jgid] = 1
+      if srow < 0:
+        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+        efc_jtdaj_adr_out[worldid, jgid] = efcid
+        efc_jtdaj_nrow_out[worldid, jgid] = 1
 
     Jqvel = float(0.0)
 
     rownnz_tenJ = ten_J_rownnz[tenid]
     rowadr_tenJ = ten_J_rowadr[tenid]
     if wp.static(is_sparse):
-      efc_J_rownnz_out[worldid, efcid] = rownnz_tenJ
-      rowadr_efc = wp.atomic_add(efc_nnz_out, worldid, rownnz_tenJ)
-      if rowadr_efc + rownnz_tenJ > njmax_nnz_in:
+      efc_J_rownnz_out[worldid, efcid] = wp.where(srow >= 0, 0, rownnz_tenJ)
+      rowadr_efc = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, rownnz_tenJ))
+      if srow < 0 and rowadr_efc + rownnz_tenJ > njmax_nnz_in:
         return
       efc_J_rowadr_out[worldid, efcid] = rowadr_efc
 
@@ -2280,8 +2364,11 @@ def _friction_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
         sparseid_efc = rowadr_efc + i
         colind = ten_J_colind[sparseid_ten]
         J = ten_J_in[worldid, sparseid_ten]
-        efc_J_colind_out[worldid, 0, sparseid_efc] = colind
-        efc_J_out[worldid, 0, sparseid_efc] = J
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid_efc] = colind
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid_efc] = J
+        slot_set(worldid, srow, 0, colind, J, dof_slotcol_in, slot_J_out)
         Jqvel += J * qvel_in[worldid, colind]
     else:
       nnz = int(0)
@@ -2357,6 +2444,8 @@ def _limit_slide_hinge(is_sparse: bool, newton: bool, is_discrete: bool = False,
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     nl_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -2381,6 +2470,7 @@ def _limit_slide_hinge(is_sparse: bool, newton: bool, is_discrete: bool = False,
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     worldid, jntlimitedid = wp.tid()
     jntid = jnt_limited_slide_hinge_adr[jntlimitedid]
@@ -2402,6 +2492,7 @@ def _limit_slide_hinge(is_sparse: bool, newton: bool, is_discrete: bool = False,
         rows_discover(worldid, rows_tree0, rows_tree1, 1, ROW_LIMIT, tree_island_out, island_parent_out, tree_nrow_out)
         return
       wp.atomic_add(nl_out, worldid, 1)
+      srow = int(-1)
       if wp.static(ROWS == ROWS_WRITE):
         rows_tree0 = island_dof_treeid_in[jnt_dofadr[jntid]]
         wp.atomic_add(nefc_out, worldid, 1)
@@ -2415,6 +2506,8 @@ def _limit_slide_hinge(is_sparse: bool, newton: bool, is_discrete: bool = False,
           island_rowadr_in,
           island_cursor_out,
         )
+        srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+        slot_zero(srow, 1, slot_J_out)
       else:
         efcid = wp.atomic_add(nefc_out, worldid, 1)
 
@@ -2422,22 +2515,26 @@ def _limit_slide_hinge(is_sparse: bool, newton: bool, is_discrete: bool = False,
         return
 
       if wp.static(is_sparse and newton):
-        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-        efc_jtdaj_adr_out[worldid, jgid] = efcid
-        efc_jtdaj_nrow_out[worldid, jgid] = 1
+        if srow < 0:
+          jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+          efc_jtdaj_adr_out[worldid, jgid] = efcid
+          efc_jtdaj_nrow_out[worldid, jgid] = 1
 
       dofadr = jnt_dofadr[jntid]
 
       J = float(dist_min < dist_max) * 2.0 - 1.0
 
       if wp.static(is_sparse):
-        efc_J_rownnz_out[worldid, efcid] = 1
-        rowadr = wp.atomic_add(efc_nnz_out, worldid, 1)
-        if rowadr + 1 > njmax_nnz_in:
+        efc_J_rownnz_out[worldid, efcid] = wp.where(srow >= 0, 0, 1)
+        rowadr = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, 1))
+        if srow < 0 and rowadr + 1 > njmax_nnz_in:
           return
         efc_J_rowadr_out[worldid, efcid] = rowadr
-        efc_J_colind_out[worldid, 0, rowadr] = dofadr
-        efc_J_out[worldid, 0, rowadr] = J
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, rowadr] = dofadr
+        if srow < 0:
+          efc_J_out[worldid, 0, rowadr] = J
+        slot_set(worldid, srow, 0, dofadr, J, dof_slotcol_in, slot_J_out)
       else:
         for i in range(nv):
           efc_J_out[worldid, efcid, i] = 0.0
@@ -2505,6 +2602,8 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     nl_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -2529,6 +2628,7 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     worldid, jntlimitedid = wp.tid()
     jntid = jnt_limited_ball_adr[jntlimitedid]
@@ -2555,6 +2655,7 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
         rows_discover(worldid, rows_tree0, rows_tree1, 1, ROW_LIMIT, tree_island_out, island_parent_out, tree_nrow_out)
         return
       wp.atomic_add(nl_out, worldid, 1)
+      srow = int(-1)
       if wp.static(ROWS == ROWS_WRITE):
         rows_tree0 = island_dof_treeid_in[jnt_dofadr[jntid]]
         wp.atomic_add(nefc_out, worldid, 1)
@@ -2568,6 +2669,8 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
           island_rowadr_in,
           island_cursor_out,
         )
+        srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+        slot_zero(srow, 1, slot_J_out)
       else:
         efcid = wp.atomic_add(nefc_out, worldid, 1)
 
@@ -2575,9 +2678,10 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
         return
 
       if wp.static(is_sparse and newton):
-        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-        efc_jtdaj_adr_out[worldid, jgid] = efcid
-        efc_jtdaj_nrow_out[worldid, jgid] = 1
+        if srow < 0:
+          jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+          efc_jtdaj_adr_out[worldid, jgid] = efcid
+          efc_jtdaj_nrow_out[worldid, jgid] = 1
 
       dofadr = jnt_dofadr[jntid]
       dof0 = dofadr + 0
@@ -2585,9 +2689,9 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
       dof2 = dofadr + 2
 
       if wp.static(is_sparse):
-        efc_J_rownnz_out[worldid, efcid] = 3
-        rowadr = wp.atomic_add(efc_nnz_out, worldid, 3)
-        if rowadr + 3 > njmax_nnz_in:
+        efc_J_rownnz_out[worldid, efcid] = wp.where(srow >= 0, 0, 3)
+        rowadr = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, 3))
+        if srow < 0 and rowadr + 3 > njmax_nnz_in:
           return
         efc_J_rowadr_out[worldid, efcid] = rowadr
 
@@ -2595,13 +2699,22 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
         sparseid1 = rowadr + 1
         sparseid2 = rowadr + 2
 
-        efc_J_colind_out[worldid, 0, sparseid0] = dof0
-        efc_J_colind_out[worldid, 0, sparseid1] = dof1
-        efc_J_colind_out[worldid, 0, sparseid2] = dof2
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid0] = dof0
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid1] = dof1
+        if srow < 0:
+          efc_J_colind_out[worldid, 0, sparseid2] = dof2
 
-        efc_J_out[worldid, 0, sparseid0] = -axis[0]
-        efc_J_out[worldid, 0, sparseid1] = -axis[1]
-        efc_J_out[worldid, 0, sparseid2] = -axis[2]
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid0] = -axis[0]
+        slot_set(worldid, srow, 0, dof0, -axis[0], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid1] = -axis[1]
+        slot_set(worldid, srow, 0, dof1, -axis[1], dof_slotcol_in, slot_J_out)
+        if srow < 0:
+          efc_J_out[worldid, 0, sparseid2] = -axis[2]
+        slot_set(worldid, srow, 0, dof2, -axis[2], dof_slotcol_in, slot_J_out)
       else:
         for i in range(nv):
           efc_J_out[worldid, efcid, i] = 0.0
@@ -2675,6 +2788,8 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     nl_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -2699,6 +2814,7 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     worldid, tenlimitedid = wp.tid()
     tenid = tendon_limited_adr[tenlimitedid]
@@ -2731,6 +2847,7 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
         rows_discover(worldid, rows_tree0, rows_tree1, 1, ROW_LIMIT, tree_island_out, island_parent_out, tree_nrow_out)
         return
       wp.atomic_add(nl_out, worldid, 1)
+      srow = int(-1)
       if wp.static(ROWS == ROWS_WRITE):
         rows_tree0 = rows_tendon_tree(island_dof_treeid_in, ten_J_rownnz, ten_J_rowadr, ten_J_colind, tenid)
         wp.atomic_add(nefc_out, worldid, 1)
@@ -2744,6 +2861,8 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
           island_rowadr_in,
           island_cursor_out,
         )
+        srow = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slotrow_in)
+        slot_zero(srow, 1, slot_J_out)
       else:
         efcid = wp.atomic_add(nefc_out, worldid, 1)
 
@@ -2751,9 +2870,10 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
         return
 
       if wp.static(is_sparse and newton):
-        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-        efc_jtdaj_adr_out[worldid, jgid] = efcid
-        efc_jtdaj_nrow_out[worldid, jgid] = 1
+        if srow < 0:
+          jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+          efc_jtdaj_adr_out[worldid, jgid] = efcid
+          efc_jtdaj_nrow_out[worldid, jgid] = 1
 
       Jqvel = float(0.0)
       scl = float(dist_min < dist_max) * 2.0 - 1.0
@@ -2761,9 +2881,9 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
       rownnz_tenJ = ten_J_rownnz[tenid]
       rowadr_tenJ = ten_J_rowadr[tenid]
       if wp.static(is_sparse):
-        efc_J_rownnz_out[worldid, efcid] = rownnz_tenJ
-        rowadr_efc = wp.atomic_add(efc_nnz_out, worldid, rownnz_tenJ)
-        if rowadr_efc + rownnz_tenJ > njmax_nnz_in:
+        efc_J_rownnz_out[worldid, efcid] = wp.where(srow >= 0, 0, rownnz_tenJ)
+        rowadr_efc = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, rownnz_tenJ))
+        if srow < 0 and rowadr_efc + rownnz_tenJ > njmax_nnz_in:
           return
         efc_J_rowadr_out[worldid, efcid] = rowadr_efc
 
@@ -2772,8 +2892,11 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
           sparseid_efc = rowadr_efc + i
           colind = ten_J_colind[sparseid_ten]
           J = scl * ten_J_in[worldid, sparseid_ten]
-          efc_J_colind_out[worldid, 0, sparseid_efc] = colind
-          efc_J_out[worldid, 0, sparseid_efc] = J
+          if srow < 0:
+            efc_J_colind_out[worldid, 0, sparseid_efc] = colind
+          if srow < 0:
+            efc_J_out[worldid, 0, sparseid_efc] = J
+          slot_set(worldid, srow, 0, colind, J, dof_slotcol_in, slot_J_out)
           Jqvel += J * qvel_in[worldid, colind]
       else:
         nnz = int(0)
@@ -3144,6 +3267,8 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     nefc_out: wp.array[int],
     contact_efc_address_out: wp.array2d[int],
@@ -3159,6 +3284,7 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
     island_parent_out: wp.array2d[int],
     tree_nrow_out: wp.array2d[int],
     island_cursor_out: wp.array2d[int],
+    slot_J_out: wp.array2d[float],
   ):
     conid = wp.tid()
 
@@ -3199,6 +3325,7 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
       rows_tree1 = island_body_treeid_in[geom_bodyid[rows_geom[1]]]
       rows_discover(worldid, rows_tree0, rows_tree1, ndim, ROW_CONTACT, tree_island_out, island_parent_out, tree_nrow_out)
       return
+    srow = int(-1)
     if wp.static(ROWS == ROWS_WRITE):
       rows_geom = geom_in[conid]
       rows_tree0 = island_body_treeid_in[geom_bodyid[rows_geom[0]]]
@@ -3214,6 +3341,9 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
         island_rowadr_in,
         island_cursor_out,
       )
+      srow = rows_slot(
+        tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), base_efcid, island_slotrow_in
+      )
     else:
       base_efcid = wp.atomic_add(nefc_out, worldid, ndim)
     for dim in range(ndim):
@@ -3227,9 +3357,10 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
 
     if wp.static(is_sparse and newton):
       if base_efcid < njmax_in:
-        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-        efc_jtdaj_adr_out[worldid, jgid] = base_efcid
-        efc_jtdaj_nrow_out[worldid, jgid] = wp.min(ndim, njmax_in - base_efcid)
+        if srow < 0:
+          jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+          efc_jtdaj_adr_out[worldid, jgid] = base_efcid
+          efc_jtdaj_nrow_out[worldid, jgid] = wp.min(ndim, njmax_in - base_efcid)
 
     if wp.static(IS_SPARSE):
       geom = geom_in[conid]
@@ -3252,14 +3383,14 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
           da2 = dof_parentid[da2]
         rownnz += 1
 
-      rowadr = wp.atomic_add(efc_nnz_out, worldid, rownnz * ndim)
-      if rowadr + rownnz * ndim > njmax_nnz_in:
+      rowadr = wp.atomic_add(efc_nnz_out, worldid, wp.where(srow >= 0, 0, rownnz * ndim))
+      if srow < 0 and rowadr + rownnz * ndim > njmax_nnz_in:
         return
       for dim in range(ndim):
         efcid = base_efcid + dim
         if efcid < njmax_in:
           efc_J_rowadr_out[worldid, efcid] = rowadr + dim * rownnz
-          efc_J_rownnz_out[worldid, efcid] = rownnz
+          efc_J_rownnz_out[worldid, efcid] = wp.where(srow >= 0, 0, rownnz)
 
   return kernel
 
@@ -3607,7 +3738,7 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
 
 
 @cache_kernel
-def _efc_contact_jac_sparse(cone_type: types.ConeType):
+def _efc_contact_jac_sparse(cone_type: types.ConeType, slots: bool = False):
   IS_ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
@@ -3629,6 +3760,7 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType):
     contact_efc_address_in: wp.array2d[int],
     efc_J_rownnz_in: wp.array2d[int],
     efc_J_rowadr_in: wp.array2d[int],
+    tree_island_in: wp.array2d[int],
     nacon_in: wp.array[int],
     # In:
     condim_in: wp.array[int],
@@ -3637,10 +3769,15 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType):
     frame_in: wp.array2d[wp.vec3],
     friction_in: wp.array2d[float],
     worldid_in: wp.array[int],
+    island_body_treeid_in: wp.array[int],
+    island_slotrow_in: wp.array2d[int],
+    dof_slotcol_in: wp.array2d[int],
     # Data out:
     efc_J_colind_out: wp.array3d[int],
     efc_J_out: wp.array3d[float],
     efc_Jqvel_out: wp.array2d[float],
+    # Out:
+    slot_J_out: wp.array2d[float],
   ):
     conid, dimid = wp.tid()
 
@@ -3673,12 +3810,24 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType):
     rowadr = efc_J_rowadr_in[worldid, efcid]
     rownnz = efc_J_rownnz_in[worldid, efcid]
 
+    # the same tree as rows_write
+    srow = int(-1)
+    if wp.static(slots):
+      tree = island_body_treeid_in[geom_bodyid[geom[0]]]
+      if tree < 0:
+        tree = island_body_treeid_in[geom_bodyid[geom[1]]]
+      srow = rows_slot(tree_island_in, worldid, tree, efcid, island_slotrow_in)
+      slot_zero(srow, 1, slot_J_out)
+
     Jqvel = float(0.0)
     nnz = int(0)
     dofid = int(da)
 
     while True:
-      if nnz >= rownnz:
+      if srow >= 0:
+        if da < 0 or (da1 == da and da2 == da):
+          break
+      elif nnz >= rownnz:
         break
 
       if dofid == da:
@@ -3739,9 +3888,11 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType):
             else:
               J -= Ji * frii
 
-        sparseid = rowadr + nnz
-        efc_J_colind_out[worldid, 0, sparseid] = dofid
-        efc_J_out[worldid, 0, sparseid] = J
+        if srow < 0:
+          sparseid = rowadr + nnz
+          efc_J_colind_out[worldid, 0, sparseid] = dofid
+          efc_J_out[worldid, 0, sparseid] = J
+        slot_set(worldid, srow, 0, dofid, J, dof_slotcol_in, slot_J_out)
         nnz += 1
         Jqvel += J * qvel_in[worldid, dofid]
 
@@ -5442,6 +5593,7 @@ def make_constraint(m: types.Model, d: types.Data):
 
   rows = island.ROWS_WORLD
   island_parent = island_rowadr = tree_nrow = island_cursor = tree_island = None
+  island_slotrow = dof_slotcol = slot_J = None
   if island.island_rows(m):
     island_parent = wp.empty((d.nworld, m.ntree), dtype=int)
     tree_nrow = wp.empty((d.nworld, m.ntree * island.ROW_CLASSES), dtype=int)
@@ -5495,6 +5647,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.ne,
@@ -5519,6 +5673,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
         wp.launch(
@@ -5566,6 +5721,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.ne,
@@ -5590,6 +5747,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
         wp.launch(
@@ -5617,6 +5775,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.ne,
@@ -5641,6 +5801,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
         wp.launch(
@@ -5670,6 +5831,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.ne,
@@ -5694,6 +5857,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
 
@@ -5831,6 +5995,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.nf,
@@ -5855,6 +6021,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
 
@@ -5879,6 +6046,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.nf,
@@ -5903,6 +6072,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
 
@@ -5930,6 +6100,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.nl,
@@ -5954,6 +6126,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
 
@@ -5979,6 +6152,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.nl,
@@ -6003,6 +6178,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
 
@@ -6030,6 +6206,8 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
+            island_slotrow,
+            dof_slotcol,
           ],
           outputs=[
             d.nl,
@@ -6054,6 +6232,7 @@ def make_constraint(m: types.Model, d: types.Data):
             island_parent,
             tree_nrow,
             island_cursor,
+            slot_J,
           ],
         )
 
@@ -6152,6 +6331,8 @@ def make_constraint(m: types.Model, d: types.Data):
               m.body_treeid,
               m.dof_treeid,
               island_rowadr,
+              island_slotrow,
+              dof_slotcol,
             ],
             outputs=[
               d.nefc,
@@ -6167,6 +6348,7 @@ def make_constraint(m: types.Model, d: types.Data):
               island_parent,
               tree_nrow,
               island_cursor,
+              slot_J,
             ],
           )
 
@@ -6224,7 +6406,7 @@ def make_constraint(m: types.Model, d: types.Data):
               )
             else:
               wp.launch(
-                _efc_contact_jac_sparse(m.opt.cone),
+                _efc_contact_jac_sparse(m.opt.cone, slot_J is not None),
                 dim=(d.naconmax, nmaxdim),
                 inputs=[
                   m.body_parentid,
@@ -6242,6 +6424,7 @@ def make_constraint(m: types.Model, d: types.Data):
                   d.contact.efc_address,
                   d.efc.J_rownnz,
                   d.efc.J_rowadr,
+                  tree_island,
                   d.nacon,
                   d.contact.dim,
                   d.contact.geom,
@@ -6249,11 +6432,15 @@ def make_constraint(m: types.Model, d: types.Data):
                   contact_frame_2d,
                   contact_friction_2d,
                   d.contact.worldid,
+                  m.body_treeid,
+                  island_slotrow,
+                  dof_slotcol,
                 ],
                 outputs=[
                   d.efc.J_colind,
                   d.efc.J,
                   d.efc.Jqvel,
+                  slot_J,
                 ],
               )
           else:
@@ -6464,7 +6651,10 @@ def make_constraint(m: types.Model, d: types.Data):
       inputs=[m.ntree, d.nisland, d.tree_island, tree_nrow],
       outputs=[d.island_nefc, d.island_ne, d.island_nf, island_rowadr, island_cursor],
     )
+    slots = island.assign_slots(m, d)
+    island_slotrow, dof_slotcol, slot_J = slots.island_slotrow, slots.dof_slotcol, slots.J
     build(island.ROWS_WRITE)
+    island.island_rows_identity(m, d)
   else:
     build(island.ROWS_WORLD)
 

@@ -26,7 +26,7 @@ from mujoco_warp._src import island
 from mujoco_warp._src import island_solver
 
 
-def _fixture():
+def _fixture(slots: bool = True):
   """Islands of every kind: single boxes, stacks (2 and 3 tiles per side), a weld, an arm."""
   pos = {
     "s0": "0 0 .049",
@@ -62,13 +62,18 @@ def _fixture():
   )
   m.opt.island_solve = True
   # rows in island order
-  mjw.make_constraint(m, d)
+  if slots:
+    mjw.make_constraint(m, d)
+  else:
+    with island.no_slots():
+      mjw.make_constraint(m, d)
   # start away from the solution so every island iterates
   d.qacc_warmstart.zero_()
   return mjm, mjd, m, d
 
 
 def _dense_J(d):
+  """World 0's Jacobian, including the rows of islands in slots (kept only there)."""
   nefc = d.nefc.numpy()[0]
   rownnz, rowadr = d.efc.J_rownnz.numpy()[0], d.efc.J_rowadr.numpy()[0]
   colind, J = d.efc.J_colind.numpy()[0, 0], d.efc.J.numpy()[0, 0]
@@ -76,6 +81,15 @@ def _dense_J(d):
   out = np.zeros((nefc, nv))
   for r in range(nefc):
     out[r, colind[rowadr[r] : rowadr[r] + rownnz[r]]] = J[rowadr[r] : rowadr[r] + rownnz[r]]
+  slots = d.__dict__.get("_island_slots")
+  if slots is not None:
+    slotrow, slot_J = slots.island_slotrow.numpy()[0], slots.J.numpy()
+    island_nv, island_nefc = d.island_nv.numpy()[0], d.island_nefc.numpy()[0]
+    idofadr, iefcadr = d.island_idofadr.numpy()[0], d.island_iefcadr.numpy()[0]
+    idof2dof = d.map_idof2dof.numpy()[0]
+    for i in np.nonzero(slotrow != island.NO_SLOT)[0]:
+      r0, r1, n = iefcadr[i], iefcadr[i] + island_nefc[i], island_nv[i]
+      out[r0:r1, idof2dof[idofadr[i] : idofadr[i] + n]] = slot_J[slotrow[i] + r0 : slotrow[i] + r1, :n]
   return out
 
 
@@ -119,7 +133,9 @@ class IslandSolverTest(absltest.TestCase):
 
     def rows(island_solve):
       m.opt.island_solve = island_solve
-      mjw.make_constraint(m, d)
+      # without slots, so islands can be rediscovered from the sparse rows
+      with island.no_slots():
+        mjw.make_constraint(m, d)
       nefc = d.nefc.numpy()[0]
       etype, eid = d.efc.type.numpy()[0, :nefc], d.efc.id.numpy()[0, :nefc]
       order = np.lexsort((np.arange(nefc), eid, etype))
@@ -142,7 +158,6 @@ class IslandSolverTest(absltest.TestCase):
 
     # each island's rows are contiguous and ordered equality, friction, limit, contact
     nefc = d.nefc.numpy()[0]
-    island.compute_island_dofs(m, d)
     row_island = d.efc.island.numpy()[0, :nefc]
     self.assertTrue(np.all(np.diff(row_island) >= 0))
     rank = {0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 3, 7: 3}  # MuJoCo constraint types to classes
@@ -154,16 +169,52 @@ class IslandSolverTest(absltest.TestCase):
       self.assertEqual(d.island_nf.numpy()[0, i], cls.count(1))
       self.assertEqual(d.island_nefc.numpy()[0, i], len(cls))
 
+  def test_slot_rows(self):
+    """Islands in slots write their rows only there, dense with island-local columns."""
+    rows_fixture = test_data.fixture(
+      xml=_ROWS_XML, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
+    )
+    for _, _, m, d in (rows_fixture, _fixture()):
+      m.opt.island_solve = True
+
+      def rows():
+        nefc = d.nefc.numpy()[0]
+        etype, eid = d.efc.type.numpy()[0, :nefc], d.efc.id.numpy()[0, :nefc]
+        order = np.lexsort((np.arange(nefc), eid, etype))
+        return _dense_J(d)[order]
+
+      with island.no_slots():
+        mjw.make_constraint(m, d)
+      expect = rows()
+      # every slot entry must be written (stale rows from other steps are not zero)
+      slots = island.slot_buffers(m, d)
+      slots.J.fill_(np.nan)
+      mjw.make_constraint(m, d)
+      np.testing.assert_allclose(rows(), expect, atol=1e-6)
+
+      slotrow, slot_J = slots.island_slotrow.numpy()[0], slots.J.numpy()
+      nv, nefc, iefcadr = d.island_nv.numpy()[0], d.island_nefc.numpy()[0], d.island_iefcadr.numpy()[0]
+      rownnz = d.efc.J_rownnz.numpy()[0]
+      in_slot = np.nonzero(slotrow != island.NO_SLOT)[0]
+      self.assertGreater(len(in_slot), 1)
+      for i in in_slot:
+        r0, r1 = iefcadr[i], iefcadr[i] + nefc[i]
+        np.testing.assert_array_equal(rownnz[r0:r1], 0)
+        np.testing.assert_array_equal(slot_J[slotrow[i] + r0 : slotrow[i] + r1, nv[i] :], 0.0)
+
   def test_solve(self):
-    """The island solve reaches MuJoCo's solution."""
-    mjm, mjd, m, d = _fixture()
-    island_solver.solve(m, d)
-    np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
-    np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
+    """The island solve reaches MuJoCo's solution, with and without slots for small islands."""
+    for use_slots in (True, False):
+      mjm, mjd, m, d = _fixture(use_slots)
+      island_solver.solve(m, d)
+      np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3, err_msg=f"slots {use_slots}")
+      np.testing.assert_allclose(
+        d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3, err_msg=f"slots {use_slots}"
+      )
 
   def test_hessian(self):
     """Each island's H block is M + J'DJ over its quadratic rows, after incremental updates."""
-    mjm, mjd, m, d = _fixture()
+    mjm, mjd, m, d = _fixture(slots=False)
     ctx = island_solver.solve(m, d)
     self.assertGreater(ctx.niter.numpy()[0].max(), 1)
 
@@ -199,7 +250,7 @@ class IslandSolverTest(absltest.TestCase):
     Islands whose rows keep their states keep their search direction and gradient (scaled), as in
     the world solver's stable-state fast path; the welded pair has only equality rows.
     """
-    _, _, m, d = _fixture()
+    _, _, m, d = _fixture(slots=False)
     ctx = island_solver.solve(m, d)
     nisland = d.nisland.numpy()[0]
     grad_true = ctx.Ma.numpy()[0] - ctx.qfrc_smooth.numpy()[0] - ctx.frc.numpy()[0]
@@ -212,7 +263,7 @@ class IslandSolverTest(absltest.TestCase):
 
   def test_islands_converge_independently(self):
     """Islands stop at their own iteration; the world reports the slowest."""
-    _, _, m, d = _fixture()
+    _, _, m, d = _fixture(slots=False)
     ctx = island_solver.solve(m, d)
     niter = ctx.niter.numpy()[0, : d.nisland.numpy()[0]]
     self.assertLess(niter.min(), niter.max())
