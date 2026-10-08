@@ -188,18 +188,16 @@ class IslandSolverTest(absltest.TestCase):
       mjw.make_constraint(m, d)
       np.testing.assert_allclose(rows(), expect, atol=1e-6)
 
-      island_slot, slot_J = slots.island_slot.numpy()[0], slots.J.numpy()
+      island_slot, slot_J = slots.island_slot.numpy()[0], slots.J.numpy()[0]
       nv, nefc, iefcadr = d.island_nv.numpy()[0], d.island_nefc.numpy()[0], d.island_iefcadr.numpy()[0]
       rownnz = d.efc.J_rownnz.numpy()[0]
-      widths.update(island_slot[: d.nisland.numpy()[0], 1])
-      for i in np.nonzero(island_slot[:, 1])[0]:
-        base, width = island_slot[i]
+      widths.update(island_slot[: d.nisland.numpy()[0], 0])
+      for i in np.nonzero(island_slot[:, 0])[0]:
         r0, r1 = iefcadr[i], iefcadr[i] + nefc[i]
         np.testing.assert_array_equal(rownnz[r0:r1], 0)
-        rows = slot_J[base + r0 * width : base + r1 * width].reshape(nefc[i], width)
-        np.testing.assert_array_equal(rows[:, nv[i] :], 0.0)
-    # every class is used, and some islands are left to the island solver
-    self.assertEqual(sorted(widths), [0, 8, 16, 32])
+        np.testing.assert_array_equal(slot_J[r0:r1, nv[i] : island_slot[i, 0]], 0.0)
+    # islands in each class: single boxes and the arm, short stacks, the tall stack
+    self.assertEqual(sorted(widths), [8, 16, 32, 64])
 
   def test_solve(self):
     """The island solve reaches MuJoCo's solution, with and without slots for small islands."""

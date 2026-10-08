@@ -2576,6 +2576,10 @@ class InverseContext:
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None
   compact_d_full: Optional["Data"] = None
+  # see SolverContext
+  efc_world: Optional[wp.array[int]] = None
+  efc_rowoff: Optional[wp.array[int]] = None
+  efc_problem: Optional[wp.array2d[int]] = None
 
 
 @dataclasses.dataclass
@@ -2624,6 +2628,12 @@ class SolverContext:
   island_large: Optional[wp.array[int]] = None  # 1 if any island is left for the world solve
   pgrad: Optional[wp.array2d[float]] = None
   psearch: Optional[wp.array2d[float]] = None
+  # islands solved as worlds: problem p's rows are rows [efc_rowoff[p], + nefc[p]) of world
+  # efc_world[p] in the efc and row workspace arrays (None: problem p is world p, from row 0)
+  efc_world: Optional[wp.array[int]] = None
+  efc_rowoff: Optional[wp.array[int]] = None
+  # row -> problem (-1: the row is not in a problem), for kernels with one thread per row
+  efc_problem: Optional[wp.array2d[int]] = None
 
 
 @dataclasses.dataclass

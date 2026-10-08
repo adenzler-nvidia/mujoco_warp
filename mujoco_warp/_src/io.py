@@ -2340,16 +2340,14 @@ def put_data(
 
 
 def _island_slot_rows(efc_J: np.ndarray, d: types.Data, slots, worldid: int):
-  """Fill the rows of islands solved in slots (island_slot: J address base, width)."""
-  island_slot, slot_J = slots.island_slot.numpy()[worldid], slots.J.numpy()
+  """Fill the rows of islands solved in slots (dense, island-local columns, in slots.J)."""
+  island_slot, slot_J = slots.island_slot.numpy()[worldid], slots.J.numpy()[worldid]
   island_nv, island_nefc = d.island_nv.numpy()[worldid], d.island_nefc.numpy()[worldid]
   idofadr, iefcadr = d.island_idofadr.numpy()[worldid], d.island_iefcadr.numpy()[worldid]
   idof2dof = d.map_idof2dof.numpy()[worldid]
-  for i in np.nonzero(island_slot[:, 1])[0]:
-    base, width = island_slot[i]
+  for i in np.nonzero(island_slot[:, 0])[0]:
     r0, r1, n = iefcadr[i], iefcadr[i] + island_nefc[i], island_nv[i]
-    rows = slot_J[base + r0 * width : base + r1 * width].reshape(r1 - r0, width)
-    efc_J[r0:r1, idof2dof[idofadr[i] : idofadr[i] + n]] = rows[:, :n]
+    efc_J[r0:r1, idof2dof[idofadr[i] : idofadr[i] + n]] = slot_J[r0:r1, :n]
 
 
 def get_data_into(
