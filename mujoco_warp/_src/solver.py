@@ -2809,6 +2809,11 @@ def _active_check(tid: int, threshold: int) -> float:
     return 1.0
 
 
+@wp.func
+def _keep_row(active: float, x: float) -> float:
+  return wp.where(active != 0.0, x, 0.0)
+
+
 @cache_kernel
 def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njmax: int, ragged: bool = False):
   """Compact-path variant of _update_gradient_JTDAJ_dense_tiled.
@@ -2873,6 +2878,11 @@ def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njma
 
       active_tile = wp.tile_map(_active_check, tid_tile, threshold_tile)
       D_k = wp.tile_map(wp.mul, active_tile, D_k)
+      if wp.static(RAGGED):
+        # rows past the problem's are other data (e.g. narrower rows of the next island, or
+        # uninitialized): select, not multiply
+        rows = wp.tile_broadcast(wp.tile_reshape(active_tile, shape=(TILE_SIZE_K, 1)), shape=(TILE_SIZE_K, nv_pad))
+        J_kj = wp.tile_map(_keep_row, rows, J_kj)
 
       J_ki = wp.tile_map(wp.mul, wp.tile_transpose(J_kj), wp.tile_broadcast(D_k, shape=(nv_pad, TILE_SIZE_K)))
 
@@ -3764,9 +3774,9 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         )
         if ctx.efc_world is not None:
           wp.launch(
-            _add_M_ragged(m.nv),
-            dim=(ctx.dof_problem.shape[0], m.M_mulm_col.shape[0]),
-            inputs=[m.M_mulm_rowadr, m.M_mulm_col, m.M_mulm_madr, d.M, ctx.done, ctx.dof_problem, ctx.dof_local],
+            _add_M_ragged,
+            dim=(ctx.dof_problem.shape[0], m.M_colind.shape[0]),
+            inputs=[m.M_colind, m.M_hinit_i, d.M, ctx.done, ctx.dof_problem, ctx.dof_local],
             outputs=[ctx.h],
           )
       else:
@@ -5974,52 +5984,36 @@ def _mul_m_sparse_ragged(
   res[problem, i] = acc
 
 
-@cache_kernel
-def _add_M_ragged(nv: int):  # noqa: ARG001 (one kernel per class)
-  @wp.kernel(module="unique", enable_backward=False)
-  def kernel(
-    # Model:
-    M_mulm_rowadr: wp.array[int],
-    M_mulm_col: wp.array[int],
-    M_mulm_madr: wp.array[int],
-    # Data in:
-    M_in: wp.array2d[float],
-    # In:
-    ctx_done_in: wp.array[bool],
-    ctx_dof_problem_in: wp.array2d[int],
-    ctx_dof_local_in: wp.array2d[int],
-    # Out:
-    ctx_h_out: wp.array3d[float],
-  ):
-    """Add the world's M to the upper triangle of each problem's H, one thread per M entry.
+@wp.kernel
+def _add_M_ragged(
+  # Model:
+  M_colind: wp.array[int],
+  M_hinit_i: wp.array[int],
+  # Data in:
+  M_in: wp.array2d[float],
+  # In:
+  ctx_done_in: wp.array[bool],
+  ctx_dof_problem_in: wp.array2d[int],
+  ctx_dof_local_in: wp.array2d[int],
+  # Out:
+  ctx_h_out: wp.array3d[float],
+):
+  """Add the world's M to the upper triangle of each problem's H, one thread per CSR M entry.
 
-    H starts as J'DJ plus the identity (padding DOFs keep it), so diagonals add M_ii - 1. Each entry
-    (i, j >= i) of a problem's H takes one M entry, so there are no conflicts.
-    """
-    worldid, k = wp.tid()
-    # the entry's row: the last one whose first entry is at or before k
-    lo = int(0)
-    hi = M_mulm_rowadr.shape[0] - 1
-    while hi - lo > 1:
-      mid = (lo + hi) // 2
-      if M_mulm_rowadr[mid] <= k:
-        lo = mid
-      else:
-        hi = mid
-    dofid = lo
-    problem = ctx_dof_problem_in[worldid, dofid]
-    if problem < 0:
-      return
-    if ctx_done_in[problem]:
-      return
-    i = ctx_dof_local_in[worldid, dofid]
-    j = ctx_dof_local_in[worldid, M_mulm_col[k]]
-    if j > i:
-      ctx_h_out[problem, i, j] += M_in[worldid, M_mulm_madr[k]]
-    elif j == i:
-      ctx_h_out[problem, i, j] += M_in[worldid, M_mulm_madr[k]] - 1.0
-
-  return kernel
+  H starts as J'DJ plus the identity (padding DOFs keep it), so diagonals add M_ii - 1. The CSR M
+  holds the lower triangle, so each upper entry of a problem's H takes exactly one M entry.
+  """
+  worldid, ec = wp.tid()
+  row = M_hinit_i[ec]
+  problem = ctx_dof_problem_in[worldid, row]
+  if problem < 0:
+    return
+  if ctx_done_in[problem]:
+    return
+  i = ctx_dof_local_in[worldid, row]
+  j = ctx_dof_local_in[worldid, M_colind[ec]]
+  value = M_in[worldid, ec] - wp.where(i == j, 1.0, 0.0)
+  ctx_h_out[problem, wp.min(i, j), wp.max(i, j)] += value
 
 
 def _sparse_compact(ctx: SolverContext | InverseContext) -> bool:

@@ -113,6 +113,8 @@ class IslandContext:
   group_list: wp.array2d[int]
   group_problem: wp.array2d[int]
   nsolving: wp.array[int]
+  # the dense world solver's model, data and context for two-tile groups (see _create_dense)
+  dense: object = None
 
 
 def supported(m: types.Model) -> bool:
@@ -1971,6 +1973,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   # islands are solved in groups (see island.MERGE)
   g = island.slot_buffers(m, d)
   dense = _create_dense(m, d, ctx, g)
+  ctx.dense = dense
   d.solver_niter.zero_()
   wp.launch(_free_dofs, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, g.dof_group], outputs=[d.qacc, d.qfrc_constraint])
 

@@ -28,7 +28,7 @@ from mujoco_warp._src import island_solver
 
 
 def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
-  """Islands of every kind: single boxes, stacks (2 and 3 tiles per side), a weld, an arm."""
+  """Islands of every kind: single boxes, stacks (2, 3 tiles per side), a weld, an arm, a chain."""
   pos = {
     "s0": "0 0 .049",
     "s1": "1 0 .049",
@@ -48,12 +48,18 @@ def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
     '<body pos=".3 0 0"><joint type="hinge" axis="0 1 0" frictionloss=".2"/>'
     '<geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/></body></body>'
   )
+  # an 18-DOF chain on the floor: a two-tile group with a full inertia matrix
+  chain = '<body name="c0" pos="8 0 .03"><freejoint/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".03"/>'
+  for i in range(12):
+    axis = "0 1 0" if i % 2 else "0 0 1"
+    chain += f'<body pos=".1 0 0"><joint type="hinge" axis="{axis}"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".03"/>'
+  chain += "</body>" * 13
   # the second welded box spins, so the weld loads every DOF of the pair
-  qvel = np.zeros(2 + 6 * len(pos))
+  qvel = np.zeros(18 + 2 + 6 * len(pos))
   qvel[-3:] = [1.0, 2.0, 3.0]
   xml = f"""
   <mujoco>
-    <worldbody><geom type="plane" size="10 10 .1"/>{arm}{bodies}</worldbody>
+    <worldbody><geom type="plane" size="10 10 .1"/>{chain}{arm}{bodies}</worldbody>
     <equality><weld body1="w0" body2="w1"/></equality>
     <keyframe><key qvel="{" ".join(map(str, qvel))}"/></keyframe>
   </mujoco>
@@ -239,9 +245,24 @@ class IslandSolverTest(absltest.TestCase):
     island_nv, island_nefc, island_iefcadr = (a.numpy()[0] for a in (g.group_nv, g.group_nefc, g.group_iefcadr))
     ntiles = []
     width = g.group_slot.numpy()[0, :, 0]
+    state = d.efc.state.numpy()[0]
+    dense_h, problem = ctx.dense.ctx.h.numpy(), ctx.group_problem.numpy()[0]
+    idof2dof, idofadr = d.map_idof2dof.numpy()[0], g.group_idofadr.numpy()[0]
+    ndense = 0
     for i in range(g.ngroup.numpy()[0]):
-      # two-tile dense groups are solved by the dense world solver (H in its own context)
       if width[i] == 32:
+        # two-tile dense groups: the dense world solver's H (upper triangle, identity padding)
+        dofs = idof2dof[idofadr[i] : idofadr[i] + island_nv[i]]
+        Hi = M[np.ix_(dofs, dofs)].copy()
+        for r in range(island_iefcadr[i], island_iefcadr[i] + island_nefc[i]):
+          if state[r] == mujoco.mjtConstraintState.mjCNSTRSTATE_QUADRATIC:
+            Jr = J[iefc2efc[r], dofs]
+            Hi += D[iefc2efc[r]] * np.outer(Jr, Jr)
+        Hp = dense_h[problem[i]]
+        n = len(dofs)
+        np.testing.assert_allclose(np.triu(Hp[:n, :n]), np.triu(Hi), rtol=1e-4, atol=1e-4, err_msg=f"dense group {i}")
+        np.testing.assert_allclose(np.diag(Hp)[n:], 1.0)
+        ndense += 1
         continue
       c, tilebase, vbase = ctx.ntile.numpy()[0, i], ctx.tilebase.numpy()[0, i], ctx.vbase.numpy()[0, i]
       ntiles.append(c)
@@ -259,6 +280,8 @@ class IslandSolverTest(absltest.TestCase):
           entry = H[16 * (tilebase + (a // 16) * c + b // 16) + a % 16, b % 16]
           np.testing.assert_allclose(entry, Hi[a, b], rtol=1e-4, atol=1e-4, err_msg=f"group {i} ({a}, {b})")
     self.assertIn(3, ntiles)
+    if dense_nv == 32:
+      self.assertGreater(ndense, 0)
 
   def test_gradient_scale(self):
     """The stored gradient times grad_scale is the gradient at the final point.
