@@ -974,9 +974,10 @@ ROW_CONTACT = 3
 # so a 16 x 16 tile is 256 contiguous values. Their rows have J_rownnz = 0. Wider islands keep
 # sparse rows.
 DENSE_NV = 64  # read at each make_constraint
-# The island solver solves groups of islands: runs of consecutive islands that share a 16-DOF tile
-# (e.g. two free bodies), with block-diagonal Hessians. Groups are decided with the dense blocks;
-# MERGE = False keeps one island per group.
+# The island solver solves groups of islands: runs of consecutive islands that fit in one 16-DOF
+# tile together (e.g. two free bodies), with block-diagonal Hessians, solved whole in one kernel.
+# Larger groups would leave that path and waste work on their block-diagonal Hessian. Groups are
+# decided with the dense blocks; MERGE = False keeps one island per group.
 MERGE = True  # read at each make_constraint
 _dense = [True]
 
@@ -1060,11 +1061,6 @@ def _fits(end: int, nnz_max: int) -> int:
   return wp.where(end <= nnz_max, 1, 0)
 
 
-@wp.func
-def _ntile16(n: int) -> int:
-  return (n + 15) // 16
-
-
 @cache_kernel
 def _island_groups(ntree: int):
   @wp.kernel(module="unique", enable_backward=False)
@@ -1085,7 +1081,7 @@ def _island_groups(ntree: int):
     group_nefc_out: wp.array2d[int],
     group_iefcadr_out: wp.array2d[int],
   ):
-    """Pack consecutive islands into groups where that saves a 16-DOF tile.
+    """Pack consecutive islands into groups that fit in one 16-DOF tile.
 
     Greedy, so serial per world: one lane, from the island sizes in shared memory.
     """
@@ -1101,7 +1097,7 @@ def _island_groups(ntree: int):
     gnefc = int(0)
     for i in range(nisland_in[worldid]):
       n = nv[i]
-      if g >= 0 and merge and _ntile16(gnv + n) < _ntile16(gnv) + _ntile16(n):
+      if g >= 0 and merge and gnv + n <= 16:
         gnv += n
         gnefc += nefc[i]
       else:

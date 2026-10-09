@@ -281,7 +281,7 @@ class IslandSolverTest(absltest.TestCase):
     self.assertEqual(d.solver_niter.numpy()[0], niter.max())
 
   def test_island_groups(self):
-    """Consecutive islands share a group where that saves a tile; the solution is unchanged."""
+    """Consecutive islands share a group if they fit in one tile; the solution is unchanged."""
     mjm, mjd, m, d = _fixture()
     g = island.slot_buffers(m, d)
     nv, group = d.island_nv.numpy()[0], g.island_group.numpy()[0]
@@ -292,8 +292,7 @@ class IslandSolverTest(absltest.TestCase):
       members = nv[:nisland][group[:nisland] == k]
       self.assertEqual(members.sum(), group_nv[k])
       if len(members) > 1:
-        # merged only where the group takes fewer tiles than its islands
-        self.assertLess((group_nv[k] + 15) // 16, ((members + 15) // 16).sum())
+        self.assertLessEqual(group_nv[k], 16)
     island_solver.solve(m, d)
     np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
 
