@@ -62,9 +62,10 @@ def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
     xml=xml, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
   )
   m.opt.island_solve = True
-  # rows in island order, dense blocks for islands up to dense_nv DOFs; no stale Jacobian entry
-  # may be used
+  # rows in island order, dense rows for groups up to dense_nv DOFs; no stale Jacobian entry may be
+  # used
   d.efc.J.fill_(np.nan)
+  island.slot_buffers(m, d).J.fill_(np.nan)
   default = island.DENSE_NV, island.MERGE
   island.DENSE_NV, island.MERGE = dense_nv, merge
   try:
@@ -168,7 +169,7 @@ class IslandSolverTest(absltest.TestCase):
       self.assertEqual(d.island_nefc.numpy()[0, i], len(cls))
 
   def test_dense_rows(self):
-    """Narrow island groups store their rows as one dense block of whole tiles, local columns."""
+    """Narrow island groups write their rows only as dense rows of whole tiles, local columns."""
     rows_fixture = test_data.fixture(
       xml=_ROWS_XML, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
     )
@@ -185,31 +186,32 @@ class IslandSolverTest(absltest.TestCase):
       with island.no_slots():
         mjw.make_constraint(m, d)
       expect = rows()
-      # every entry of a block must be written (stale values from other steps are not zero)
-      d.efc.J.fill_(np.nan)
+      # every dense entry must be written (stale values from other steps are not zero)
+      island.slot_buffers(m, d).J.fill_(np.nan)
       mjw.make_constraint(m, d)
       np.testing.assert_allclose(rows(), expect, atol=1e-6)
 
       g = island.slot_buffers(m, d)
-      group_slot, J = g.group_slot.numpy()[0], d.efc.J.numpy()[0, 0]
+      group_slot, J = g.group_slot.numpy()[0], g.J.numpy()[0]
       nv, rownnz = g.group_nv.numpy()[0], d.efc.J_rownnz.numpy()[0]
       ngroup = g.ngroup.numpy()[0]
-      np.testing.assert_array_equal(group_slot[:ngroup, 0], (nv[:ngroup] + 15) // 16 * 16)
+      width = (nv[:ngroup] + 15) // 16 * 16
+      np.testing.assert_array_equal(group_slot[:ngroup, 0], np.where(width <= island.DENSE_NV, width, 0))
       widths.update(group_slot[:ngroup, 0])
       for i in range(ngroup):
-        width, base, nrow, rowadr = group_slot[i]
-        np.testing.assert_array_equal(rownnz[rowadr : rowadr + nrow], 0)
-        block = J[base : base + width * nrow].reshape(width // 16, nrow, 16).transpose(1, 0, 2).reshape(nrow, width)
-        np.testing.assert_array_equal(block[:, nv[i] :], 0.0)
-    # one, two and three tiles
-    self.assertEqual(sorted(widths), [16, 32, 48])
+        width, _, nrow, rowadr = group_slot[i]
+        if width:
+          np.testing.assert_array_equal(rownnz[rowadr : rowadr + nrow], 0)
+          np.testing.assert_array_equal(J[rowadr : rowadr + nrow, nv[i] : width], 0.0)
+    # one tile, two tiles, and sparse (the tall stack)
+    self.assertEqual(sorted(widths), [0, 16, 32])
 
   def test_solve(self):
     """The island solve reaches MuJoCo's solution, with dense, mixed and sparse islands.
 
     Without merging, single boxes, the arm and the welded pair are one-tile groups (_solve_small).
     """
-    for dense_nv, merge in ((64, True), (64, False), (32, True), (0, True)):
+    for dense_nv, merge in ((32, True), (32, False), (16, True), (0, True)):
       with self.subTest(dense_nv=dense_nv, merge=merge):
         mjm, mjd, m, d = _fixture(dense_nv, merge)
         island_solver.solve(m, d)
@@ -218,7 +220,7 @@ class IslandSolverTest(absltest.TestCase):
 
   def test_hessian(self):
     """Each island's H block is M + J'DJ over its quadratic rows, after incremental updates."""
-    for dense_nv, merge in ((64, True), (64, False), (0, True)):
+    for dense_nv, merge in ((32, True), (32, False), (0, True)):
       with self.subTest(dense_nv=dense_nv, merge=merge):
         self._check_hessian(dense_nv, merge)
 
@@ -236,7 +238,11 @@ class IslandSolverTest(absltest.TestCase):
     g = island.slot_buffers(m, d)
     island_nv, island_nefc, island_iefcadr = (a.numpy()[0] for a in (g.group_nv, g.group_nefc, g.group_iefcadr))
     ntiles = []
+    width = g.group_slot.numpy()[0, :, 0]
     for i in range(g.ngroup.numpy()[0]):
+      # two-tile dense groups are solved by the dense world solver (H in its own context)
+      if width[i] == 32:
+        continue
       c, tilebase, vbase = ctx.ntile.numpy()[0, i], ctx.tilebase.numpy()[0, i], ctx.vbase.numpy()[0, i]
       ntiles.append(c)
       dofs = row2dof[vbase : vbase + island_nv[i]]
@@ -267,7 +273,11 @@ class IslandSolverTest(absltest.TestCase):
     grad_true = ctx.Ma.numpy()[0] - ctx.qfrc_smooth.numpy()[0] - ctx.frc.numpy()[0]
     grad, scale = ctx.grad.numpy()[0, :, 0], ctx.grad_scale.numpy()[0, :nisland]
     vbase, nv = ctx.vbase.numpy()[0, :nisland], g.group_nv.numpy()[0, :nisland]
+    width = g.group_slot.numpy()[0, :, 0]
     for i in range(nisland):
+      # two-tile dense groups are solved by the dense world solver
+      if width[i] == 32:
+        continue
       rows = slice(vbase[i], vbase[i] + nv[i])
       np.testing.assert_allclose(scale[i] * grad[rows], grad_true[rows], rtol=1e-3, atol=1e-4, err_msg=f"island {i}")
     self.assertTrue(np.any(np.abs(scale - 1.0) > 1e-3))
@@ -276,9 +286,12 @@ class IslandSolverTest(absltest.TestCase):
     """Islands stop at their own iteration; the world reports the slowest."""
     _, _, m, d = _fixture(merge=False)
     ctx = island_solver.solve(m, d)
-    niter = ctx.niter.numpy()[0, : d.nisland.numpy()[0]]
+    g = island.slot_buffers(m, d)
+    # groups of the island solver (two-tile dense groups are solved by the dense world solver)
+    own = g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0] != 32
+    niter = ctx.niter.numpy()[0, : g.ngroup.numpy()[0]][own]
     self.assertLess(niter.min(), niter.max())
-    self.assertEqual(d.solver_niter.numpy()[0], niter.max())
+    self.assertGreaterEqual(d.solver_niter.numpy()[0], niter.max())
 
   def test_island_groups(self):
     """Consecutive islands share a group if they fit in one tile; the solution is unchanged."""

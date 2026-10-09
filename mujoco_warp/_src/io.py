@@ -23,7 +23,6 @@ import numpy as np
 import warp as wp
 
 from mujoco_warp._src import history
-from mujoco_warp._src import island
 from mujoco_warp._src import sleep
 from mujoco_warp._src import support
 from mujoco_warp._src import types
@@ -1538,16 +1537,6 @@ def _calculate_max_contact_nnz(mjm: mujoco.MjModel) -> int:
   return max_contact_nnz
 
 
-def _island_dense_nnz(mjm: mujoco.MjModel, njmax: int) -> int:
-  """Room for opt.island_solve's dense Jacobian blocks (island.DENSE_NV) besides the sparse rows.
-
-  A row is stored dense (at most this wide) or sparse, so this plus the sparse estimate bounds both.
-  """
-  if mjm.ntree < 2:
-    return 0
-  return njmax * min((mjm.nv + 15) // 16 * 16, island.DENSE_NV)
-
-
 def _default_njmax_nnz(mjm: mujoco.MjModel, nconmax: int, njmax: int) -> int:
   """Returns a heuristic estimate for the number of non-zeros in the sparse constraint Jacobian.
 
@@ -1923,7 +1912,7 @@ def make_data(
 
   if njmax_nnz is None:
     if is_sparse(mjm):
-      njmax_nnz = _default_njmax_nnz(mjm, nconmax, njmax) + _island_dense_nnz(mjm, njmax)
+      njmax_nnz = _default_njmax_nnz(mjm, nconmax, njmax)
     else:
       njmax_nnz = njmax * mjm.nv
 
@@ -2153,7 +2142,7 @@ def put_data(
 
   if njmax_nnz is None:
     if is_sparse(mjm):
-      njmax_nnz = _default_njmax_nnz(mjm, nconmax, njmax) + _island_dense_nnz(mjm, njmax)
+      njmax_nnz = _default_njmax_nnz(mjm, nconmax, njmax)
     else:
       njmax_nnz = njmax * mjm.nv
 
@@ -2351,18 +2340,16 @@ def put_data(
 
 
 def _island_slot_rows(efc_J: np.ndarray, d: types.Data, slots, worldid: int):
-  """Fill the rows of island groups with a dense Jacobian block (see island.DENSE_NV)."""
-  group_slot, J = slots.group_slot.numpy()[worldid], d.efc.J.numpy()[worldid, 0]
+  """Fill the rows of island groups with dense rows (see island.DENSE_NV)."""
+  group_slot, J = slots.group_slot.numpy()[worldid], slots.J.numpy()[worldid]
   group_nv, group_idofadr = slots.group_nv.numpy()[worldid], slots.group_idofadr.numpy()[worldid]
   idof2dof = d.map_idof2dof.numpy()[worldid]
   for g in range(slots.ngroup.numpy()[worldid]):
-    width, base, nrow, rowadr = group_slot[g]
+    width, _, nrow, rowadr = group_slot[g]
     if width == 0:
       continue
     n = group_nv[g]
-    # tiles of 16 columns, each all rows x 16
-    block = J[base : base + width * nrow].reshape(width // 16, nrow, 16).transpose(1, 0, 2).reshape(nrow, width)
-    efc_J[rowadr : rowadr + nrow, idof2dof[group_idofadr[g] : group_idofadr[g] + n]] = block[:, :n]
+    efc_J[rowadr : rowadr + nrow, idof2dof[group_idofadr[g] : group_idofadr[g] + n]] = J[rowadr : rowadr + nrow, :n]
 
 
 def get_data_into(
