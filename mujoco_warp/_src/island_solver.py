@@ -209,8 +209,8 @@ def _group_lists(
   """Compacted lists of the groups that exist.
 
   Lists 0-3: groups of the iterative path (all, and by tiles per side: 1, 2, >= 3); list 4: dense
-  one-tile groups, solved whole by _solve_small (done for the iterative path). The Hessian tile
-  pairs (bi <= bj) of the iterative path's groups are listed too.
+  one-tile groups, solved whole by _solve_small (done for the iterative path); count 5: sparse
+  groups. The Hessian tile pairs (bi <= bj) of the iterative path's groups are listed too.
   """
   worldid, g = wp.tid()
   if g >= ngroup_in[worldid]:
@@ -222,6 +222,8 @@ def _group_lists(
     done_out[worldid, g] = True
     return
   group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed
+  if island_slot_in[worldid, g][0] == 0:
+    wp.atomic_add(group_count_out, 5, 1)
   c = wp.min(ntile, 3)
   group_list_out[c, wp.atomic_add(group_count_out, c, 1)] = packed
   npair = _npair(ntile)
@@ -407,11 +409,20 @@ def _rows(initial: bool):
     # Data in:
     nefc_in: wp.array[int],
     efc_type_in: wp.array2d[int],
+    efc_J_rownnz_in: wp.array2d[int],
+    efc_J_rowadr_in: wp.array2d[int],
+    efc_J_colind_in: wp.array3d[int],
+    efc_J_in: wp.array3d[float],
     efc_D_in: wp.array2d[float],
     efc_frictionloss_in: wp.array2d[float],
     efc_island_in: wp.array2d[int],
     # In:
+    island_slot_in: wp.array2d[wp.vec4i],
+    tilebase_in: wp.array2d[int],
+    ntile_in: wp.array2d[int],
+    vbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
+    dof2row_in: wp.array2d[int],
     row_jaref_in: wp.array2d[float],
     # Data out:
     efc_force_out: wp.array2d[float],
@@ -419,13 +430,16 @@ def _rows(initial: bool):
     # Out:
     row_quad_out: wp.array2d[bool],
     row_w_out: wp.array2d[float],
+    frc_out: wp.array2d[float],
+    H_out: wp.array3d[float],
     changed_out: wp.array2d[bool],
     state_changed_out: wp.array2d[bool],
   ):
     """Constraint force and state of a row, and the weight of its J'J term in the H update.
 
     H = M + sum of D J'J over quadratic rows: the initial pass weighs every quadratic row, later
-    ones only rows that flip (D added or removed).
+    ones only rows that flip (D added or removed). Rows of sparse groups also add J'force to frc
+    and, where they flip, w J'J to H (their initial H is assembled by _JTDACJ_sparse).
     """
     worldid, row = wp.tid()
     if row >= nefc_in[worldid]:
@@ -467,49 +481,11 @@ def _rows(initial: bool):
       w = wp.where(quad, D, -D)
     row_w_out[worldid, row] = w
 
-  return kernel
-
-
-@cache_kernel
-def _sparse_rows(initial: bool):
-  INITIAL = initial
-
-  @wp.kernel(module="unique", enable_backward=False)
-  def kernel(
-    # Data in:
-    nefc_in: wp.array[int],
-    efc_J_rownnz_in: wp.array2d[int],
-    efc_J_rowadr_in: wp.array2d[int],
-    efc_J_colind_in: wp.array3d[int],
-    efc_J_in: wp.array3d[float],
-    efc_force_in: wp.array2d[float],
-    efc_island_in: wp.array2d[int],
-    # In:
-    island_slot_in: wp.array2d[wp.vec4i],
-    tilebase_in: wp.array2d[int],
-    ntile_in: wp.array2d[int],
-    vbase_in: wp.array2d[int],
-    done_in: wp.array2d[bool],
-    dof2row_in: wp.array2d[int],
-    row_w_in: wp.array2d[float],
-    # Out:
-    frc_out: wp.array2d[float],
-    H_out: wp.array3d[float],
-  ):
-    """Rows of sparse islands: add J'force to frc and, where the row flipped, w J'J to H.
-
-    The initial H is assembled by _JTDACJ_sparse.
-    """
-    worldid, row = wp.tid()
-    if row >= nefc_in[worldid]:
+    if island_slot_in[worldid, islandid][0] > 0:
       return
-    islandid = efc_island_in[worldid, row]
-    if island_slot_in[worldid, islandid][0] > 0 or done_in[worldid, islandid]:
-      return
-    force = efc_force_in[worldid, row]
-    w = float(0.0)
-    if wp.static(not INITIAL):
-      w = row_w_in[worldid, row]
+    force = res[0]
+    if wp.static(INITIAL):
+      w = 0.0
     rowadr = efc_J_rowadr_in[worldid, row]
     rownnz = efc_J_rownnz_in[worldid, row]
     dof2row = dof2row_in[worldid]
@@ -1510,7 +1486,7 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     changed=wp.zeros((nworld, ntree), dtype=bool),
     state_changed=wp.zeros((nworld, ntree), dtype=bool),
     grad_scale=wp.ones((nworld, ntree), dtype=float),
-    group_count=wp.zeros(5, dtype=int),
+    group_count=wp.zeros(6, dtype=int),
     group_list=wp.empty((5, nworld * ntree), dtype=int),
     pair_count=wp.zeros(1, dtype=int),
     # at most one island of all DOFs and one tile for each other island
@@ -1545,8 +1521,25 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
   wp.launch(
     _rows(initial),
     dim=(d.nworld, d.njmax),
-    inputs=[d.nefc, d.efc.type, d.efc.D, d.efc.frictionloss, g.efc_group, ctx.done, ctx.row_jaref],
-    outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.row_w, ctx.changed, ctx.state_changed],
+    inputs=[
+      d.nefc,
+      d.efc.type,
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.efc.J_colind,
+      d.efc.J,
+      d.efc.D,
+      d.efc.frictionloss,
+      g.efc_group,
+      g.group_slot,
+      ctx.tilebase,
+      ctx.ntile,
+      ctx.vbase,
+      ctx.done,
+      ctx.dof2row,
+      ctx.row_jaref,
+    ],
+    outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.row_w, ctx.frc, ctx.H, ctx.changed, ctx.state_changed],
   )
   # dense islands: one block per tile pair of H
   wp.launch_tiled(
@@ -1571,29 +1564,10 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
     outputs=[ctx.H],
     block_dim=_PAIR_THREADS,
   )
-  # sparse islands: by rows
-  wp.launch(
-    _sparse_rows(initial),
-    dim=(d.nworld, d.njmax),
-    inputs=[
-      d.nefc,
-      d.efc.J_rownnz,
-      d.efc.J_rowadr,
-      d.efc.J_colind,
-      d.efc.J,
-      d.efc.force,
-      g.efc_group,
-      g.group_slot,
-      ctx.tilebase,
-      ctx.ntile,
-      ctx.vbase,
-      ctx.done,
-      ctx.dof2row,
-      ctx.row_w,
-    ],
-    outputs=[ctx.frc, ctx.H],
-  )
-  if initial:
+  # allocated outside the conditional body below (later evaluations run in the iteration loop)
+  world_done = wp.zeros(d.nworld, dtype=bool) if initial else None
+
+  def sparse_h():
     # dense rows have no constraint groups
     wp.launch(
       _JTDACJ_sparse(False, m.opt.cone, 3, True),
@@ -1615,12 +1589,19 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
         ctx.dof_poolrow,
         ctx.dof_local,
         ctx.row_jaref,
-        wp.zeros(d.nworld, dtype=bool),
+        world_done,
         _jtdaj_groups_per_world(d.nworld, d.njmax),
       ],
       outputs=[ctx.H],
       block_dim=m.block_dim.update_gradient_JTDAJ_sparse,
     )
+
+  # the initial H of sparse groups, only if there is one
+  if initial:
+    if m.opt.graph_conditional:
+      wp.capture_if(ctx.group_count[5:6], on_true=sparse_h)
+    else:
+      sparse_h()
 
 
 def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final: bool):
