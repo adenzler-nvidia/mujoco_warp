@@ -21,6 +21,7 @@ from mujoco_warp._src import island
 from mujoco_warp._src import math
 from mujoco_warp._src import support
 from mujoco_warp._src import types
+from mujoco_warp._src.island import ROW_CLASSES
 from mujoco_warp._src.island import ROW_CONTACT
 from mujoco_warp._src.island import ROW_EQUALITY
 from mujoco_warp._src.island import ROW_FRICTION
@@ -3872,7 +3873,9 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType, slots: bool = False):
       srow = srow_nv[0]
       snv = srow_nv[1]
       sstr = srow_nv[2]
-      slot_zero(worldid, srow, snv, sstr, 1, slot_J_out)
+      # dense rows: _efc_contact_jac_groups
+      if srow >= 0:
+        return
 
     Jqvel = float(0.0)
     nnz = int(0)
@@ -3962,6 +3965,119 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType, slots: bool = False):
     efc_Jqvel_out[worldid, efcid] = Jqvel
 
   return kernel
+
+
+@wp.kernel
+def _efc_contact_jac_groups(
+  # Model:
+  body_rootid: wp.array[int],
+  geom_bodyid: wp.array[int],
+  body_isdofancestor: wp.array2d[int],
+  # Data in:
+  qvel_in: wp.array2d[float],
+  subtree_com_in: wp.array2d[wp.vec3],
+  cdof_in: wp.array2d[wp.spatial_vector],
+  contact_efc_address_in: wp.array2d[int],
+  efc_id_in: wp.array2d[int],
+  island_nefc_in: wp.array2d[int],
+  island_iefcadr_in: wp.array2d[int],
+  map_idof2dof_in: wp.array2d[int],
+  njmax_in: int,
+  # In:
+  condim_in: wp.array[int],
+  geom_in: wp.array[wp.vec2i],
+  pos_in: wp.array[wp.vec3],
+  frame_in: wp.array2d[wp.vec3],
+  friction_in: wp.array2d[float],
+  island_rowadr_in: wp.array2d[int],
+  group_slot_in: wp.array2d[wp.vec4i],
+  group_idofadr_in: wp.array2d[int],
+  group_nv_in: wp.array2d[int],
+  group_island0_in: wp.array2d[int],
+  group_nisland_in: wp.array2d[int],
+  # Data out:
+  efc_Jqvel_out: wp.array2d[float],
+  # Out:
+  slot_J_out: wp.array3d[float],
+):
+  """Dense contact rows of an island group (pyramidal), as _efc_contact_jac_dense for a world.
+
+  One block per group, one lane per group-local column; the group's contact rows are the contact
+  class of each of its islands. Rows are written whole (zero where a DOF does not move the contact).
+  """
+  worldid, groupid, lane = wp.tid()
+  width = group_slot_in[worldid, groupid][0]
+  if width == 0:
+    return
+  dofid = int(-1)
+  if lane < group_nv_in[worldid, groupid]:
+    dofid = map_idof2dof_in[worldid, group_idofadr_in[worldid, groupid] + lane]
+  cdof = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  qvel = float(0.0)
+  if dofid >= 0:
+    cdof = cdof_in[worldid, dofid]
+    qvel = qvel_in[worldid, dofid]
+
+  prev_conid = int(-1)
+  condim = int(0)
+  j0p = float(0.0)
+  j1p = float(0.0)
+  j2p = float(0.0)
+  j0r = float(0.0)
+  j1r = float(0.0)
+  j2r = float(0.0)
+  island0 = group_island0_in[worldid, groupid]
+  for islandid in range(island0, island0 + group_nisland_in[worldid, groupid]):
+    rowbeg = island_rowadr_in[worldid, islandid * ROW_CLASSES + ROW_CONTACT]
+    rowend = wp.min(island_iefcadr_in[worldid, islandid] + island_nefc_in[worldid, islandid], njmax_in)
+    for efcid in range(rowbeg, rowend):
+      conid = efc_id_in[worldid, efcid]
+      # per-contact values only when the contact changes
+      if conid != prev_conid:
+        prev_conid = conid
+        condim = condim_in[conid]
+        geom = geom_in[conid]
+        body1 = geom_bodyid[geom[0]]
+        body2 = geom_bodyid[geom[1]]
+        con_pos = pos_in[conid]
+        jacp_dif = wp.vec3(0.0)
+        jacr_dif = wp.vec3(0.0)
+        if dofid >= 0:
+          offset1 = con_pos - subtree_com_in[worldid, body_rootid[body1]]
+          offset2 = con_pos - subtree_com_in[worldid, body_rootid[body2]]
+          affects1 = body_isdofancestor[body1, dofid]
+          affects2 = body_isdofancestor[body2, dofid]
+          jacp_dif = support._compute_jacp(cdof, offset2, affects2) - support._compute_jacp(cdof, offset1, affects1)
+          jacr_dif = support._compute_jacr(cdof, affects2) - support._compute_jacr(cdof, affects1)
+        frame0 = frame_in[conid, 0]
+        frame1 = frame_in[conid, 1]
+        frame2 = frame_in[conid, 2]
+        j0p = wp.dot(jacp_dif, frame0)
+        j1p = wp.dot(jacp_dif, frame1)
+        j2p = wp.dot(jacp_dif, frame2)
+        j0r = wp.dot(jacr_dif, frame0)
+        j1r = wp.dot(jacr_dif, frame1)
+        j2r = wp.dot(jacr_dif, frame2)
+      J = j0p
+      if condim > 1:
+        dimid = efcid - contact_efc_address_in[conid, 0]
+        dimid2 = dimid / 2 + 1
+        frii_sign = friction_in[conid, dimid2 - 1] * (1.0 - 2.0 * float(dimid & 1))
+        if dimid2 == 1:
+          J += j1p * frii_sign
+        elif dimid2 == 2:
+          J += j2p * frii_sign
+        elif dimid2 == 3:
+          J += j0r * frii_sign
+        elif dimid2 == 4:
+          J += j1r * frii_sign
+        else:
+          J += j2r * frii_sign
+      if lane < width:
+        slot_J_out[worldid, efcid, lane] = J
+      Jqvel = wp.tile_reduce(wp.add, wp.tile(J * qvel))
+      if lane == 0:
+        efc_Jqvel_out[worldid, efcid] = Jqvel[0]
 
 
 @cache_kernel
@@ -6498,6 +6614,39 @@ def make_constraint(m: types.Model, d: types.Data):
                   slot_J,
                 ],
               )
+              if island_slot is not None:
+                g = island.slot_buffers(m, d)
+                wp.launch_tiled(
+                  _efc_contact_jac_groups,
+                  dim=(d.nworld, m.ntree),
+                  inputs=[
+                    m.body_rootid,
+                    m.geom_bodyid,
+                    m.body_isdofancestor,
+                    d.qvel,
+                    d.subtree_com,
+                    d.cdof,
+                    d.contact.efc_address,
+                    d.efc.id,
+                    d.island_nefc,
+                    d.island_iefcadr,
+                    d.map_idof2dof,
+                    d.njmax,
+                    d.contact.dim,
+                    d.contact.geom,
+                    d.contact.pos,
+                    contact_frame_2d,
+                    contact_friction_2d,
+                    island_rowadr,
+                    g.group_slot,
+                    g.group_idofadr,
+                    g.group_nv,
+                    g.group_island0,
+                    g.group_nisland,
+                  ],
+                  outputs=[d.efc.Jqvel, slot_J],
+                  block_dim=32,
+                )
           else:
             d.efc.Jqvel.zero_()
             tile_size = m.block_dim.contact_jac_tiled

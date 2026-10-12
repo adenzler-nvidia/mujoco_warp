@@ -1068,6 +1068,8 @@ def _island_groups(ntree: int):
     group_iefcadr_out: wp.array2d[int],
     group_ne_out: wp.array2d[int],
     group_nf_out: wp.array2d[int],
+    group_island0_out: wp.array2d[int],
+    group_nisland_out: wp.array2d[int],
   ):
     """Pack consecutive islands into groups that fit in one 16-DOF tile.
 
@@ -1101,7 +1103,10 @@ def _island_groups(ntree: int):
         # and the solvers that use these counts (groups over one tile) see single islands
         group_ne_out[worldid, g] = island_ne_in[worldid, i]
         group_nf_out[worldid, g] = island_nf_in[worldid, i]
+        group_island0_out[worldid, g] = i
+        group_nisland_out[worldid, g] = 0
       island_group_out[worldid, i] = g
+      group_nisland_out[worldid, g] += 1
     if g >= 0:
       group_nv_out[worldid, g] = gnv
       group_nefc_out[worldid, g] = gnefc
@@ -1205,6 +1210,8 @@ class SlotBuffers:
     self.group_iefcadr = wp.empty(shape, dtype=int)
     self.group_ne = wp.empty(shape, dtype=int)
     self.group_nf = wp.empty(shape, dtype=int)
+    self.group_island0 = wp.empty(shape, dtype=int)
+    self.group_nisland = wp.empty(shape, dtype=int)
     self.group_slot = wp.empty(shape, dtype=wp.vec4i)
     self.island_slot = wp.empty(shape, dtype=wp.vec4i)
     self.dof_group = wp.empty((d.nworld, m.nv), dtype=int)
@@ -1251,6 +1258,8 @@ def assign_slots(m: types.Model, d: types.Data) -> SlotBuffers:
       buf.group_iefcadr,
       buf.group_ne,
       buf.group_nf,
+      buf.group_island0,
+      buf.group_nisland,
     ],
     block_dim=types.BlockDim.island_scan_sizes,
   )

@@ -54,9 +54,11 @@ def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
     axis = "0 1 0" if i % 2 else "0 0 1"
     chain += f'<body pos=".1 0 0"><joint type="hinge" axis="{axis}"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".03"/>'
   chain += "</body>" * 13
-  # the second welded box spins, so the weld loads every DOF of the pair
+  # the second welded box spins, so the weld loads every DOF of the pair; the first single box
+  # slides, so its contacts have a velocity
   qvel = np.zeros(18 + 2 + 6 * len(pos))
   qvel[-3:] = [1.0, 2.0, 3.0]
+  qvel[20] = 1.0
   xml = f"""
   <mujoco>
     <worldbody><geom type="plane" size="10 10 .1"/>{chain}{arm}{bodies}</worldbody>
