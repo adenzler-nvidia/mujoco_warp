@@ -1467,7 +1467,6 @@ def _dense_dofs(
   dense_qfrc_smooth_out: wp.array2d[float],
   dense_qacc_smooth_out: wp.array2d[float],
   dense_problem_dof_out: wp.array2d[int],
-  dense_dof_problem_out: wp.array2d[int],
 ):
   """DOF vectors and maps of the dense problems, one thread per world DOF.
 
@@ -1478,7 +1477,6 @@ def _dense_dofs(
   p = int(-1)
   if g >= 0:
     p = group_problem_in[worldid, g]
-  dense_dof_problem_out[worldid, dofid] = p
   if p < 0:
     return
   i = dof_slotcol_in[worldid, dofid]
@@ -1546,15 +1544,6 @@ def _dense_scatter(
     wp.atomic_or(overflow_out, worldid, dense_overflow_in[p])
 
 
-@wp.kernel
-def _identity(
-  # Out:
-  eye_out: wp.array3d[float],
-):
-  i = wp.tid()
-  eye_out[0, i, i] = 1.0
-
-
 @dataclasses.dataclass
 class _Dense:
   m: types.Model
@@ -1608,11 +1597,7 @@ def _create_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.S
     efc_problem=wp.empty((d.nworld, d.njmax), dtype=int),
     nproblem=ctx.group_count[6:7],
     problem_dof=wp.empty((ns, N), dtype=int),
-    dof_problem=wp.empty((d.nworld, m.nv), dtype=int),
-    dof_local=g.dof_slotcol,
-    h_init=wp.zeros((1, N, N), dtype=float),
   )
-  wp.launch(_identity, dim=N, outputs=[sctx.h_init])
   return _Dense(m=m_dense, d=d_dense, ctx=sctx, nsolving=wp.empty(1, dtype=int))
 
 
@@ -1655,7 +1640,7 @@ def _solve_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
     _dense_dofs,
     dim=(d.nworld, m.nv),
     inputs=[d.qacc_warmstart, d.qfrc_smooth, d.qacc_smooth, g.dof_group, g.dof_slotcol, g.group_nv, ctx.group_problem],
-    outputs=[ds.qacc_warmstart, ds.qfrc_smooth, ds.qacc_smooth, sctx.problem_dof, sctx.dof_problem],
+    outputs=[ds.qacc_warmstart, ds.qfrc_smooth, ds.qacc_smooth, sctx.problem_dof],
   )
   wp.launch(
     _dense_rowmap,

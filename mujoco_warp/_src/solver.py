@@ -2815,7 +2815,112 @@ def _keep_row(active: float, x: float) -> float:
 
 
 @cache_kernel
-def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njmax: int, ragged: bool = False):
+def _update_gradient_JTDAJ_ragged(nv_pad: int, tile_size: int, njmax: int):
+  """_update_gradient_JTDAJ_dense_tiled over the problems of the island solver.
+
+  A problem's rows are rows of a world (efc_world, efc_rowoff). Its DOFs are whole trees in order,
+  and M is block-diagonal over trees with each tree's CSR entries contiguous, so M is seeded per
+  tree from the world's CSR as the world kernel does (local index = tree's column + DOF offset).
+  """
+  if njmax < tile_size:
+    tile_size = njmax
+
+  TILE_SIZE_K = tile_size
+
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
+  def kernel(
+    # Model:
+    dof_treeid: wp.array[int],
+    tree_dofadr: wp.array[int],
+    tree_dofnum: wp.array[int],
+    M_rownnz: wp.array[int],
+    M_rowadr: wp.array[int],
+    M_colind: wp.array[int],
+    M_hinit_i: wp.array[int],
+    # Data in:
+    nefc_in: wp.array[int],
+    M_in: wp.array2d[float],
+    efc_J_in: wp.array3d[float],
+    efc_D_in: wp.array2d[float],
+    efc_state_in: wp.array2d[int],
+    # In:
+    ctx_done_in: wp.array[bool],
+    ctx_efc_world_in: wp.array[int],
+    ctx_efc_rowoff_in: wp.array[int],
+    ctx_problem_dof_in: wp.array2d[int],
+    # Out:
+    ctx_h_out: wp.array3d[float],
+  ):
+    worldid, rank = wp.tid()
+
+    if ctx_done_in[worldid]:
+      return
+
+    nefc = nefc_in[worldid]
+    rw = ctx_efc_world_in[worldid]
+    ro = ctx_efc_rowoff_in[worldid]
+
+    # M's upper triangle, tree by tree; identity on padding (uniform trip counts: the scatter is
+    # collective)
+    m_tile = wp.tile_zeros(shape=(wp.static(nv_pad * nv_pad),), dtype=float, storage="shared")
+    lanes = wp.block_dim()
+    c = int(0)
+    while c < wp.static(nv_pad):
+      dof = ctx_problem_dof_in[worldid, c]
+      if dof < 0:
+        break
+      tree = dof_treeid[dof]
+      dofadr = tree_dofadr[tree]
+      last = dofadr + tree_dofnum[tree] - 1
+      beg = M_rowadr[dofadr]
+      nent = M_rowadr[last] + M_rownnz[last] - beg
+      base = c - dofadr
+      for it in range((nent + lanes - 1) // lanes):
+        e = it * lanes + rank
+        enable = e < nent
+        ec = beg + wp.where(enable, e, 0)
+        pos = (M_colind[ec] + base) * wp.static(nv_pad) + M_hinit_i[ec] + base
+        wp.tile_scatter_add(m_tile, pos, wp.where(enable, M_in[rw, ec], 0.0), enable)
+      c += tree_dofnum[tree]
+    for it in range((wp.static(nv_pad) + lanes - 1) // lanes):
+      i = it * lanes + rank
+      enable = i >= c and i < wp.static(nv_pad)
+      wp.tile_scatter_add(m_tile, wp.where(enable, i * wp.static(nv_pad) + i, 0), 1.0, enable)
+    sum_val = wp.tile_reshape(m_tile, (nv_pad, nv_pad))
+
+    for k in range(0, njmax, TILE_SIZE_K):
+      if k >= nefc:
+        break
+
+      # rows past the problem's are another island's or past the world (bounds checked)
+      J_kj = wp.tile_load(efc_J_in[rw], shape=(TILE_SIZE_K, nv_pad), offset=(ro + k, 0), bounds_check=True)
+
+      D_k = wp.tile_load(efc_D_in[rw], shape=TILE_SIZE_K, offset=ro + k, bounds_check=True)
+      state = wp.tile_load(efc_state_in[rw], shape=TILE_SIZE_K, offset=ro + k, bounds_check=True)
+
+      D_k = wp.tile_map(_state_check, D_k, state)
+
+      tid_tile = wp.tile_arange(TILE_SIZE_K, dtype=int)
+      threshold_tile = wp.tile_ones(shape=TILE_SIZE_K, dtype=int) * (nefc - k)
+
+      active_tile = wp.tile_map(_active_check, tid_tile, threshold_tile)
+      D_k = wp.tile_map(wp.mul, active_tile, D_k)
+      # rows past the problem's are other data (e.g. narrower rows of the next island, or
+      # uninitialized): select, not multiply
+      rows = wp.tile_broadcast(wp.tile_reshape(active_tile, shape=(TILE_SIZE_K, 1)), shape=(TILE_SIZE_K, nv_pad))
+      J_kj = wp.tile_map(_keep_row, rows, J_kj)
+
+      J_ki = wp.tile_map(wp.mul, wp.tile_transpose(J_kj), wp.tile_broadcast(D_k, shape=(nv_pad, TILE_SIZE_K)))
+
+      sum_val += wp.tile_matmul(J_ki, J_kj)
+
+    wp.tile_store(ctx_h_out[worldid], sum_val, bounds_check=False)
+
+  return kernel
+
+
+@cache_kernel
+def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njmax: int):
   """Compact-path variant of _update_gradient_JTDAJ_dense_tiled.
 
   Takes M_in as a dense 3D array (nworld, nv_pad, nv_pad) -- the compacted active-DOF
@@ -2827,7 +2932,6 @@ def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njma
     tile_size = njmax
 
   TILE_SIZE_K = tile_size
-  RAGGED = ragged
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
@@ -2839,8 +2943,6 @@ def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njma
     efc_state_in: wp.array2d[int],
     # In:
     ctx_done_in: wp.array[bool],
-    ctx_efc_world_in: wp.array[int],
-    ctx_efc_rowoff_in: wp.array[int],
     # Out:
     ctx_h_out: wp.array3d[float],
   ):
@@ -2850,26 +2952,18 @@ def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njma
       return
 
     nefc = nefc_in[worldid]
-    rw = worldid
-    ro = int(0)
-    if wp.static(RAGGED):
-      rw = ctx_efc_world_in[worldid]
-      ro = ctx_efc_rowoff_in[worldid]
 
     # Load full symmetric compact inertia tile (Cholesky only reads upper triangle).
-    # ragged: M_in is the identity, then _add_M_ragged replaces the problem's DOFs' rows with the
-    # world's M
-    sum_val = wp.tile_load(M_in[wp.where(RAGGED, 0, worldid)], shape=(wp.static(nv_pad), wp.static(nv_pad)), bounds_check=True)
+    sum_val = wp.tile_load(M_in[worldid], shape=(wp.static(nv_pad), wp.static(nv_pad)), bounds_check=True)
 
     for k in range(0, njmax, TILE_SIZE_K):
       if k >= nefc:
         break
 
-      # ragged: rows past the problem's are another island's or past the world (bounds checked)
-      J_kj = wp.tile_load(efc_J_in[rw], shape=(TILE_SIZE_K, nv_pad), offset=(ro + k, 0), bounds_check=RAGGED)
+      J_kj = wp.tile_load(efc_J_in[worldid], shape=(TILE_SIZE_K, nv_pad), offset=(k, 0), bounds_check=False)
 
-      D_k = wp.tile_load(efc_D_in[rw], shape=TILE_SIZE_K, offset=ro + k, bounds_check=RAGGED)
-      state = wp.tile_load(efc_state_in[rw], shape=TILE_SIZE_K, offset=ro + k, bounds_check=RAGGED)
+      D_k = wp.tile_load(efc_D_in[worldid], shape=TILE_SIZE_K, offset=k, bounds_check=False)
+      state = wp.tile_load(efc_state_in[worldid], shape=TILE_SIZE_K, offset=k, bounds_check=False)
 
       D_k = wp.tile_map(_state_check, D_k, state)
 
@@ -2878,11 +2972,6 @@ def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njma
 
       active_tile = wp.tile_map(_active_check, tid_tile, threshold_tile)
       D_k = wp.tile_map(wp.mul, active_tile, D_k)
-      if wp.static(RAGGED):
-        # rows past the problem's are other data (e.g. narrower rows of the next island, or
-        # uninitialized): select, not multiply
-        rows = wp.tile_broadcast(wp.tile_reshape(active_tile, shape=(TILE_SIZE_K, 1)), shape=(TILE_SIZE_K, nv_pad))
-        J_kj = wp.tile_map(_keep_row, rows, J_kj)
 
       J_ki = wp.tile_map(wp.mul, wp.tile_transpose(J_kj), wp.tile_broadcast(D_k, shape=(nv_pad, TILE_SIZE_K)))
 
@@ -3754,31 +3843,47 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       )
     else:
       m_mat = d.qH if is_discrete else d.M
-      if compact:
-        # compact path: d.M is the dense 3D compact inertia block (nworld, nv_pad, nv_pad)
+      if ctx.efc_world is not None:
         wp.launch_tiled(
-          _update_gradient_JTDAJ_dense_tiled_compact(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax, ctx.efc_world is not None),
+          _update_gradient_JTDAJ_ragged(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax),
           dim=d.nworld,
           inputs=[
+            m.dof_treeid,
+            m.tree_dofadr,
+            m.tree_dofnum,
+            m.M_rownnz,
+            m.M_rowadr,
+            m.M_colind,
+            m.M_hinit_i,
             d.nefc,
-            m_mat if ctx.efc_world is None else ctx.h_init,
+            d.M,
             d.efc.J,
             d.efc.D,
             d.efc.state,
             ctx.done,
             ctx.efc_world,
             ctx.efc_rowoff,
+            ctx.problem_dof,
           ],
           outputs=[ctx.h],
           block_dim=m.block_dim.update_gradient_JTDAJ_dense,
         )
-        if ctx.efc_world is not None:
-          wp.launch(
-            _add_M_ragged,
-            dim=(ctx.dof_problem.shape[0], m.M_colind.shape[0]),
-            inputs=[m.M_colind, m.M_hinit_i, d.M, ctx.done, ctx.dof_problem, ctx.dof_local],
-            outputs=[ctx.h],
-          )
+      elif compact:
+        # compact path: d.M is the dense 3D compact inertia block (nworld, nv_pad, nv_pad)
+        wp.launch_tiled(
+          _update_gradient_JTDAJ_dense_tiled_compact(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax),
+          dim=d.nworld,
+          inputs=[
+            d.nefc,
+            m_mat,
+            d.efc.J,
+            d.efc.D,
+            d.efc.state,
+            ctx.done,
+          ],
+          outputs=[ctx.h],
+          block_dim=m.block_dim.update_gradient_JTDAJ_dense,
+        )
       else:
         wp.launch_tiled(
           _update_gradient_JTDAJ_dense_tiled(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax, m.M_colind.shape[0]),
@@ -5959,13 +6064,15 @@ def _mul_m_sparse_ragged(
   ctx_nproblem_in: wp.array[int],
   ctx_efc_world_in: wp.array[int],
   ctx_problem_dof_in: wp.array2d[int],
-  ctx_dof_local_in: wp.array2d[int],
   vec: wp.array2d[float],
   skip: wp.array[bool],
   # Out:
   res: wp.array2d[float],
 ):
-  """Res = M @ vec per problem via its world's sparse M (identity on padding DOFs)."""
+  """Res = M @ vec per problem via its world's sparse M (identity on padding DOFs).
+
+  A problem's DOFs are whole trees in order, so column col of row dof is local i + col - dof.
+  """
   problem, i = wp.tid()
 
   # empty problems have no DOF maps
@@ -5980,40 +6087,8 @@ def _mul_m_sparse_ragged(
   worldid = ctx_efc_world_in[problem]
   acc = float(0.0)
   for k in range(M_mulm_rowadr[dof], M_mulm_rowadr[dof + 1]):
-    acc += M_in[worldid, M_mulm_madr[k]] * vec[problem, ctx_dof_local_in[worldid, M_mulm_col[k]]]
+    acc += M_in[worldid, M_mulm_madr[k]] * vec[problem, i + M_mulm_col[k] - dof]
   res[problem, i] = acc
-
-
-@wp.kernel
-def _add_M_ragged(
-  # Model:
-  M_colind: wp.array[int],
-  M_hinit_i: wp.array[int],
-  # Data in:
-  M_in: wp.array2d[float],
-  # In:
-  ctx_done_in: wp.array[bool],
-  ctx_dof_problem_in: wp.array2d[int],
-  ctx_dof_local_in: wp.array2d[int],
-  # Out:
-  ctx_h_out: wp.array3d[float],
-):
-  """Add the world's M to the upper triangle of each problem's H, one thread per CSR M entry.
-
-  H starts as J'DJ plus the identity (padding DOFs keep it), so diagonals add M_ii - 1. The CSR M
-  holds the lower triangle, so each upper entry of a problem's H takes exactly one M entry.
-  """
-  worldid, ec = wp.tid()
-  row = M_hinit_i[ec]
-  problem = ctx_dof_problem_in[worldid, row]
-  if problem < 0:
-    return
-  if ctx_done_in[problem]:
-    return
-  i = ctx_dof_local_in[worldid, row]
-  j = ctx_dof_local_in[worldid, M_colind[ec]]
-  value = M_in[worldid, ec] - wp.where(i == j, 1.0, 0.0)
-  ctx_h_out[problem, wp.min(i, j), wp.max(i, j)] += value
 
 
 def _sparse_compact(ctx: SolverContext | InverseContext) -> bool:
@@ -6026,7 +6101,7 @@ def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | Inv
   if m.opt.integrator == types.IntegratorType.DISCRETE:
     derivative.eff_mul_m(m, d, res, vec, skip=skip)
     return
-  if getattr(ctx, "dof_problem", None) is not None:
+  if ctx.problem_dof is not None:
     wp.launch(
       _mul_m_sparse_ragged,
       dim=ctx.problem_dof.shape,
@@ -6038,7 +6113,6 @@ def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | Inv
         ctx.nproblem,
         ctx.efc_world,
         ctx.problem_dof,
-        ctx.dof_local,
         vec,
         skip,
       ],

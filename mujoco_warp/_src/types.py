@@ -2582,9 +2582,6 @@ class InverseContext:
   efc_problem: Optional[wp.array2d[int]] = None
   nproblem: Optional[wp.array[int]] = None
   problem_dof: Optional[wp.array2d[int]] = None
-  dof_problem: Optional[wp.array2d[int]] = None
-  dof_local: Optional[wp.array2d[int]] = None
-  h_init: Optional[wp.array3d[float]] = None  # (1, nv, nv) identity: H before M is added
 
 
 @dataclasses.dataclass
@@ -2641,12 +2638,9 @@ class SolverContext:
   efc_problem: Optional[wp.array2d[int]] = None
   # number of problems (shape (1,)); problems past it are empty (None: all nworld are problems)
   nproblem: Optional[wp.array[int]] = None
-  # problem DOFs, set with efc_world: world DOF of (problem, local DOF) (-1: padding), and each
-  # world DOF's problem (-1: none) and local DOF; M is then the worlds' sparse M
+  # set with efc_world: world DOF of (problem, local DOF) (-1: padding); a problem's DOFs are
+  # whole trees in order, and its M is its world's sparse M
   problem_dof: Optional[wp.array2d[int]] = None
-  dof_problem: Optional[wp.array2d[int]] = None
-  dof_local: Optional[wp.array2d[int]] = None
-  h_init: Optional[wp.array3d[float]] = None  # (1, nv, nv) identity: H before M is added
 
 
 @dataclasses.dataclass
