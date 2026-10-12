@@ -2816,6 +2816,7 @@ def _update_gradient_JTDAJ_ragged(nv_pad: int, tile_size: int, njmax: int):
   A problem's rows are rows of a world (efc_world, efc_rowoff). Its DOFs are whole trees in order,
   and M is block-diagonal over trees with each tree's CSR entries contiguous, so M is seeded per
   tree from the world's CSR as the world kernel does (local index = tree's column + DOF offset).
+  Also writes each problem's meaninertia (first read by the line search).
   """
   if njmax < tile_size:
     tile_size = njmax
@@ -2845,6 +2846,7 @@ def _update_gradient_JTDAJ_ragged(nv_pad: int, tile_size: int, njmax: int):
     ctx_problem_dof_in: wp.array2d[int],
     # Out:
     ctx_h_out: wp.array3d[float],
+    problem_meaninertia_out: wp.array[float],
   ):
     worldid, rank = wp.tid()
 
@@ -2859,6 +2861,7 @@ def _update_gradient_JTDAJ_ragged(nv_pad: int, tile_size: int, njmax: int):
     # collective)
     m_tile = wp.tile_zeros(shape=(wp.static(nv_pad * nv_pad),), dtype=float, storage="shared")
     lanes = wp.block_dim()
+    diag = float(0.0)
     c = int(0)
     while c < wp.static(nv_pad):
       dof = ctx_problem_dof_in[worldid, c]
@@ -2875,13 +2878,20 @@ def _update_gradient_JTDAJ_ragged(nv_pad: int, tile_size: int, njmax: int):
         enable = e < nent
         ec = beg + wp.where(enable, e, 0)
         pos = (M_colind[ec] + base) * wp.static(nv_pad) + M_hinit_i[ec] + base
-        wp.tile_scatter_add(m_tile, pos, wp.where(enable, M_in[rw, ec], 0.0), enable)
+        value = wp.where(enable, M_in[rw, ec], 0.0)
+        wp.tile_scatter_add(m_tile, pos, value, enable)
+        if M_colind[ec] == M_hinit_i[ec]:
+          diag += value
       c += tree_dofnum[tree]
     for it in range((wp.static(nv_pad) + lanes - 1) // lanes):
       i = it * lanes + rank
       enable = i >= c and i < wp.static(nv_pad)
       wp.tile_scatter_add(m_tile, wp.where(enable, i * wp.static(nv_pad) + i, 0), 1.0, enable)
     sum_val = wp.tile_reshape(m_tile, (nv_pad, nv_pad))
+    # MuJoCo scales an island's convergence tests by its inertia trace: meaninertia * nv = trace
+    trace = wp.tile_reduce(wp.add, wp.tile(diag))
+    if rank == 0:
+      problem_meaninertia_out[worldid] = trace[0] / float(nv_pad)
 
     # views ending at the problem's last row: the loads zero-fill rows past it (other problems'
     # or uninitialized rows), so neither J nor D needs masking
@@ -3849,7 +3859,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
             ctx.efc_rowoff,
             ctx.problem_dof,
           ],
-          outputs=[ctx.h],
+          outputs=[ctx.h, m.stat.meaninertia],
           block_dim=m.block_dim.update_gradient_JTDAJ_dense,
         )
       elif compact:

@@ -88,6 +88,13 @@ def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
   return mjm, mjd, m, d
 
 
+def _assert_Ma(mjm, mjd, d):
+  """efc.Ma is M qacc at the solution, as the world solver leaves it."""
+  M = np.zeros((mjm.nv, mjm.nv))
+  mujoco.mj_fullM(mjm, mjd, M)
+  np.testing.assert_allclose(d.efc.Ma.numpy()[0], M @ d.qacc.numpy()[0], rtol=1e-4, atol=1e-4)
+
+
 def _dense_J(d):
   """World 0's Jacobian, including the rows of islands in slots (kept only there)."""
   nefc = d.nefc.numpy()[0]
@@ -245,11 +252,13 @@ class IslandSolverTest(absltest.TestCase):
     # every DOF must be written, the box's too
     d.qacc.fill_(np.nan)
     d.qfrc_constraint.fill_(np.nan)
+    d.efc.Ma.fill_(np.nan)
     island_solver.solve(m, d)
     g = island.slot_buffers(m, d)
     self.assertEqual(list(g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0]), [24])
     np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
     np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
+    _assert_Ma(mjm, mjd, d)
 
   def test_solve(self):
     """The island solve reaches MuJoCo's solution, with dense, mixed and sparse islands.
@@ -259,10 +268,12 @@ class IslandSolverTest(absltest.TestCase):
     for dense_nv, merge in ((32, True), (32, False), (16, True), (0, True)):
       with self.subTest(dense_nv=dense_nv, merge=merge):
         mjm, mjd, m, d = _fixture(dense_nv, merge)
+        d.efc.Ma.fill_(np.nan)
         island_solver.solve(m, d)
         # the chain's accelerations end within about 1e-3 of MuJoCo's (atomic sums are unordered)
         np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
         np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
+        _assert_Ma(mjm, mjd, d)
 
   def test_hessian(self):
     """Each island's H block is M + J'DJ over its quadratic rows, after incremental updates."""
@@ -294,6 +305,9 @@ class IslandSolverTest(absltest.TestCase):
         # dense groups: the dense world solver's H (upper triangle, identity padding)
         dofs = idof2dof[idofadr[i] : idofadr[i] + island_nv[i]]
         Hi = M[np.ix_(dofs, dofs)].copy()
+        # convergence is measured relative to the island's inertia trace (meaninertia * nv)
+        meaninertia = ctx.dense.m.stat.meaninertia.numpy()[problem[i]]
+        np.testing.assert_allclose(meaninertia * m.island_dense_nv, np.trace(Hi), rtol=1e-5)
         for r in range(island_iefcadr[i], island_iefcadr[i] + island_nefc[i]):
           if state[r] == mujoco.mjtConstraintState.mjCNSTRSTATE_QUADRATIC:
             Jr = J[iefc2efc[r], dofs]

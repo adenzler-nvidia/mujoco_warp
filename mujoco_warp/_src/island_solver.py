@@ -27,7 +27,6 @@ import dataclasses
 import warp as wp
 
 from mujoco_warp._src import island
-from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_pool_cholesky_newton_func
 from mujoco_warp._src.block_cholesky import solve_search_sums
@@ -1410,16 +1409,9 @@ def _dense_scalars(
   ntree: int,
   opt_tolerance: wp.array[float],
   opt_ls_tolerance: wp.array[float],
-  island_dense_nv: int,
-  M_elemid: wp.array2d[int],
-  # Data in:
-  M_in: wp.array2d[float],
-  map_idof2dof_in: wp.array2d[int],
   # In:
   group_count_in: wp.array[int],
   group_list_in: wp.array2d[int],
-  group_idofadr_in: wp.array2d[int],
-  group_nv_in: wp.array2d[int],
   group_nefc_in: wp.array2d[int],
   group_ne_in: wp.array2d[int],
   group_nf_in: wp.array2d[int],
@@ -1428,13 +1420,12 @@ def _dense_scalars(
   dense_nefc_out: wp.array[int],
   dense_ne_out: wp.array[int],
   dense_nf_out: wp.array[int],
-  dense_meaninertia_out: wp.array[float],
   dense_tolerance_out: wp.array[float],
   dense_ls_tolerance_out: wp.array[float],
   dense_efc_world_out: wp.array[int],
   dense_efc_rowoff_out: wp.array[int],
 ):
-  """Sizes, rows and tolerances of each dense problem."""
+  """Sizes, rows and tolerances of each dense problem (meaninertia: the J'DJ kernel)."""
   p = wp.tid()
   if p >= group_count_in[6]:
     return
@@ -1445,13 +1436,6 @@ def _dense_scalars(
   dense_nf_out[p] = group_nf_in[worldid, g]
   dense_efc_world_out[p] = worldid
   dense_efc_rowoff_out[p] = group_iefcadr_in[worldid, g]
-  # MuJoCo scales an island's convergence tests by its inertia trace: meaninertia * nv = trace
-  idofadr = group_idofadr_in[worldid, g]
-  trace = float(0.0)
-  for k in range(group_nv_in[worldid, g]):
-    dofk = map_idof2dof_in[worldid, idofadr + k]
-    trace += M_in[worldid, M_elemid[dofk, dofk]]
-  dense_meaninertia_out[p] = trace / float(island_dense_nv)
   dense_tolerance_out[p] = opt_tolerance[worldid % opt_tolerance.shape[0]]
   dense_ls_tolerance_out[p] = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
 
@@ -1529,10 +1513,12 @@ def _dense_scatter(
   dense_qfrc_constraint_in: wp.array2d[float],
   dense_niter_in: wp.array[int],
   dense_overflow_in: wp.array[int],
+  dense_Ma_in: wp.array2d[float],
   # Data out:
   solver_niter_out: wp.array[int],
   qacc_out: wp.array2d[float],
   qfrc_constraint_out: wp.array2d[float],
+  efc_Ma_out: wp.array2d[float],
   overflow_out: wp.array[int],
 ):
   """Copy the dense problems' solution to their DOFs (rows' force and state are in place)."""
@@ -1546,6 +1532,7 @@ def _dense_scatter(
   i = dof_slotcol_in[worldid, dofid]
   qacc_out[worldid, dofid] = dense_qacc_in[p, i]
   qfrc_constraint_out[worldid, dofid] = dense_qfrc_constraint_in[p, i]
+  efc_Ma_out[worldid, dofid] = dense_Ma_in[p, i]
   if i == 0:
     wp.atomic_max(solver_niter_out, worldid, dense_niter_in[p])
     wp.atomic_or(overflow_out, worldid, dense_overflow_in[p])
@@ -1620,29 +1607,14 @@ def _solve_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
       m.ntree,
       m.opt.tolerance,
       m.opt.ls_tolerance,
-      m.island_dense_nv,
-      m.M_elemid,
-      d.M,
-      d.map_idof2dof,
       ctx.group_count,
       ctx.group_list,
-      g.group_idofadr,
-      g.group_nv,
       g.group_nefc,
       g.group_ne,
       g.group_nf,
       g.group_iefcadr,
     ],
-    outputs=[
-      ds.nefc,
-      ds.ne,
-      ds.nf,
-      ms.stat.meaninertia,
-      ms.opt.tolerance,
-      ms.opt.ls_tolerance,
-      sctx.efc_world,
-      sctx.efc_rowoff,
-    ],
+    outputs=[ds.nefc, ds.ne, ds.nf, ms.opt.tolerance, ms.opt.ls_tolerance, sctx.efc_world, sctx.efc_rowoff],
   )
   wp.launch(
     _dense_dofs,
@@ -1669,8 +1641,17 @@ def _solve_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
   wp.launch(
     _dense_scatter,
     dim=(d.nworld, m.nv),
-    inputs=[g.dof_group, g.dof_slotcol, ctx.group_problem, ds.qacc, ds.qfrc_constraint, ds.solver_niter, ds.overflow],
-    outputs=[d.solver_niter, d.qacc, d.qfrc_constraint, d.overflow],
+    inputs=[
+      g.dof_group,
+      g.dof_slotcol,
+      ctx.group_problem,
+      ds.qacc,
+      ds.qfrc_constraint,
+      ds.solver_niter,
+      ds.overflow,
+      ds.efc.Ma,
+    ],
+    outputs=[d.solver_niter, d.qacc, d.qfrc_constraint, d.efc.Ma, d.overflow],
   )
 
 
@@ -1680,31 +1661,37 @@ def _scatter_dofs(
   row2dof_in: wp.array2d[int],
   iqacc_in: wp.array2d[float],
   frc_in: wp.array2d[float],
+  iMa_in: wp.array2d[float],
   # Data out:
   qacc_out: wp.array2d[float],
   qfrc_constraint_out: wp.array2d[float],
+  efc_Ma_out: wp.array2d[float],
 ):
   worldid, row = wp.tid()
   dofid = row2dof_in[worldid, row]
   if dofid >= 0:
     qacc_out[worldid, dofid] = iqacc_in[worldid, row]
     qfrc_constraint_out[worldid, dofid] = frc_in[worldid, row]
+    efc_Ma_out[worldid, dofid] = iMa_in[worldid, row]
 
 
 @wp.kernel
 def _free_dofs(
   # Data in:
+  qfrc_smooth_in: wp.array2d[float],
   qacc_smooth_in: wp.array2d[float],
   dof_island_in: wp.array2d[int],
   # Data out:
   qacc_out: wp.array2d[float],
   qfrc_constraint_out: wp.array2d[float],
+  efc_Ma_out: wp.array2d[float],
 ):
-  """DOFs outside all islands have no constraints."""
+  """DOFs outside all islands have no constraints (M qacc_smooth = qfrc_smooth)."""
   worldid, dofid = wp.tid()
   if dof_island_in[worldid, dofid] < 0:
     qacc_out[worldid, dofid] = qacc_smooth_in[worldid, dofid]
     qfrc_constraint_out[worldid, dofid] = 0.0
+    efc_Ma_out[worldid, dofid] = qfrc_smooth_in[worldid, dofid]
 
 
 def _create_context(m: types.Model, d: types.Data) -> IslandContext:
@@ -2129,7 +2116,12 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
 
   # J'force at the solution (stable iterations skip it), then scatter back
   _launch_grad(d, ctx, g, final=True)
-  wp.launch(_scatter_dofs, dim=(d.nworld, nrow), inputs=[ctx.row2dof, ctx.qacc, ctx.frc], outputs=[d.qacc, d.qfrc_constraint])
+  wp.launch(
+    _scatter_dofs,
+    dim=(d.nworld, nrow),
+    inputs=[ctx.row2dof, ctx.qacc, ctx.frc, ctx.Ma],
+    outputs=[d.qacc, d.qfrc_constraint, d.efc.Ma],
+  )
 
 
 def solve(m: types.Model, d: types.Data) -> IslandContext:
@@ -2141,7 +2133,12 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   dense = _create_dense(m, d, ctx, g)
   ctx.dense = dense
   d.solver_niter.zero_()
-  wp.launch(_free_dofs, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, g.dof_group], outputs=[d.qacc, d.qfrc_constraint])
+  wp.launch(
+    _free_dofs,
+    dim=(d.nworld, m.nv),
+    inputs=[d.qfrc_smooth, d.qacc_smooth, g.dof_group],
+    outputs=[d.qacc, d.qfrc_constraint, d.efc.Ma],
+  )
   wp.launch(
     _group_lists,
     dim=(d.nworld, m.ntree),
@@ -2159,5 +2156,4 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   else:
     _solve_dense(m, d, ctx, g, dense)
 
-  support.mul_m(m, d, d.efc.Ma, d.qacc)
   return ctx
