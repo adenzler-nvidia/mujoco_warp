@@ -1022,8 +1022,9 @@ def slot_zero(
   slot_J_out: wp.array3d[float],
 ):
   if srow >= 0:
+    # whole rows, past narrower groups' columns too: rows with gaps are expensive to write
     for r in range(nrow):
-      for c in range(snv):
+      for c in range(slot_J_out.shape[2]):
         slot_J_out[worldid, srow + r, c] = 0.0
 
 

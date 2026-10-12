@@ -4073,7 +4073,8 @@ def _efc_contact_jac_groups(
           J += j1r * frii_sign
         else:
           J += j2r * frii_sign
-      if lane < width:
+      # whole rows (J is 0 past the group's DOFs): rows with unwritten gaps are expensive to write
+      if lane < slot_J_out.shape[2]:
         slot_J_out[worldid, efcid, lane] = J
       Jqvel = wp.tile_reduce(wp.add, wp.tile(J * qvel))
       if lane == 0:

@@ -2895,7 +2895,7 @@ def _update_gradient_JTDAJ_ragged(nv_pad: int, tile_size: int, njmax: int):
 
     # views ending at the problem's last row: the loads zero-fill rows past it (other problems'
     # or uninitialized rows), so neither J nor D needs masking
-    J = wp.array(ptr=efc_J_in[rw].ptr, shape=(ro + nefc, wp.static(nv_pad)), dtype=float)
+    J = wp.array(ptr=efc_J_in[rw].ptr, shape=(ro + nefc, efc_J_in.shape[2]), dtype=float)
     D = wp.array(ptr=efc_D_in[rw].ptr, shape=(ro + nefc,), dtype=float)
     state = wp.array(ptr=efc_state_in[rw].ptr, shape=(ro + nefc,), dtype=int)
     for k in range(0, njmax, TILE_SIZE_K):
