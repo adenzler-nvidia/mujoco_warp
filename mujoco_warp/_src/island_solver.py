@@ -114,6 +114,8 @@ class IslandContext:
   group_problem: wp.array2d[int]
   nsolving: wp.array[int]
   # the dense world solver's model, data and context for two-tile groups (see _create_dense)
+  small_nsolving: wp.array[int] = None  # an output of _solve_small, unused
+  world_done: wp.array[bool] = None  # all False: the initial J'DJ of every world
   dense: object = None
 
 
@@ -189,7 +191,7 @@ def _group_lists(
   ntree: int,
   # In:
   ngroup_in: wp.array[int],
-  ntile_in: wp.array2d[int],
+  group_nv_in: wp.array2d[int],
   island_slot_in: wp.array2d[wp.vec4i],
   # Out:
   group_count_out: wp.array[int],
@@ -200,9 +202,10 @@ def _group_lists(
   """Compacted lists of the groups that exist, by solve path.
 
   Lists 0-3: the block path, sparse rows (all, and by tiles per side: 1, 2, >= 3; count 5 is the
-  same as count 0). List 4: dense one-tile groups, solved whole by _solve_small. List 6: dense
-  two-tile groups, solved by the dense world solver (see _solve_dense), problem index in
-  group_problem. Groups of lists 4 and 6 are done for the block path.
+  same as count 0). List 4: dense one-tile groups, solved whole by _solve_small. List 6: wider
+  dense groups, solved by the dense world solver (see _solve_dense), problem index in
+  group_problem. Groups of lists 4 and 6 are done for the block path. Count 7: the groups of lists
+  0 and 4 (the island solver's own).
   """
   worldid, g = wp.tid()
   if g >= ngroup_in[worldid]:
@@ -212,6 +215,7 @@ def _group_lists(
   group_problem_out[worldid, g] = -1
   if width == _TILE:
     group_list_out[4, wp.atomic_add(group_count_out, 4, 1)] = packed
+    wp.atomic_add(group_count_out, 7, 1)
     done_out[worldid, g] = True
     return
   if width > _TILE:
@@ -222,7 +226,8 @@ def _group_lists(
     return
   group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed
   wp.atomic_add(group_count_out, 5, 1)
-  c = wp.min(ntile_in[worldid, g], 3)
+  wp.atomic_add(group_count_out, 7, 1)
+  c = wp.min(_ntile(group_nv_in[worldid, g]), 3)
   group_list_out[c, wp.atomic_add(group_count_out, c, 1)] = packed
 
 
@@ -1739,7 +1744,9 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     changed=wp.zeros((nworld, ntree), dtype=bool),
     state_changed=wp.zeros((nworld, ntree), dtype=bool),
     grad_scale=wp.ones((nworld, ntree), dtype=float),
-    group_count=wp.zeros(7, dtype=int),
+    group_count=wp.zeros(8, dtype=int),
+    small_nsolving=wp.zeros(1, dtype=int),
+    world_done=wp.zeros(nworld, dtype=bool),
     group_list=wp.empty((7, nworld * ntree), dtype=int),
     group_problem=wp.empty((nworld, ntree), dtype=int),
     nsolving=wp.zeros(1, dtype=int),
@@ -1779,8 +1786,6 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
     ],
     outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.row_w, ctx.frc, ctx.H, ctx.changed, ctx.state_changed],
   )
-  # allocated outside the conditional body below (later evaluations run in the iteration loop)
-  world_done = wp.zeros(d.nworld, dtype=bool) if initial else None
 
   def sparse_h():
     # dense rows have no constraint groups
@@ -1804,7 +1809,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
         ctx.dof_poolrow,
         ctx.dof_local,
         ctx.row_jaref,
-        world_done,
+        ctx.world_done,
         _jtdaj_groups_per_world(d.nworld, d.njmax),
       ],
       outputs=[ctx.H],
@@ -1962,18 +1967,9 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
   _evaluate(m, d, ctx, g, initial=False)
 
 
-def solve(m: types.Model, d: types.Data) -> IslandContext:
-  """Solve every island with its own Newton iteration and scatter the results back."""
-  # make_constraint found the islands and wrote the rows in island order
-  ctx = _create_context(m, d)
+def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
+  """Solve the island solver's own groups: one-tile groups whole, wider ones on the block path."""
   nrow = ctx.qacc.shape[1]
-  # islands are solved in groups (see island.MERGE)
-  g = island.slot_buffers(m, d)
-  dense = _create_dense(m, d, ctx, g)
-  ctx.dense = dense
-  d.solver_niter.zero_()
-  wp.launch(_free_dofs, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, g.dof_group], outputs=[d.qacc, d.qfrc_constraint])
-
   # layout and gathers into island order
   wp.launch_tiled(
     _layout(m.ntree),
@@ -1981,12 +1977,6 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     inputs=[g.group_nv],
     outputs=[ctx.tilebase, ctx.ntile, ctx.vbase, ctx.pairbase],
     block_dim=m.block_dim.island_scan_sizes,
-  )
-  wp.launch(
-    _group_lists,
-    dim=(d.nworld, m.ntree),
-    inputs=[m.ntree, g.ngroup, ctx.ntile, g.group_slot],
-    outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done],
   )
   ctx.row2dof.fill_(-1)
   wp.launch(
@@ -2062,7 +2052,6 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
 
   # one-tile groups (e.g. free bodies): the whole solve in one kernel
   nrow_dof = ctx.qacc.shape[1]
-  small_nsolving = wp.zeros(1, dtype=int)
 
   def solve_small():
     wp.launch_tiled(
@@ -2117,7 +2106,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
         ctx.mv,
         ctx.row_jaref,
         ctx.row_jv,
-        small_nsolving,
+        ctx.small_nsolving,
         ctx.grad_scale,
         ctx.row_quad,
         ctx.H,
@@ -2141,6 +2130,28 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   # J'force at the solution (stable iterations skip it), then scatter back
   _launch_grad(d, ctx, g, final=True)
   wp.launch(_scatter_dofs, dim=(d.nworld, nrow), inputs=[ctx.row2dof, ctx.qacc, ctx.frc], outputs=[d.qacc, d.qfrc_constraint])
+
+
+def solve(m: types.Model, d: types.Data) -> IslandContext:
+  """Solve every island with its own Newton iteration and scatter the results back."""
+  # make_constraint found the islands and wrote the rows in island order
+  ctx = _create_context(m, d)
+  # islands are solved in groups (see island.MERGE)
+  g = island.slot_buffers(m, d)
+  dense = _create_dense(m, d, ctx, g)
+  ctx.dense = dense
+  d.solver_niter.zero_()
+  wp.launch(_free_dofs, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, g.dof_group], outputs=[d.qacc, d.qfrc_constraint])
+  wp.launch(
+    _group_lists,
+    dim=(d.nworld, m.ntree),
+    inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot],
+    outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done],
+  )
+  if m.opt.graph_conditional:
+    wp.capture_if(ctx.group_count[7:8], on_true=lambda: _solve_own(m, d, ctx, g))
+  else:
+    _solve_own(m, d, ctx, g)
 
   # two-tile groups: the dense world solver; it scatters last, over the block path's values
   if m.opt.graph_conditional:

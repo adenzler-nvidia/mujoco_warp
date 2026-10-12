@@ -218,12 +218,15 @@ class IslandSolverTest(absltest.TestCase):
     self.assertEqual(sorted(widths), [0, 16, 32])
 
   def test_dense_width(self):
-    """Dense problems are as wide as the model's largest possible island of 17 to 32 DOFs."""
+    """Dense problems are as wide as the model's largest possible island of 17 to 32 DOFs.
+
+    The box falls freely, so the chain is the only group: the island solver's own path is skipped.
+    """
     xml = f"""
     <mujoco>
       <worldbody>
         <geom type="plane" size="10 10 .1"/>{_chain()}
-        <body pos="0 0 .049"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
+        <body pos="0 0 2"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
       </worldbody>
     </mujoco>
     """
@@ -239,10 +242,14 @@ class IslandSolverTest(absltest.TestCase):
     self.assertTrue(island.island_rows(m))
     mjw.make_constraint(m, d)
     d.qacc_warmstart.zero_()
+    # every DOF must be written, the box's too
+    d.qacc.fill_(np.nan)
+    d.qfrc_constraint.fill_(np.nan)
     island_solver.solve(m, d)
     g = island.slot_buffers(m, d)
-    self.assertEqual(sorted(g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0]), [16, 24])
+    self.assertEqual(list(g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0]), [24])
     np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
+    np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
 
   def test_solve(self):
     """The island solve reaches MuJoCo's solution, with dense, mixed and sparse islands.
