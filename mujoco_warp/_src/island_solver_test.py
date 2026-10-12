@@ -27,6 +27,15 @@ from mujoco_warp._src import island
 from mujoco_warp._src import island_solver
 
 
+def _chain() -> str:
+  """An 18-DOF chain on the floor: a group wider than a tile, with a full inertia matrix."""
+  chain = '<body name="c0" pos="8 0 .03"><freejoint/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".03"/>'
+  for i in range(12):
+    axis = "0 1 0" if i % 2 else "0 0 1"
+    chain += f'<body pos=".1 0 0"><joint type="hinge" axis="{axis}"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".03"/>'
+  return chain + "</body>" * 13
+
+
 def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
   """Islands of every kind: single boxes, stacks (2, 3 tiles per side), a weld, an arm, a chain."""
   pos = {
@@ -48,12 +57,6 @@ def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
     '<body pos=".3 0 0"><joint type="hinge" axis="0 1 0" frictionloss=".2"/>'
     '<geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/></body></body>'
   )
-  # an 18-DOF chain on the floor: a two-tile group with a full inertia matrix
-  chain = '<body name="c0" pos="8 0 .03"><freejoint/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".03"/>'
-  for i in range(12):
-    axis = "0 1 0" if i % 2 else "0 0 1"
-    chain += f'<body pos=".1 0 0"><joint type="hinge" axis="{axis}"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".03"/>'
-  chain += "</body>" * 13
   # the second welded box spins, so the weld loads every DOF of the pair; the first single box
   # slides, so its contacts have a velocity
   qvel = np.zeros(18 + 2 + 6 * len(pos))
@@ -61,7 +64,7 @@ def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
   qvel[20] = 1.0
   xml = f"""
   <mujoco>
-    <worldbody><geom type="plane" size="10 10 .1"/>{chain}{arm}{bodies}</worldbody>
+    <worldbody><geom type="plane" size="10 10 .1"/>{_chain()}{arm}{bodies}</worldbody>
     <equality><weld body1="w0" body2="w1"/></equality>
     <keyframe><key qvel="{" ".join(map(str, qvel))}"/></keyframe>
   </mujoco>
@@ -203,16 +206,43 @@ class IslandSolverTest(absltest.TestCase):
       group_slot, J = g.group_slot.numpy()[0], g.J.numpy()[0]
       nv, rownnz = g.group_nv.numpy()[0], d.efc.J_rownnz.numpy()[0]
       ngroup = g.ngroup.numpy()[0]
-      width = (nv[:ngroup] + 15) // 16 * 16
-      np.testing.assert_array_equal(group_slot[:ngroup, 0], np.where(width <= island.DENSE_NV, width, 0))
+      wide = np.where(nv[:ngroup] <= m.island_dense_nv, m.island_dense_nv, 0)
+      np.testing.assert_array_equal(group_slot[:ngroup, 0], np.where(nv[:ngroup] <= 16, 16, wide))
       widths.update(group_slot[:ngroup, 0])
       for i in range(ngroup):
         width, _, nrow, rowadr = group_slot[i]
         if width:
           np.testing.assert_array_equal(rownnz[rowadr : rowadr + nrow], 0)
           np.testing.assert_array_equal(J[rowadr : rowadr + nrow, nv[i] : width], 0.0)
-    # one tile, two tiles, and sparse (the tall stack)
+    # one tile, wider, and sparse (the tall stack)
     self.assertEqual(sorted(widths), [0, 16, 32])
+
+  def test_dense_width(self):
+    """Dense problems are as wide as the model's largest possible island of 17 to 32 DOFs."""
+    xml = f"""
+    <mujoco>
+      <worldbody>
+        <geom type="plane" size="10 10 .1"/>{_chain()}
+        <body pos="0 0 .049"><freejoint/><geom type="box" size=".05 .05 .05"/></body>
+      </worldbody>
+    </mujoco>
+    """
+    overrides = {
+      "opt.cone": ConeType.PYRAMIDAL,
+      "opt.solver": SolverType.NEWTON,
+      "opt.jacobian": mujoco.mjtJacobian.mjJAC_SPARSE,
+    }
+    mjm, mjd, m, d = test_data.fixture(xml=xml, overrides=overrides)
+    # islands: the chain (18 DOFs), the box (6), or both (24)
+    self.assertEqual(m.island_dense_nv, 24)
+    m.opt.island_solve = True
+    self.assertTrue(island.island_rows(m))
+    mjw.make_constraint(m, d)
+    d.qacc_warmstart.zero_()
+    island_solver.solve(m, d)
+    g = island.slot_buffers(m, d)
+    self.assertEqual(sorted(g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0]), [16, 24])
+    np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
 
   def test_solve(self):
     """The island solve reaches MuJoCo's solution, with dense, mixed and sparse islands.
@@ -253,8 +283,8 @@ class IslandSolverTest(absltest.TestCase):
     idof2dof, idofadr = d.map_idof2dof.numpy()[0], g.group_idofadr.numpy()[0]
     ndense = 0
     for i in range(g.ngroup.numpy()[0]):
-      if width[i] == 32:
-        # two-tile dense groups: the dense world solver's H (upper triangle, identity padding)
+      if width[i] > 16:
+        # dense groups: the dense world solver's H (upper triangle, identity padding)
         dofs = idof2dof[idofadr[i] : idofadr[i] + island_nv[i]]
         Hi = M[np.ix_(dofs, dofs)].copy()
         for r in range(island_iefcadr[i], island_iefcadr[i] + island_nefc[i]):
@@ -301,8 +331,8 @@ class IslandSolverTest(absltest.TestCase):
     vbase, nv = ctx.vbase.numpy()[0, :nisland], g.group_nv.numpy()[0, :nisland]
     width = g.group_slot.numpy()[0, :, 0]
     for i in range(nisland):
-      # two-tile dense groups are solved by the dense world solver
-      if width[i] == 32:
+      # dense groups are solved by the dense world solver
+      if width[i] > 16:
         continue
       rows = slice(vbase[i], vbase[i] + nv[i])
       np.testing.assert_allclose(scale[i] * grad[rows], grad_true[rows], rtol=1e-3, atol=1e-4, err_msg=f"island {i}")
@@ -313,8 +343,8 @@ class IslandSolverTest(absltest.TestCase):
     _, _, m, d = _fixture(merge=False)
     ctx = island_solver.solve(m, d)
     g = island.slot_buffers(m, d)
-    # groups of the island solver (two-tile dense groups are solved by the dense world solver)
-    own = g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0] != 32
+    # groups of the island solver (dense groups are solved by the dense world solver)
+    own = g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0] <= 16
     niter = ctx.niter.numpy()[0, : g.ngroup.numpy()[0]][own]
     self.assertLess(niter.min(), niter.max())
     self.assertGreaterEqual(d.solver_niter.numpy()[0], niter.max())

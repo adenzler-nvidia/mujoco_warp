@@ -214,7 +214,7 @@ def _group_lists(
     group_list_out[4, wp.atomic_add(group_count_out, 4, 1)] = packed
     done_out[worldid, g] = True
     return
-  if width == 2 * _TILE:
+  if width > _TILE:
     p = wp.atomic_add(group_count_out, 6, 1)
     group_list_out[6, p] = packed
     group_problem_out[worldid, g] = p
@@ -288,7 +288,7 @@ def _pool_init(
       lo = mid
     else:
       hi = mid
-  if island_slot_in[worldid, lo][0] == 2 * _TILE:
+  if island_slot_in[worldid, lo][0] > _TILE:
     return
   TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
   ntile = island_ntile_in[worldid, lo]
@@ -337,8 +337,8 @@ def _init_rows(
     return
   islandid = efc_island_in[worldid, row]
   block = island_slot_in[worldid, islandid]
-  # two-tile dense groups: the dense world solver computes its own
-  if block[0] == 2 * _TILE:
+  # dense groups wider than a tile: the dense world solver computes its own
+  if block[0] > _TILE:
     return
   jaref = -efc_aref_in[worldid, row]
   if block[0] > 0:
@@ -1393,11 +1393,10 @@ def _solve_small(ls_iterations: int, warn_overflow: int):
   return kernel
 
 
-# Two-tile groups (17 to 32 DOFs, e.g. a humanoid) are solved by the dense world solver, each group
-# one problem of 32 DOFs: its rows are the group's rows in place (SolverContext.efc_world and
-# efc_rowoff), its Jacobian the dense rows (island.SlotBuffers.J), its inertia the world's sparse M
-# through the DOF maps.
-_DENSE_NV = 2 * _TILE
+# Groups of 17 to 32 DOFs (e.g. a humanoid) are solved by the dense world solver, each group one
+# problem of m.island_dense_nv DOFs: its rows are the group's rows in place (SolverContext.efc_world
+# and efc_rowoff), its Jacobian the dense rows (island.SlotBuffers.J), its inertia the world's
+# sparse M.
 
 
 @wp.kernel
@@ -1406,6 +1405,7 @@ def _dense_scalars(
   ntree: int,
   opt_tolerance: wp.array[float],
   opt_ls_tolerance: wp.array[float],
+  island_dense_nv: int,
   M_elemid: wp.array2d[int],
   # Data in:
   M_in: wp.array2d[float],
@@ -1446,13 +1446,15 @@ def _dense_scalars(
   for k in range(group_nv_in[worldid, g]):
     dofk = map_idof2dof_in[worldid, idofadr + k]
     trace += M_in[worldid, M_elemid[dofk, dofk]]
-  dense_meaninertia_out[p] = trace / float(_DENSE_NV)
+  dense_meaninertia_out[p] = trace / float(island_dense_nv)
   dense_tolerance_out[p] = opt_tolerance[worldid % opt_tolerance.shape[0]]
   dense_ls_tolerance_out[p] = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
 
 
 @wp.kernel
 def _dense_dofs(
+  # Model:
+  island_dense_nv: int,
   # Data in:
   qacc_warmstart_in: wp.array2d[float],
   qfrc_smooth_in: wp.array2d[float],
@@ -1485,7 +1487,7 @@ def _dense_dofs(
   dense_qacc_smooth_out[p, i] = qacc_smooth_in[worldid, dofid]
   dense_problem_dof_out[p, i] = dofid
   n = group_nv_in[worldid, g]
-  for r in range(n + i, _DENSE_NV, n):
+  for r in range(n + i, island_dense_nv, n):
     dense_qacc_warmstart_out[p, r] = 0.0
     dense_qfrc_smooth_out[p, r] = 0.0
     dense_qacc_smooth_out[p, r] = 0.0
@@ -1559,7 +1561,7 @@ def _create_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.S
   """
   from mujoco_warp._src import solver  # noqa: PLC0415 (solver dispatches to this module)
 
-  N = _DENSE_NV
+  N = m.island_dense_nv
   # a world has at most nv // 17 groups of 17 or more DOFs
   ns = d.nworld * max(1, min(m.ntree, m.nv // (_TILE + 1)))
   gc = m.opt.graph_conditional and wp.get_device().is_cuda
@@ -1613,6 +1615,7 @@ def _solve_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
       m.ntree,
       m.opt.tolerance,
       m.opt.ls_tolerance,
+      m.island_dense_nv,
       m.M_elemid,
       d.M,
       d.map_idof2dof,
@@ -1639,7 +1642,16 @@ def _solve_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
   wp.launch(
     _dense_dofs,
     dim=(d.nworld, m.nv),
-    inputs=[d.qacc_warmstart, d.qfrc_smooth, d.qacc_smooth, g.dof_group, g.dof_slotcol, g.group_nv, ctx.group_problem],
+    inputs=[
+      m.island_dense_nv,
+      d.qacc_warmstart,
+      d.qfrc_smooth,
+      d.qacc_smooth,
+      g.dof_group,
+      g.dof_slotcol,
+      g.group_nv,
+      ctx.group_problem,
+    ],
     outputs=[ds.qacc_warmstart, ds.qfrc_smooth, ds.qacc_smooth, sctx.problem_dof],
   )
   wp.launch(

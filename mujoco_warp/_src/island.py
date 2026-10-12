@@ -970,8 +970,8 @@ ROW_LIMIT = 2
 ROW_CONTACT = 3
 
 # Island groups of up to DENSE_NV DOFs write their Jacobian rows only to a dense row-major array
-# indexed by the world's rows (SlotBuffers.J), ntile * 16 group-local columns wide; their sparse
-# rows are empty (J_rownnz = 0). Wider groups keep sparse rows.
+# indexed by the world's rows (SlotBuffers.J), 16 group-local columns wide up to 16 DOFs, else
+# m.island_dense_nv; their sparse rows are empty (J_rownnz = 0). Wider groups keep sparse rows.
 DENSE_NV = 32  # read at each make_constraint
 # The island solver solves groups of islands: runs of consecutive islands that fit in one 16-DOF
 # tile together (e.g. two free bodies), with block-diagonal Hessians, solved whole in one kernel.
@@ -1122,9 +1122,10 @@ def _island_groups(ntree: int):
 
 
 @wp.func
-def _dense_width(ndof: int, dense_nv: int) -> int:
-  width = (ndof + 15) // 16 * 16
-  return wp.where(width <= dense_nv, width, 0)
+def _dense_width(ndof: int, small: int, wide: int) -> int:
+  if ndof <= small:
+    return small
+  return wp.where(ndof <= wide, wide, 0)
 
 
 @wp.kernel
@@ -1135,7 +1136,8 @@ def _island_slot(
   group_nv_in: wp.array2d[int],
   group_nefc_in: wp.array2d[int],
   group_iefcadr_in: wp.array2d[int],
-  dense_nv: int,
+  small: int,
+  wide: int,
   # Out:
   group_slot_out: wp.array2d[wp.vec4i],
   island_slot_out: wp.array2d[wp.vec4i],
@@ -1145,13 +1147,13 @@ def _island_slot(
   block = wp.vec4i(0)
   if i < ngroup_in[worldid]:
     block = wp.vec4i(
-      _dense_width(group_nv_in[worldid, i], dense_nv), 0, group_nefc_in[worldid, i], group_iefcadr_in[worldid, i]
+      _dense_width(group_nv_in[worldid, i], small, wide), 0, group_nefc_in[worldid, i], group_iefcadr_in[worldid, i]
     )
   group_slot_out[worldid, i] = block
   g = island_group_in[worldid, i]
   if g >= 0:
     island_slot_out[worldid, i] = wp.vec4i(
-      _dense_width(group_nv_in[worldid, g], dense_nv), 0, group_nefc_in[worldid, g], group_iefcadr_in[worldid, g]
+      _dense_width(group_nv_in[worldid, g], small, wide), 0, group_nefc_in[worldid, g], group_iefcadr_in[worldid, g]
     )
 
 
@@ -1200,7 +1202,7 @@ class SlotBuffers:
   """Island groups and their dense rows, shared by make_constraint and the island solve."""
 
   def __init__(self, m: types.Model, d: types.Data):
-    self.key = (d.nworld, m.ntree, m.nv, d.njmax)
+    self.key = (d.nworld, m.ntree, m.nv, d.njmax, m.island_dense_nv)
     shape = (d.nworld, m.ntree)
     self.ngroup = wp.empty(d.nworld, dtype=int)
     self.island_group = wp.empty(shape, dtype=int)
@@ -1220,12 +1222,12 @@ class SlotBuffers:
     # dense rows by world row; tile kernels read whole tiles of rows, past a world's last row (and
     # mask them). Not zeroed: this may be allocated in a graph capture, where a fill would run every
     # step.
-    self.J = wp.empty((d.nworld, d.njmax + types.TILE_SIZE_JTDAJ_DENSE, DENSE_NV), dtype=float)
+    self.J = wp.empty((d.nworld, d.njmax + types.TILE_SIZE_JTDAJ_DENSE, max(16, m.island_dense_nv)), dtype=float)
 
 
 def slot_buffers(m: types.Model, d: types.Data) -> SlotBuffers:
   buf = d.__dict__.get("_island_slots")
-  if buf is None or buf.key != (d.nworld, m.ntree, m.nv, d.njmax):
+  if buf is None or buf.key != (d.nworld, m.ntree, m.nv, d.njmax, m.island_dense_nv):
     buf = SlotBuffers(m, d)
     d.__dict__["_island_slots"] = buf
   return buf
@@ -1266,14 +1268,15 @@ def assign_slots(m: types.Model, d: types.Data) -> SlotBuffers:
   wp.launch(
     _island_slot,
     dim=(d.nworld, m.ntree),
-    # the dense rows' width bounds DENSE_NV (tests lower it)
+    # DENSE_NV bounds the dense rows (tests lower it)
     inputs=[
       buf.ngroup,
       buf.island_group,
       buf.group_nv,
       buf.group_nefc,
       buf.group_iefcadr,
-      min(DENSE_NV, buf.J.shape[2]) if _dense[0] else 0,
+      16 if _dense[0] and DENSE_NV >= 16 else 0,
+      m.island_dense_nv if _dense[0] and DENSE_NV >= 32 else 0,
     ],
     outputs=[buf.group_slot, buf.island_slot],
   )

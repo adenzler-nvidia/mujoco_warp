@@ -1465,6 +1465,8 @@ class Model:
     callback: custom physics callbacks
     nbranch: number of branches (leaf-to-root paths)
     nv_pad: number of degrees of freedom + padding
+    island_dense_nv: width of the island solver's dense problems: its largest possible island of
+                     17 to 32 DOFs, padded as nv_pad; 16 if there is none
     nacttrnbody: number of actuators with body transmission
     nsensorcollision: number of unique collisions for
                       geom distance sensors
@@ -1994,6 +1996,7 @@ class Model:
   callback: Callback
   nbranch: int
   nv_pad: int
+  island_dense_nv: int
   nacttrnbody: int
   nsensorcollision: int
   nsensortaxel: int

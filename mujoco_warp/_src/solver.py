@@ -2809,11 +2809,6 @@ def _active_check(tid: int, threshold: int) -> float:
     return 1.0
 
 
-@wp.func
-def _keep_row(active: float, x: float) -> float:
-  return wp.where(active != 0.0, x, 0.0)
-
-
 @cache_kernel
 def _update_gradient_JTDAJ_ragged(nv_pad: int, tile_size: int, njmax: int):
   """_update_gradient_JTDAJ_dense_tiled over the problems of the island solver.
@@ -2888,30 +2883,19 @@ def _update_gradient_JTDAJ_ragged(nv_pad: int, tile_size: int, njmax: int):
       wp.tile_scatter_add(m_tile, wp.where(enable, i * wp.static(nv_pad) + i, 0), 1.0, enable)
     sum_val = wp.tile_reshape(m_tile, (nv_pad, nv_pad))
 
+    # views ending at the problem's last row: the loads zero-fill rows past it (other problems'
+    # or uninitialized rows), so neither J nor D needs masking
+    J = wp.array(ptr=efc_J_in[rw].ptr, shape=(ro + nefc, wp.static(nv_pad)), dtype=float)
+    D = wp.array(ptr=efc_D_in[rw].ptr, shape=(ro + nefc,), dtype=float)
+    state = wp.array(ptr=efc_state_in[rw].ptr, shape=(ro + nefc,), dtype=int)
     for k in range(0, njmax, TILE_SIZE_K):
       if k >= nefc:
         break
-
-      # rows past the problem's are another island's or past the world (bounds checked)
-      J_kj = wp.tile_load(efc_J_in[rw], shape=(TILE_SIZE_K, nv_pad), offset=(ro + k, 0), bounds_check=True)
-
-      D_k = wp.tile_load(efc_D_in[rw], shape=TILE_SIZE_K, offset=ro + k, bounds_check=True)
-      state = wp.tile_load(efc_state_in[rw], shape=TILE_SIZE_K, offset=ro + k, bounds_check=True)
-
-      D_k = wp.tile_map(_state_check, D_k, state)
-
-      tid_tile = wp.tile_arange(TILE_SIZE_K, dtype=int)
-      threshold_tile = wp.tile_ones(shape=TILE_SIZE_K, dtype=int) * (nefc - k)
-
-      active_tile = wp.tile_map(_active_check, tid_tile, threshold_tile)
-      D_k = wp.tile_map(wp.mul, active_tile, D_k)
-      # rows past the problem's are other data (e.g. narrower rows of the next island, or
-      # uninitialized): select, not multiply
-      rows = wp.tile_broadcast(wp.tile_reshape(active_tile, shape=(TILE_SIZE_K, 1)), shape=(TILE_SIZE_K, nv_pad))
-      J_kj = wp.tile_map(_keep_row, rows, J_kj)
-
+      J_kj = wp.tile_load(J, shape=(TILE_SIZE_K, nv_pad), offset=(ro + k, 0), bounds_check=True)
+      D_k = wp.tile_load(D, shape=TILE_SIZE_K, offset=ro + k, bounds_check=True)
+      state_k = wp.tile_load(state, shape=TILE_SIZE_K, offset=ro + k, bounds_check=True)
+      D_k = wp.tile_map(_state_check, D_k, state_k)
       J_ki = wp.tile_map(wp.mul, wp.tile_transpose(J_kj), wp.tile_broadcast(D_k, shape=(nv_pad, TILE_SIZE_K)))
-
       sum_val += wp.tile_matmul(J_ki, J_kj)
 
     wp.tile_store(ctx_h_out[worldid], sum_val, bounds_check=False)
