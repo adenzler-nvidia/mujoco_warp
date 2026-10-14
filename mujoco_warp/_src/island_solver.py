@@ -258,65 +258,6 @@ def _gather_dofs(
 
 
 @wp.kernel
-def _pool_init(
-  # Model:
-  M_elemid: wp.array2d[int],
-  # Data in:
-  nisland_in: wp.array[int],
-  M_in: wp.array2d[float],
-  island_nv_in: wp.array2d[int],
-  # In:
-  h_row2dof_in: wp.array2d[int],
-  island_tilebase_in: wp.array2d[int],
-  island_ntile_in: wp.array2d[int],
-  island_vbase_in: wp.array2d[int],
-  island_slot_in: wp.array2d[wp.vec4i],
-  # Out:
-  ctx_h_out: wp.array3d[float],
-):
-  """Upper triangle of one row of a group's block in the tile pool: M, identity on padding.
-
-  Two-tile dense groups (solved by the dense world solver) have no block.
-  """
-  worldid, row = wp.tid()
-  nisland = nisland_in[worldid]
-  if nisland == 0:
-    return
-
-  # the owning island is the last one whose aligned rows start at or before this row
-  lo = int(0)
-  hi = nisland
-  while hi - lo > 1:
-    mid = (lo + hi) // 2
-    if island_vbase_in[worldid, mid] <= row:
-      lo = mid
-    else:
-      hi = mid
-  if island_slot_in[worldid, lo][0] > _TILE:
-    return
-  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
-  ntile = island_ntile_in[worldid, lo]
-  vbase = island_vbase_in[worldid, lo]
-  la = row - vbase
-  if la >= TILE * ntile:
-    return
-
-  n = island_nv_in[worldid, lo]
-  tilebase = island_tilebase_in[worldid, lo]
-  dofa = h_row2dof_in[worldid, row]
-  for lb in range(la, TILE * ntile):
-    value = float(0.0)
-    if la < n and lb < n:
-      dofb = h_row2dof_in[worldid, vbase + lb]
-      elemid = M_elemid[wp.max(dofa, dofb), wp.min(dofa, dofb)]
-      if elemid >= 0:
-        value = M_in[worldid, elemid]
-    elif la == lb:
-      value = 1.0
-    ctx_h_out[worldid, TILE * (tilebase + (la // TILE) * ntile + lb // TILE) + la % TILE, lb % TILE] = value
-
-
-@wp.kernel
 def _init_rows(
   # Data in:
   nefc_in: wp.array[int],
@@ -377,29 +318,84 @@ def _block_matvec(
   return acc
 
 
-@wp.func
-def _copy_upper_tiles(
-  # In:
-  lane: int,
-  nthread: int,
-  tilebase: int,
-  ntile: int,
-  src: wp.array2d[float],
-  # Out:
-  dst_out: wp.array2d[float],
-):
-  """Copy the upper tiles of an island block (the factorization reads no others)."""
-  TILE2 = wp.static(_TILE * _TILE)
-  for e in range(lane, ntile * ntile * TILE2, nthread):
-    t = e // TILE2
-    if t // ntile <= t % ntile:
-      row = _TILE * (tilebase + t) + (e % TILE2) // _TILE
-      dst_out[row, e % _TILE] = src[row, e % _TILE]
-
-
 @wp.func_native(snippet="WP_TILE_SYNC();")
 def _sync():
   pass
+
+
+@wp.func
+def _own_group(group_count_in: wp.array[int], group_list_in: wp.array2d[int], e: int) -> int:
+  """Entry e of the island solver's own groups: list 0 (block path), then list 4 (one tile)."""
+  if e < group_count_in[0]:
+    return group_list_in[0, e]
+  return group_list_in[4, e - group_count_in[0]]
+
+
+@wp.kernel
+def _pool_seed(
+  # Model:
+  ntree: int,
+  dof_treeid: wp.array[int],
+  tree_dofadr: wp.array[int],
+  tree_dofnum: wp.array[int],
+  M_rownnz: wp.array[int],
+  M_rowadr: wp.array[int],
+  M_colind: wp.array[int],
+  M_hinit_i: wp.array[int],
+  # Data in:
+  M_in: wp.array2d[float],
+  island_nv_in: wp.array2d[int],
+  # In:
+  nblock: int,
+  group_count_in: wp.array[int],
+  group_list_in: wp.array2d[int],
+  row2dof_in: wp.array2d[int],
+  tilebase_in: wp.array2d[int],
+  ntile_in: wp.array2d[int],
+  vbase_in: wp.array2d[int],
+  # Out:
+  iM_out: wp.array3d[float],
+  H_out: wp.array3d[float],
+):
+  """The own groups' blocks of M (identity on padding) in the M and H pools (upper tiles).
+
+  A group's DOFs are whole trees in order and M is block-diagonal over trees, with each tree's CSR
+  entries contiguous: the tiles are zeroed, then each tree's entries are written in place.
+  """
+  bid, lane = wp.tid()
+  nthread = wp.block_dim()
+  TILE2 = wp.static(_TILE * _TILE)
+  for e in range(bid, group_count_in[0] + group_count_in[4], nblock):
+    packed = _own_group(group_count_in, group_list_in, e)
+    worldid = packed // ntree
+    g = packed % ntree
+    n = island_nv_in[worldid, g]
+    ntile = ntile_in[worldid, g]
+    tilebase = tilebase_in[worldid, g]
+    vbase = vbase_in[worldid, g]
+    for idx in range(lane, ntile * ntile * TILE2, nthread):
+      t = idx // TILE2
+      if t // ntile <= t % ntile:
+        r = (idx % TILE2) // _TILE
+        c = idx % _TILE
+        la = (t // ntile) * _TILE + r
+        value = wp.where(la == (t % ntile) * _TILE + c and la >= n, 1.0, 0.0)
+        iM_out[worldid, _TILE * (tilebase + t) + r, c] = value
+        H_out[worldid, _TILE * (tilebase + t) + r, c] = value
+    _sync()
+    col = int(0)
+    while col < n:
+      tree = dof_treeid[row2dof_in[worldid, vbase + col]]
+      dofadr = tree_dofadr[tree]
+      last = dofadr + tree_dofnum[tree] - 1
+      beg = M_rowadr[dofadr]
+      base = col - dofadr
+      for ec in range(beg + lane, M_rowadr[last] + M_rownnz[last], nthread):
+        rc = _pool_rc(tilebase, ntile, M_colind[ec] + base, M_hinit_i[ec] + base)
+        iM_out[worldid, rc[0], rc[1]] = M_in[worldid, ec]
+        H_out[worldid, rc[0], rc[1]] = M_in[worldid, ec]
+      col += tree_dofnum[tree]
+    _sync()
 
 
 @wp.kernel
@@ -429,7 +425,7 @@ def _init_islands(
   improvement_out: wp.array2d[float],
   nsolving_out: wp.array[int],
 ):
-  """Start every island: M qacc, H = M, and its convergence scale (the inertia trace)."""
+  """Start every island: M qacc and its convergence scale (the inertia trace); H = M is seeded."""
   bid, lane = wp.tid()
   for e in range(bid, group_count_in[cls], nblock):
     worldid = group_list_in[cls, e] // ntree
@@ -448,7 +444,6 @@ def _init_islands(
       Ma_out[worldid, vbase + la] = _block_matvec(iM_in[worldid], tilebase, ntile, vbase, ndof, iqacc_in[worldid], la)
       rc = _pool_rc(tilebase, ntile, la, la)
       trace += iM_in[worldid, rc[0], rc[1]]
-    _copy_upper_tiles(lane, nthread, tilebase, ntile, iM_in[worldid], H_out[worldid])
     # MuJoCo scales an island's convergence tests by its inertia trace instead of meaninertia * nv
     trace = wp.tile_reduce(wp.add, wp.tile(trace))[0]
     if lane == 0:
@@ -1979,21 +1974,30 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     inputs=[d.qacc_warmstart, d.qfrc_smooth, d.qacc_smooth, warmstart, ctx.row2dof],
     outputs=[ctx.qacc, ctx.qfrc_smooth, ctx.frc],
   )
-  wp.launch(
-    _pool_init,
-    dim=(d.nworld, nrow),
+  wp.launch_tiled(
+    _pool_seed,
+    dim=_nblock(),
     inputs=[
-      m.M_elemid,
-      g.ngroup,
+      m.ntree,
+      m.dof_treeid,
+      m.tree_dofadr,
+      m.tree_dofnum,
+      m.M_rownnz,
+      m.M_rowadr,
+      m.M_colind,
+      m.M_hinit_i,
       d.M,
       g.group_nv,
+      _nblock(),
+      ctx.group_count,
+      ctx.group_list,
       ctx.row2dof,
       ctx.tilebase,
       ctx.ntile,
       ctx.vbase,
-      g.group_slot,
     ],
-    outputs=[ctx.M],
+    outputs=[ctx.M, ctx.H],
+    block_dim=_ISLAND_THREADS,
   )
   wp.launch(
     _init_rows,
