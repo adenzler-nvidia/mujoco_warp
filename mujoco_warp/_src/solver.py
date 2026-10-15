@@ -65,13 +65,12 @@ def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
   )
 
 
-def _island_pool_size(nv: int, ntree: int) -> tuple[int, int]:
+def _island_pool_size(nv: int, ntree: int, tile: int = types.TILE_SIZE_JTDAJ_DENSE) -> tuple[int, int]:
   """Tiles and aligned rows the island tile pool needs at most.
 
   An island of n DOFs takes ceil(n / 16) <= (n + 15) / 16 tiles per side, so the islands take at
-  most (nv^2 + 30 nv + 225 ntree) / 256 tiles and nv + 15 ntree aligned rows.
+  most (nv^2 + 30 nv + 225 ntree) / 256 tiles and nv + 15 ntree aligned rows (for tile = 16).
   """
-  tile = types.TILE_SIZE_JTDAJ_DENSE
   ntile = -(-(nv * nv + 2 * (tile - 1) * nv + (tile - 1) ** 2 * ntree) // (tile * tile))
   nrow = -(-(nv + (tile - 1) * ntree) // tile) * tile
   return ntile, nrow
@@ -2287,15 +2286,15 @@ def _island_pool_add(
   rowb: int,
   lb: int,
   value: float,
+  TILE: int,
   # Out:
   ctx_h_out: wp.array3d[float],
 ):
   """Add to entry (a, b) of an island block in the tile pool, mirrored into its upper triangle.
 
   rowa is the pool row of island-local row la within its first tile column; tiles of a block row
-  are 16 rows apart.
+  are TILE rows apart.
   """
-  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
   if la <= lb:
     wp.atomic_add(ctx_h_out[worldid, rowa + TILE * (lb // TILE)], lb % TILE, value)
   else:
@@ -2363,7 +2362,7 @@ def _update_gradient_h_incremental_sparse(compact: bool, pool: bool = False):
               continue
             li = ctx_h_dof_local_in[worldid, colindi]
             lj = ctx_h_dof_local_in[worldid, colindj]
-            _island_pool_add(worldid, rowi, li, rowj, lj, h, ctx_h_out)
+            _island_pool_add(worldid, rowi, li, rowj, lj, h, wp.static(types.TILE_SIZE_JTDAJ_DENSE), ctx_h_out)
             continue
           if wp.static(COMPACT):
             colindi = dof_cdof_in[worldid, colindi]
@@ -3447,7 +3446,8 @@ _JTDAJ_OVERSUBSCRIBE_WAVES = 6
 
 
 @cache_kernel
-def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int, pool: bool = False):
+def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int, pool: int = 0):
+  # pool: the tile size of the island tile pool H is stored in (0: a dense H per world)
   COMPACT = compact
   POOL = pool
   ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
@@ -3701,7 +3701,7 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int, po
               continue
             la = ctx_h_dof_local_in[worldid, dof_row]
             lb = ctx_h_dof_local_in[worldid, dof_col]
-            _island_pool_add(worldid, row_a, la, row_b, lb, hval, h_out)
+            _island_pool_add(worldid, row_a, la, row_b, lb, hval, wp.static(POOL), h_out)
             continue
           if wp.static(COMPACT):
             dof_row = dof_cdof_in[worldid, dof_row]
@@ -3804,7 +3804,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       max_condim = 3
       if m.opt.cone == types.ConeType.ELLIPTIC and m.nmaxcondim > 3:
         max_condim = int(m.nmaxcondim)
-      jtdaj_kernel = _JTDACJ_sparse(mapped, m.opt.cone, max_condim, island)
+      jtdaj_kernel = _JTDACJ_sparse(mapped, m.opt.cone, max_condim, types.TILE_SIZE_JTDAJ_DENSE if island else 0)
       jtdaj_inputs = [
         m.opt.impratio_invsqrt,
         d.contact.friction,
@@ -5488,39 +5488,44 @@ def _island_pool_layout(ntree: int):
   return kernel
 
 
-@wp.kernel
-def _island_pool_maps(
-  # Data in:
-  dof_island_in: wp.array2d[int],
-  island_idofadr_in: wp.array2d[int],
-  map_dof2idof_in: wp.array2d[int],
-  # In:
-  island_tilebase_in: wp.array2d[int],
-  island_ntile_in: wp.array2d[int],
-  island_vbase_in: wp.array2d[int],
-  # Out:
-  h_row2dof_out: wp.array2d[int],
-  h_dof2row_out: wp.array2d[int],
-  h_dof_poolrow_out: wp.array2d[int],
-  h_dof_local_out: wp.array2d[int],
-):
-  """Aligned vector row, pool row (first tile column) and local index of each large-island DOF."""
-  worldid, dofid = wp.tid()
-  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
-  row = int(-1)
-  poolrow = int(-1)
-  local = int(-1)
-  islandid = dof_island_in[worldid, dofid]
-  if islandid >= 0:
-    ntile = island_ntile_in[worldid, islandid]
-    if ntile > 0:
-      local = map_dof2idof_in[worldid, dofid] - island_idofadr_in[worldid, islandid]
-      row = island_vbase_in[worldid, islandid] + local
-      poolrow = TILE * (island_tilebase_in[worldid, islandid] + (local // TILE) * ntile) + local % TILE
-      h_row2dof_out[worldid, row] = dofid
-  h_dof2row_out[worldid, dofid] = row
-  h_dof_poolrow_out[worldid, dofid] = poolrow
-  h_dof_local_out[worldid, dofid] = local
+@cache_kernel
+def _island_pool_maps(tile: int):
+  TILE = tile
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    dof_island_in: wp.array2d[int],
+    island_idofadr_in: wp.array2d[int],
+    map_dof2idof_in: wp.array2d[int],
+    # In:
+    island_tilebase_in: wp.array2d[int],
+    island_ntile_in: wp.array2d[int],
+    island_vbase_in: wp.array2d[int],
+    # Out:
+    h_row2dof_out: wp.array2d[int],
+    h_dof2row_out: wp.array2d[int],
+    h_dof_poolrow_out: wp.array2d[int],
+    h_dof_local_out: wp.array2d[int],
+  ):
+    """Aligned vector row, pool row (first tile column) and local index of each large-island DOF."""
+    worldid, dofid = wp.tid()
+    row = int(-1)
+    poolrow = int(-1)
+    local = int(-1)
+    islandid = dof_island_in[worldid, dofid]
+    if islandid >= 0:
+      ntile = island_ntile_in[worldid, islandid]
+      if ntile > 0:
+        local = map_dof2idof_in[worldid, dofid] - island_idofadr_in[worldid, islandid]
+        row = island_vbase_in[worldid, islandid] + local
+        poolrow = TILE * (island_tilebase_in[worldid, islandid] + (local // TILE) * ntile) + local % TILE
+        h_row2dof_out[worldid, row] = dofid
+    h_dof2row_out[worldid, dofid] = row
+    h_dof_poolrow_out[worldid, dofid] = poolrow
+    h_dof_local_out[worldid, dofid] = local
+
+  return kernel
 
 
 @wp.kernel
@@ -5724,7 +5729,7 @@ def _island_h_order(m: types.Model, d: types.Data, ctx: SolverContext):
     block_dim=m.block_dim.island_scan_sizes,
   )
   wp.launch(
-    _island_pool_maps,
+    _island_pool_maps(types.TILE_SIZE_JTDAJ_DENSE),
     dim=(d.nworld, m.nv),
     inputs=[d.dof_island, d.island_idofadr, d.map_dof2idof, ctx.island_tilebase, ctx.island_ntile, ctx.island_vbase],
     outputs=[ctx.h_row2dof, ctx.h_dof2row, ctx.h_dof_poolrow, ctx.h_dof_local],

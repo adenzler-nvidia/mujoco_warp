@@ -978,6 +978,7 @@ DENSE_NV = 32  # read at each make_constraint
 # Larger groups would leave that path and waste work on their block-diagonal Hessian. Groups are
 # decided with the dense blocks; MERGE = False keeps one island per group.
 MERGE = True  # read at each make_constraint
+MERGE_NV = 16  # the merged groups' DOF limit, read at each make_constraint
 _dense = [True]
 
 
@@ -1060,6 +1061,7 @@ def _island_groups(ntree: int):
     island_iefcadr_in: wp.array2d[int],
     # In:
     merge: bool,
+    merge_nv: int,
     # Out:
     ngroup_out: wp.array[int],
     island_group_out: wp.array2d[int],
@@ -1088,7 +1090,7 @@ def _island_groups(ntree: int):
     gnefc = int(0)
     for i in range(nisland_in[worldid]):
       n = nv[i]
-      if g >= 0 and merge and gnv + n <= 16:
+      if g >= 0 and merge and gnv + n <= merge_nv:
         gnv += n
         gnefc += nefc[i]
       else:
@@ -1251,6 +1253,7 @@ def assign_slots(m: types.Model, d: types.Data) -> SlotBuffers:
       d.island_nf,
       d.island_iefcadr,
       MERGE,
+      MERGE_NV,
     ],
     outputs=[
       buf.ngroup,

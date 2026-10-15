@@ -51,7 +51,8 @@ from mujoco_warp._src.warp_util import cache_kernel
 
 wp.set_module_options({"enable_backward": False})
 
-_TILE = types.TILE_SIZE_JTDAJ_DENSE
+# the island tile pool's tile size (H, its factor, aligned DOF rows)
+_TILE = 16
 # threads per island: factorization as _update_gradient_cholesky, linesearch one warp as
 # _linesearch_iterative_kernel; one block per Hessian tile pair
 _ISLAND_THREADS = 64
@@ -1731,7 +1732,7 @@ def _free_dofs(
 
 
 def _create_context(m: types.Model, d: types.Data) -> IslandContext:
-  ntile_pool, nrow = _island_pool_size(m.nv, m.ntree)
+  ntile_pool, nrow = _island_pool_size(m.nv, m.ntree, _TILE)
   nworld, njmax, ntree = d.nworld, d.njmax, m.ntree
   pool = (nworld, ntile_pool * _TILE, _TILE)
   return IslandContext(
@@ -1813,7 +1814,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
   def sparse_h():
     # dense rows have no constraint groups
     wp.launch(
-      _JTDACJ_sparse(False, m.opt.cone, 3, True),
+      _JTDACJ_sparse(False, m.opt.cone, 3, _TILE),
       dim=(d.nworld, _jtdaj_groups_per_world(d.nworld, d.njmax), _JTDAJ_THREADS_PER_GROUP),
       inputs=[
         m.opt.impratio_invsqrt,
@@ -2007,7 +2008,7 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
   )
   ctx.row2dof.fill_(-1)
   wp.launch(
-    _island_pool_maps,
+    _island_pool_maps(_TILE),
     dim=(d.nworld, m.nv),
     inputs=[g.dof_group, g.group_idofadr, d.map_dof2idof, ctx.tilebase, ctx.ntile, ctx.vbase],
     outputs=[ctx.row2dof, ctx.dof2row, ctx.dof_poolrow, ctx.dof_local],
