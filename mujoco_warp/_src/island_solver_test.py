@@ -274,6 +274,11 @@ class IslandSolverTest(absltest.TestCase):
         np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
         np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
         _assert_Ma(mjm, mjd, d)
+        # from a nonzero start point (M qacc at the start matters)
+        mjm, mjd, m, d = _fixture(dense_nv, merge)
+        d.qacc_warmstart.assign(0.5 * mjd.qacc[None])
+        island_solver.solve(m, d)
+        np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
 
   def test_hessian(self):
     """Each island's H block is M + J'DJ over its quadratic rows, after incremental updates."""

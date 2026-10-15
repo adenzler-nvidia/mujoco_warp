@@ -357,7 +357,7 @@ def _pool_seed(
   iM_out: wp.array3d[float],
   H_out: wp.array3d[float],
 ):
-  """The own groups' blocks of M (identity on padding) in the M and H pools (upper tiles).
+  """The own groups' blocks of M (identity on padding) in the H pool, or M pool if one tile.
 
   A group's DOFs are whole trees in order and M is block-diagonal over trees, with each tree's CSR
   entries contiguous: the tiles are zeroed, then each tree's entries are written in place.
@@ -369,6 +369,8 @@ def _pool_seed(
     packed = _own_group(group_count_in, group_list_in, e)
     worldid = packed // ntree
     g = packed % ntree
+    # block-path groups (list 0) start from H = M; one-tile groups build H from M each iteration
+    block_path = e < group_count_in[0]
     n = island_nv_in[worldid, g]
     ntile = ntile_in[worldid, g]
     tilebase = tilebase_in[worldid, g]
@@ -380,8 +382,10 @@ def _pool_seed(
         c = idx % _TILE
         la = (t // ntile) * _TILE + r
         value = wp.where(la == (t % ntile) * _TILE + c and la >= n, 1.0, 0.0)
-        iM_out[worldid, _TILE * (tilebase + t) + r, c] = value
-        H_out[worldid, _TILE * (tilebase + t) + r, c] = value
+        if block_path:
+          H_out[worldid, _TILE * (tilebase + t) + r, c] = value
+        else:
+          iM_out[worldid, _TILE * (tilebase + t) + r, c] = value
     _sync()
     col = int(0)
     while col < n:
@@ -392,8 +396,10 @@ def _pool_seed(
       base = col - dofadr
       for ec in range(beg + lane, M_rowadr[last] + M_rownnz[last], nthread):
         rc = _pool_rc(tilebase, ntile, M_colind[ec] + base, M_hinit_i[ec] + base)
-        iM_out[worldid, rc[0], rc[1]] = M_in[worldid, ec]
-        H_out[worldid, rc[0], rc[1]] = M_in[worldid, ec]
+        if block_path:
+          H_out[worldid, rc[0], rc[1]] = M_in[worldid, ec]
+        else:
+          iM_out[worldid, rc[0], rc[1]] = M_in[worldid, ec]
       col += tree_dofnum[tree]
     _sync()
 
@@ -402,8 +408,14 @@ def _pool_seed(
 def _init_islands(
   # Model:
   ntree: int,
+  M_rownnz: wp.array[int],
+  M_rowadr: wp.array[int],
+  M_mulm_rowadr: wp.array[int],
+  M_mulm_col: wp.array[int],
+  M_mulm_madr: wp.array[int],
   # Data in:
   nisland_in: wp.array[int],
+  M_in: wp.array2d[float],
   island_nv_in: wp.array2d[int],
   # In:
   group_count_in: wp.array[int],
@@ -414,10 +426,9 @@ def _init_islands(
   ntile_in: wp.array2d[int],
   vbase_in: wp.array2d[int],
   iqacc_in: wp.array2d[float],
-  iM_in: wp.array3d[float],
+  row2dof_in: wp.array2d[int],
   # Out:
   Ma_out: wp.array2d[float],
-  H_out: wp.array3d[float],
   scale_out: wp.array2d[float],
   done_out: wp.array2d[bool],
   niter_out: wp.array2d[int],
@@ -441,9 +452,15 @@ def _init_islands(
     vbase = vbase_in[worldid, islandid]
     trace = float(0.0)
     for la in range(lane, ndof, nthread):
-      Ma_out[worldid, vbase + la] = _block_matvec(iM_in[worldid], tilebase, ntile, vbase, ndof, iqacc_in[worldid], la)
-      rc = _pool_rc(tilebase, ntile, la, la)
-      trace += iM_in[worldid, rc[0], rc[1]]
+      # sparse M: a group's DOFs are whole trees in order (column col of DOF dof: row + col - dof)
+      row = vbase + la
+      dof = row2dof_in[worldid, row]
+      ma = float(0.0)
+      for k in range(M_mulm_rowadr[dof], M_mulm_rowadr[dof + 1]):
+        ma += M_in[worldid, M_mulm_madr[k]] * iqacc_in[worldid, row + M_mulm_col[k] - dof]
+      Ma_out[worldid, row] = ma
+      # the diagonal is the last entry of the row of the lower triangle
+      trace += M_in[worldid, M_rowadr[dof] + M_rownnz[dof] - 1]
     # MuJoCo scales an island's convergence tests by its inertia trace instead of meaninertia * nv
     trace = wp.tile_reduce(wp.add, wp.tile(trace))[0]
     if lane == 0:
@@ -2051,7 +2068,13 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     dim=_nblock(),
     inputs=[
       m.ntree,
+      m.M_rownnz,
+      m.M_rowadr,
+      m.M_mulm_rowadr,
+      m.M_mulm_col,
+      m.M_mulm_madr,
       g.ngroup,
+      d.M,
       g.group_nv,
       ctx.group_count,
       ctx.group_list,
@@ -2061,9 +2084,9 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.ntile,
       ctx.vbase,
       ctx.qacc,
-      ctx.M,
+      ctx.row2dof,
     ],
-    outputs=[ctx.Ma, ctx.H, ctx.scale, ctx.done, ctx.niter, ctx.alpha, ctx.improvement, ctx.nsolving],
+    outputs=[ctx.Ma, ctx.scale, ctx.done, ctx.niter, ctx.alpha, ctx.improvement, ctx.nsolving],
     block_dim=_ISLAND_THREADS,
   )
   # initial constraint evaluation; H = M + J'DJ over the quadratic rows
