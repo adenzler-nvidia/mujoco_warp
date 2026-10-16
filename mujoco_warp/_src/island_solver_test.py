@@ -95,6 +95,12 @@ def _assert_Ma(mjm, mjd, d):
   np.testing.assert_allclose(d.efc.Ma.numpy()[0], M @ d.qacc.numpy()[0], rtol=1e-4, atol=1e-4)
 
 
+def _dense_groups(g, ngroup):
+  """Groups the dense world solver takes (dense rows, not the one-tile groups of _solve_small)."""
+  width = g.group_slot.numpy()[0, :ngroup, 0]
+  return (width > 0) & (width != island.small_width())
+
+
 def _dense_J(d):
   """World 0's Jacobian, including the rows of islands in slots (kept only there)."""
   nefc = d.nefc.numpy()[0]
@@ -213,19 +219,24 @@ class IslandSolverTest(absltest.TestCase):
       group_slot, J = g.group_slot.numpy()[0], g.J.numpy()[0]
       nv, rownnz = g.group_nv.numpy()[0], d.efc.J_rownnz.numpy()[0]
       ngroup = g.ngroup.numpy()[0]
-      wide = np.where(nv[:ngroup] <= m.island_dense_nv, m.island_dense_nv, 0)
-      np.testing.assert_array_equal(group_slot[:ngroup, 0], np.where(nv[:ngroup] <= 16, 16, wide))
+      # dense rows for single trees up to the dense width (one-tile groups: their own width)
+      idof2dof, idofadr = d.map_idof2dof.numpy()[0], g.group_idofadr.numpy()[0]
+      tree_nv = m.tree_dofnum.numpy()[m.dof_treeid.numpy()[idof2dof[idofadr[:ngroup]]]]
+      wide = np.where((nv[:ngroup] <= island.dense_width(m)) & (tree_nv == nv[:ngroup]), island.dense_width(m), 0)
+      small = island.small_width()
+      np.testing.assert_array_equal(group_slot[:ngroup, 0], np.where(nv[:ngroup] <= small, small, wide))
       widths.update(group_slot[:ngroup, 0])
       for i in range(ngroup):
         width, _, nrow, rowadr = group_slot[i]
         if width:
           np.testing.assert_array_equal(rownnz[rowadr : rowadr + nrow], 0)
           np.testing.assert_array_equal(J[rowadr : rowadr + nrow, nv[i] : width], 0.0)
-    # one tile, wider, and sparse (the tall stack)
-    self.assertEqual(sorted(widths), [0, 16, 32])
+    # dense rows (the chain) and sparse rows (the stacks, merged groups)
+    self.assertIn(0, widths)
+    self.assertGreater(max(widths), 0)
 
   def test_dense_width(self):
-    """Dense problems are as wide as the model's largest possible island of 17 to 32 DOFs.
+    """Dense problems are as wide as the model's largest tree of 17 to 32 DOFs (padded to 4).
 
     The box falls freely, so the chain is the only group: the island solver's own path is skipped.
     """
@@ -243,8 +254,9 @@ class IslandSolverTest(absltest.TestCase):
       "opt.jacobian": mujoco.mjtJacobian.mjJAC_SPARSE,
     }
     mjm, mjd, m, d = test_data.fixture(xml=xml, overrides=overrides)
-    # islands: the chain (18 DOFs), the box (6), or both (24)
+    # islands: the chain (18 DOFs), the box (6), or both (24); trees: the chain
     self.assertEqual(m.island_dense_nv, 24)
+    self.assertEqual(m.island_tree_nv, 20)
     m.opt.island_solve = True
     self.assertTrue(island.island_rows(m))
     mjw.make_constraint(m, d)
@@ -255,7 +267,7 @@ class IslandSolverTest(absltest.TestCase):
     d.efc.Ma.fill_(np.nan)
     island_solver.solve(m, d)
     g = island.slot_buffers(m, d)
-    self.assertEqual(list(g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0]), [24])
+    self.assertEqual(list(g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0]), [island.dense_width(m)])
     np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
     np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
     _assert_Ma(mjm, mjd, d)
@@ -263,7 +275,8 @@ class IslandSolverTest(absltest.TestCase):
   def test_solve(self):
     """The island solve reaches MuJoCo's solution, with dense, mixed and sparse islands.
 
-    Without merging, single boxes, the arm and the welded pair are one-tile groups (_solve_small).
+    Single trees (boxes, the chain, the arm) take the dense world solver; several trees (stacks, the
+    welded pair, merged groups) the block path.
     """
     for dense_nv, merge in ((32, True), (32, False), (16, True), (0, True)):
       with self.subTest(dense_nv=dense_nv, merge=merge):
@@ -305,14 +318,15 @@ class IslandSolverTest(absltest.TestCase):
     dense_h, problem = ctx.dense.ctx.h.numpy(), ctx.group_problem.numpy()[0]
     idof2dof, idofadr = d.map_idof2dof.numpy()[0], g.group_idofadr.numpy()[0]
     ndense = 0
+    dense = _dense_groups(g, g.ngroup.numpy()[0])
     for i in range(g.ngroup.numpy()[0]):
-      if width[i] > 16:
+      if dense[i]:
         # dense groups: the dense world solver's H (upper triangle, identity padding)
         dofs = idof2dof[idofadr[i] : idofadr[i] + island_nv[i]]
         Hi = M[np.ix_(dofs, dofs)].copy()
         # convergence is measured relative to the island's inertia trace (meaninertia * nv)
         meaninertia = ctx.dense.m.stat.meaninertia.numpy()[problem[i]]
-        np.testing.assert_allclose(meaninertia * m.island_dense_nv, np.trace(Hi), rtol=1e-5)
+        np.testing.assert_allclose(meaninertia * island.dense_width(m), np.trace(Hi), rtol=1e-5)
         for r in range(island_iefcadr[i], island_iefcadr[i] + island_nefc[i]):
           if state[r] == mujoco.mjtConstraintState.mjCNSTRSTATE_QUADRATIC:
             Jr = J[iefc2efc[r], dofs]
@@ -336,9 +350,11 @@ class IslandSolverTest(absltest.TestCase):
           Hi += D[iefc2efc[r]] * np.outer(Jr, Jr)
       for a in range(len(dofs)):
         for b in range(a, len(dofs)):
-          entry = H[16 * (tilebase + (a // 16) * c + b // 16) + a % 16, b % 16]
+          T = island_solver._TILE
+          entry = H[T * (tilebase + (a // T) * c + b // T) + a % T, b % T]
           np.testing.assert_allclose(entry, Hi[a, b], rtol=1e-4, atol=1e-4, err_msg=f"group {i} ({a}, {b})")
-    self.assertIn(3, ntiles)
+    # a block over one tile per side
+    self.assertGreater(max(ntiles), 1)
     if dense_nv == 32:
       self.assertGreater(ndense, 0)
 
@@ -355,13 +371,17 @@ class IslandSolverTest(absltest.TestCase):
     grad_true = ctx.Ma.numpy()[0] - ctx.qfrc_smooth.numpy()[0] - ctx.frc.numpy()[0]
     grad, scale = ctx.grad.numpy()[0, :, 0], ctx.grad_scale.numpy()[0, :nisland]
     vbase, nv = ctx.vbase.numpy()[0, :nisland], g.group_nv.numpy()[0, :nisland]
-    width = g.group_slot.numpy()[0, :, 0]
+    dense = _dense_groups(g, nisland)
     for i in range(nisland):
       # dense groups are solved by the dense world solver
-      if width[i] > 16:
+      if dense[i]:
         continue
       rows = slice(vbase[i], vbase[i] + nv[i])
-      np.testing.assert_allclose(scale[i] * grad[rows], grad_true[rows], rtol=1e-3, atol=1e-4, err_msg=f"island {i}")
+      # the gradient is a difference of force terms: its float32 noise scales with them, not with
+      # the (converged, near zero) gradient
+      forces = max(np.abs(t[rows]).max() for t in (ctx.Ma.numpy()[0], ctx.qfrc_smooth.numpy()[0], ctx.frc.numpy()[0]))
+      atol = 1e-4 + 1e-5 * forces
+      np.testing.assert_allclose(scale[i] * grad[rows], grad_true[rows], rtol=1e-3, atol=atol, err_msg=f"island {i}")
     self.assertTrue(np.any(np.abs(scale - 1.0) > 1e-3))
 
   def test_islands_converge_independently(self):
@@ -370,13 +390,16 @@ class IslandSolverTest(absltest.TestCase):
     ctx = island_solver.solve(m, d)
     g = island.slot_buffers(m, d)
     # groups of the island solver (dense groups are solved by the dense world solver)
-    own = g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0] <= 16
-    niter = ctx.niter.numpy()[0, : g.ngroup.numpy()[0]][own]
+    ngroup = g.ngroup.numpy()[0]
+    # the island solver's iterations, or the dense world solver's of the group's problem
+    dense = _dense_groups(g, ngroup)
+    problem = ctx.group_problem.numpy()[0, :ngroup]
+    niter = np.where(dense, ctx.dense.d.solver_niter.numpy()[np.maximum(problem, 0)], ctx.niter.numpy()[0, :ngroup])
     self.assertLess(niter.min(), niter.max())
     self.assertGreaterEqual(d.solver_niter.numpy()[0], niter.max())
 
   def test_island_groups(self):
-    """Consecutive islands share a group if they fit in one tile; the solution is unchanged."""
+    """Consecutive islands share a group up to MERGE_NV DOFs; the solution is unchanged."""
     mjm, mjd, m, d = _fixture()
     g = island.slot_buffers(m, d)
     nv, group = d.island_nv.numpy()[0], g.island_group.numpy()[0]
@@ -387,7 +410,7 @@ class IslandSolverTest(absltest.TestCase):
       members = nv[:nisland][group[:nisland] == k]
       self.assertEqual(members.sum(), group_nv[k])
       if len(members) > 1:
-        self.assertLessEqual(group_nv[k], 16)
+        self.assertLessEqual(group_nv[k], island.MERGE_NV)
     island_solver.solve(m, d)
     np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
 

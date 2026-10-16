@@ -969,16 +969,22 @@ ROW_FRICTION = 1
 ROW_LIMIT = 2
 ROW_CONTACT = 3
 
-# Island groups of up to DENSE_NV DOFs write their Jacobian rows only to a dense row-major array
-# indexed by the world's rows (SlotBuffers.J), 16 group-local columns wide up to 16 DOFs, else
-# m.island_dense_nv; their sparse rows are empty (J_rownnz = 0). Wider groups keep sparse rows.
+# Groups of one tree of up to dense_width(m) DOFs (e.g. a humanoid) write their Jacobian rows only
+# to a dense row-major array indexed by the world's rows (SlotBuffers.J), in group-local columns;
+# their sparse rows are empty (J_rownnz = 0), and the dense world solver solves them. Other groups
+# keep sparse rows and take the island solver's block path. DENSE_NV bounds the dense width (tests
+# lower it).
 DENSE_NV = 32  # read at each make_constraint
-# The island solver solves groups of islands: runs of consecutive islands that fit in one 16-DOF
-# tile together (e.g. two free bodies), with block-diagonal Hessians, solved whole in one kernel.
-# Larger groups would leave that path and waste work on their block-diagonal Hessian. Groups are
-# decided with the dense blocks; MERGE = False keeps one island per group.
+# Groups are runs of consecutive islands up to MERGE_NV DOFs (e.g. resting boxes), filling the
+# block path's tiles; islands after a group's first add only limit and contact rows (rows stay in
+# class order). MERGE = False keeps one island per group.
 MERGE = True  # read at each make_constraint
-MERGE_NV = 16  # the merged groups' DOF limit, read at each make_constraint
+MERGE_NV = 32  # read at each make_constraint
+# groups of up to SMALL_NV DOFs are solved whole in one kernel (_solve_small, 16-wide dense rows,
+# needs island_solver._TILE = 16); 0: they take the paths above
+SMALL_NV = 0
+# groups of several trees also get dense rows; False: sparse (rows touch few of their columns)
+DENSE_TREES = False
 _dense = [True]
 
 
@@ -1090,7 +1096,10 @@ def _island_groups(ntree: int):
     gnefc = int(0)
     for i in range(nisland_in[worldid]):
       n = nv[i]
-      if g >= 0 and merge and gnv + n <= merge_nv:
+      # a group's rows stay in class order (the dense world solver relies on it): islands after the
+      # first add only limit and contact rows
+      joins = island_ne_in[worldid, i] == 0 and island_nf_in[worldid, i] == 0
+      if g >= 0 and merge and joins and gnv + n <= merge_nv:
         gnv += n
         gnefc += nefc[i]
       else:
@@ -1102,8 +1111,7 @@ def _island_groups(ntree: int):
         gnefc = nefc[i]
         group_idofadr_out[worldid, g] = idofadr[i]
         group_iefcadr_out[worldid, g] = iefcadr[i]
-        # rows of a group of several islands are not ordered by class; such groups fit in one tile
-        # and the solvers that use these counts (groups over one tile) see single islands
+        # the group's class counts: islands that join it have only limit and contact rows
         group_ne_out[worldid, g] = island_ne_in[worldid, i]
         group_nf_out[worldid, g] = island_nf_in[worldid, i]
         group_island0_out[worldid, g] = i
@@ -1133,14 +1141,21 @@ def _dense_width(ndof: int, small: int, wide: int) -> int:
 
 @wp.kernel
 def _island_slot(
+  # Model:
+  dof_treeid: wp.array[int],
+  tree_dofnum: wp.array[int],
+  # Data in:
+  map_idof2dof_in: wp.array2d[int],
   # In:
   ngroup_in: wp.array[int],
   island_group_in: wp.array2d[int],
   group_nv_in: wp.array2d[int],
   group_nefc_in: wp.array2d[int],
   group_iefcadr_in: wp.array2d[int],
+  group_idofadr_in: wp.array2d[int],
   small: int,
   wide: int,
+  dense_trees: bool,
   # Out:
   group_slot_out: wp.array2d[wp.vec4i],
   island_slot_out: wp.array2d[wp.vec4i],
@@ -1149,15 +1164,46 @@ def _island_slot(
   worldid, i = wp.tid()
   block = wp.vec4i(0)
   if i < ngroup_in[worldid]:
-    block = wp.vec4i(
-      _dense_width(group_nv_in[worldid, i], small, wide), 0, group_nefc_in[worldid, i], group_iefcadr_in[worldid, i]
+    width = _group_width(
+      dof_treeid, tree_dofnum, map_idof2dof_in, group_nv_in, group_idofadr_in, worldid, i, small, wide, dense_trees
     )
+    block = wp.vec4i(width, 0, group_nefc_in[worldid, i], group_iefcadr_in[worldid, i])
   group_slot_out[worldid, i] = block
   g = island_group_in[worldid, i]
   if g >= 0:
-    island_slot_out[worldid, i] = wp.vec4i(
-      _dense_width(group_nv_in[worldid, g], small, wide), 0, group_nefc_in[worldid, g], group_iefcadr_in[worldid, g]
+    width = _group_width(
+      dof_treeid, tree_dofnum, map_idof2dof_in, group_nv_in, group_idofadr_in, worldid, g, small, wide, dense_trees
     )
+    island_slot_out[worldid, i] = wp.vec4i(width, 0, group_nefc_in[worldid, g], group_iefcadr_in[worldid, g])
+
+
+@wp.func
+def _group_width(
+  # Model:
+  dof_treeid: wp.array[int],
+  tree_dofnum: wp.array[int],
+  # Data in:
+  map_idof2dof_in: wp.array2d[int],
+  # In:
+  group_nv_in: wp.array2d[int],
+  group_idofadr_in: wp.array2d[int],
+  worldid: int,
+  g: int,
+  small: int,
+  wide: int,
+  dense_trees: bool,
+) -> int:
+  """Dense row width of a group (0: sparse rows).
+
+  Unless dense_trees, only single trees get dense rows wider than small: a tree's rows run along its
+  chains, while each row of several trees touches few of their columns.
+  """
+  n = group_nv_in[worldid, g]
+  width = _dense_width(n, small, wide)
+  if width > small and not dense_trees:
+    if tree_dofnum[dof_treeid[map_idof2dof_in[worldid, group_idofadr_in[worldid, g]]]] != n:
+      return 0
+  return width
 
 
 @wp.kernel
@@ -1205,7 +1251,7 @@ class SlotBuffers:
   """Island groups and their dense rows, shared by make_constraint and the island solve."""
 
   def __init__(self, m: types.Model, d: types.Data):
-    self.key = (d.nworld, m.ntree, m.nv, d.njmax, m.island_dense_nv)
+    self.key = (d.nworld, m.ntree, m.nv, d.njmax, dense_width(m), SMALL_NV)
     shape = (d.nworld, m.ntree)
     self.ngroup = wp.empty(d.nworld, dtype=int)
     self.island_group = wp.empty(shape, dtype=int)
@@ -1225,12 +1271,22 @@ class SlotBuffers:
     # dense rows by world row; tile kernels read whole tiles of rows, past a world's last row (and
     # mask them). Not zeroed: this may be allocated in a graph capture, where a fill would run every
     # step.
-    self.J = wp.empty((d.nworld, d.njmax + types.TILE_SIZE_JTDAJ_DENSE, max(16, m.island_dense_nv)), dtype=float)
+    self.J = wp.empty((d.nworld, d.njmax + types.TILE_SIZE_JTDAJ_DENSE, max(SMALL_NV, dense_width(m))), dtype=float)
+
+
+def dense_width(m: types.Model) -> int:
+  """Width of the dense problems: the largest group that can have dense rows (see DENSE_TREES)."""
+  return m.island_dense_nv if DENSE_TREES else m.island_tree_nv
+
+
+def small_width() -> int:
+  """Dense row width of the groups solved whole by _solve_small (0: no such groups)."""
+  return SMALL_NV if _dense[0] and DENSE_NV >= 16 else 0
 
 
 def slot_buffers(m: types.Model, d: types.Data) -> SlotBuffers:
   buf = d.__dict__.get("_island_slots")
-  if buf is None or buf.key != (d.nworld, m.ntree, m.nv, d.njmax, m.island_dense_nv):
+  if buf is None or buf.key != (d.nworld, m.ntree, m.nv, d.njmax, dense_width(m), SMALL_NV):
     buf = SlotBuffers(m, d)
     d.__dict__["_island_slots"] = buf
   return buf
@@ -1274,13 +1330,18 @@ def assign_slots(m: types.Model, d: types.Data) -> SlotBuffers:
     dim=(d.nworld, m.ntree),
     # DENSE_NV bounds the dense rows (tests lower it)
     inputs=[
+      m.dof_treeid,
+      m.tree_dofnum,
+      d.map_idof2dof,
       buf.ngroup,
       buf.island_group,
       buf.group_nv,
       buf.group_nefc,
       buf.group_iefcadr,
-      16 if _dense[0] and DENSE_NV >= 16 else 0,
-      m.island_dense_nv if _dense[0] and DENSE_NV >= 32 else 0,
+      buf.group_idofadr,
+      small_width(),
+      dense_width(m) if _dense[0] and DENSE_NV >= 32 else 0,
+      DENSE_TREES,
     ],
     outputs=[buf.group_slot, buf.island_slot],
   )

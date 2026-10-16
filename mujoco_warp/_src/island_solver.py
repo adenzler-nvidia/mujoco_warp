@@ -14,10 +14,11 @@
 # ==============================================================================
 """Newton constraint solver over islands (opt.island_solve).
 
-make_constraint writes an island's rows contiguously. Islands of up to island.DENSE_NV DOFs store
-their Jacobian as one dense block of whole 16-DOF tiles (island-local columns), wider ones as sparse
-rows. Each step, an island's DOFs are gathered into tile-aligned rows, and its inertia and Hessian
-are dense blocks of 16x16 tiles in a per-world pool. Every island is solved with its own step size
+make_constraint writes an island's rows contiguously. Single trees of up to island.dense_width(m)
+DOFs store their Jacobian as dense rows (island-local columns) and are solved by the dense world
+solver; other groups keep sparse rows. On the island solver's block path, a group's DOFs are
+gathered into tile-aligned rows, and its inertia and Hessian are dense blocks of _TILE x _TILE tiles
+in a per-world pool. Every island is solved with its own step size
 and convergence test, as MuJoCo's island solver does. Kernels run over the work that exists: rows,
 DOFs, islands and the tile pairs of each island's Hessian.
 """
@@ -52,7 +53,7 @@ from mujoco_warp._src.warp_util import cache_kernel
 wp.set_module_options({"enable_backward": False})
 
 # the island tile pool's tile size (H, its factor, aligned DOF rows)
-_TILE = 16
+_TILE = 32
 # threads per island: factorization as _update_gradient_cholesky, linesearch one warp as
 # _linesearch_iterative_kernel; one block per Hessian tile pair
 _ISLAND_THREADS = 64
@@ -193,6 +194,7 @@ def _group_lists(
   ngroup_in: wp.array[int],
   group_nv_in: wp.array2d[int],
   island_slot_in: wp.array2d[wp.vec4i],
+  small: int,
   # Out:
   group_count_out: wp.array[int],
   group_list_out: wp.array2d[int],
@@ -213,12 +215,12 @@ def _group_lists(
   packed = worldid * ntree + g
   width = island_slot_in[worldid, g][0]
   group_problem_out[worldid, g] = -1
-  if width == _TILE:
+  if width > 0 and width == small:
     group_list_out[4, wp.atomic_add(group_count_out, 4, 1)] = packed
     wp.atomic_add(group_count_out, 7, 1)
     done_out[worldid, g] = True
     return
-  if width > _TILE:
+  if width > 0:
     p = wp.atomic_add(group_count_out, 6, 1)
     group_list_out[6, p] = packed
     group_problem_out[worldid, g] = p
@@ -274,6 +276,7 @@ def _init_rows(
   dof2row_in: wp.array2d[int],
   iJ_in: wp.array3d[float],
   iqacc_in: wp.array2d[float],
+  small: int,
   # Out:
   row_jaref_out: wp.array2d[float],
 ):
@@ -283,8 +286,8 @@ def _init_rows(
     return
   islandid = efc_island_in[worldid, row]
   block = island_slot_in[worldid, islandid]
-  # dense groups wider than a tile: the dense world solver computes its own
-  if block[0] > _TILE:
+  # dense-path groups: the dense world solver computes its own
+  if block[0] > 0 and block[0] != small:
     return
   jaref = -efc_aref_in[worldid, row]
   if block[0] > 0:
@@ -600,6 +603,7 @@ def _grad(final: bool):
     state_changed_in: wp.array2d[bool],
     Ma_in: wp.array2d[float],
     iqfrc_smooth_in: wp.array2d[float],
+    small: int,
     # Out:
     frc_out: wp.array2d[float],
     grad_out: wp.array2d[float],
@@ -621,7 +625,7 @@ def _grad(final: bool):
         return
     block = island_slot_in[worldid, islandid]
     frc = float(0.0)
-    if block[0] == _TILE:
+    if block[0] > 0 and block[0] == small:
       col = row - vbase_in[worldid, islandid]
       for r in range(block[2]):
         force = efc_force_in[worldid, block[3] + r]
@@ -1434,10 +1438,10 @@ def _solve_small(ls_iterations: int, warn_overflow: int):
   return kernel
 
 
-# Groups of 17 to 32 DOFs (e.g. a humanoid) are solved by the dense world solver, each group one
-# problem of m.island_dense_nv DOFs: its rows are the group's rows in place (SolverContext.efc_world
-# and efc_rowoff), its Jacobian the dense rows (island.SlotBuffers.J), its inertia the world's
-# sparse M.
+# Groups with dense rows (see island.DENSE_NV) are solved by the dense world solver, each group
+# one problem of island.dense_width(m) DOFs: its rows are the group's rows in place
+# (SolverContext.efc_world and efc_rowoff), its Jacobian the dense rows (island.SlotBuffers.J), its
+# inertia the world's sparse M.
 
 
 @wp.kernel
@@ -1590,9 +1594,9 @@ def _create_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.S
   """
   from mujoco_warp._src import solver  # noqa: PLC0415 (solver dispatches to this module)
 
-  N = m.island_dense_nv
-  # a world has at most nv // 17 groups of 17 or more DOFs
-  ns = d.nworld * max(1, min(m.ntree, m.nv // (_TILE + 1)))
+  N = island.dense_width(m)
+  # dense groups are wider than the one-tile groups (if any), and at most one per tree
+  ns = d.nworld * max(1, min(m.ntree, m.nv // (island.small_width() + 1)))
   gc = m.opt.graph_conditional and wp.get_device().is_cuda
   opt = dataclasses.replace(
     m.opt, graph_conditional=gc, tolerance=wp.empty(ns, dtype=float), ls_tolerance=wp.empty(ns, dtype=float)
@@ -1657,7 +1661,7 @@ def _solve_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
     _dense_dofs,
     dim=(d.nworld, m.nv),
     inputs=[
-      m.island_dense_nv,
+      island.dense_width(m),
       d.qacc_warmstart,
       d.qfrc_smooth,
       d.qacc_smooth,
@@ -1866,6 +1870,7 @@ def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final
       ctx.state_changed,
       ctx.Ma,
       ctx.qfrc_smooth,
+      island.small_width(),
     ],
     outputs=[ctx.frc, ctx.grad.reshape((d.nworld, nrow))],
   )
@@ -2061,6 +2066,7 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.dof2row,
       g.J,
       ctx.qacc,
+      island.small_width(),
     ],
     outputs=[ctx.row_jaref],
   )
@@ -2203,7 +2209,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   wp.launch(
     _group_lists,
     dim=(d.nworld, m.ntree),
-    inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot],
+    inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot, island.small_width()],
     outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done],
   )
   if m.opt.graph_conditional:

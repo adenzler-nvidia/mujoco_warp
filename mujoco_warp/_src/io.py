@@ -471,6 +471,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.callback = types.Callback()
 
   m.island_dense_nv = _island_dense_nv(mjm.tree_dofnum)
+  m.island_tree_nv = _island_tree_nv(mjm.tree_dofnum)
   m.nv_pad = _get_padded_sizes(
     mjm.nv,
     0,
@@ -1336,6 +1337,12 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
 
   warp_util.mark_batched(m)
   return m
+
+
+def _island_tree_nv(tree_dofnum) -> int:
+  """Padded size of the largest tree of 17 to 32 DOFs; 16 if there is none."""
+  sizes = [int(n) for n in tree_dofnum if 16 < n <= 32]
+  return (max(sizes) + 3) // 4 * 4 if sizes else 16
 
 
 def _island_dense_nv(tree_dofnum) -> int:

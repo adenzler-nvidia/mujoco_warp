@@ -1467,6 +1467,7 @@ class Model:
     nv_pad: number of degrees of freedom + padding
     island_dense_nv: width of the island solver's dense problems: its largest possible island of
                      17 to 32 DOFs, padded as nv_pad; 16 if there is none
+    island_tree_nv: as island_dense_nv for trees (dense rows only for single trees)
     nacttrnbody: number of actuators with body transmission
     nsensorcollision: number of unique collisions for
                       geom distance sensors
@@ -1997,6 +1998,7 @@ class Model:
   nbranch: int
   nv_pad: int
   island_dense_nv: int
+  island_tree_nv: int
   nacttrnbody: int
   nsensorcollision: int
   nsensortaxel: int
