@@ -6846,24 +6846,14 @@ def make_constraint(m: types.Model, d: types.Data):
 
   if island.island_rows(m):
     # islands from the active constraints' trees, then rows written in island order
-    wp.launch(island._reset_dsu, dim=(d.nworld, m.ntree), inputs=[d.nisland, d.tree_island, island_parent])
-    wp.launch(island._reset_tree_nrow, dim=tree_nrow.shape, outputs=[tree_nrow])
+    wp.launch(island._island_reset, dim=(d.nworld, m.ntree), outputs=[d.nisland, d.tree_island, island_parent, tree_nrow])
     build(island.ROWS_DISCOVER)
-    island.rows_finalize(m, d, island_parent)
-    wp.launch_tiled(
-      island._island_row_layout(m.ntree),
-      dim=d.nworld,
-      inputs=[d.tree_island, tree_nrow],
-      outputs=[d.island_nefc, d.island_ne, d.island_nf, island_rowadr, island_cursor],
-      block_dim=types.BlockDim.island_scan_sizes,
-    )
-    slots = island.assign_slots(m, d)
+    slots = island.island_layout(m, d, island_parent, tree_nrow, island_rowadr, island_cursor)
     # rows that overflow the Jacobian storage return before setting their rownnz: keep them empty
     d.efc.J_rownnz.zero_()
     island_slot, dof_slotcol, slot_J = slots.island_slot, slots.dof_slotcol, slots.J
     build(island.ROWS_WRITE)
-    island.island_rows_identity(m, d)
-    island.assign_rows(m, d)
+    island.island_rows_done(m, d)
   else:
     build(island.ROWS_WORLD)
 
