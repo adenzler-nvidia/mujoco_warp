@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import contextlib
+from typing import Any
 
 import warp as wp
 
@@ -1113,6 +1114,11 @@ def slot_buffers(m: types.Model, d: types.Data) -> SlotBuffers:
 def _block_sync(): ...
 
 
+# a shared tile's element, without the barrier that tile element assignment ends with
+@wp.func_native(snippet="t.data(wp::tile_coord(i)) = v;")
+def _tile_set(t: Any, i: int, v: int): ...
+
+
 @wp.kernel
 def _island_reset(
   # Data out:
@@ -1257,49 +1263,63 @@ def _island_world(ntree: int):
       nidof_out[worldid] = nidof
     _block_sync()
 
+    # the serial passes read and write shared memory and registers: global writes followed by reads
+    # would each wait for a round trip
+    tisland = wp.tile_load(tree_island_out[worldid], shape=ntree, storage="shared")
+    tdofnum = wp.tile_load(tree_dofnum, shape=ntree, storage="shared")
+    acc = wp.tile_zeros(shape=ntree, dtype=int, storage="shared")
     if lane == 0:
       # each tree's DOF offset in its island (DOFs in tree order), or among the free trees
-      for i in range(nisland):
-        island_acc_out[worldid, i] = 0
       free = int(0)
       for t in range(ntree):
-        islandid = tree_island_out[worldid, t]
+        islandid = tisland[t]
+        n = tdofnum[t]
         if islandid >= 0:
-          tree_iofs_out[worldid, t] = island_acc_out[worldid, islandid]
-          island_acc_out[worldid, islandid] += tree_dofnum[t]
+          a = acc[islandid]
+          tree_iofs_out[worldid, t] = a
+          _tile_set(acc, islandid, a + n)
         else:
           tree_iofs_out[worldid, t] = free
-          free += tree_dofnum[t]
+          free += n
 
       # groups: runs of consecutive islands up to merge_nv DOFs; islands after a group's first add
       # only limit and contact rows, so the group's rows stay in class order
       g = int(-1)
       gnv = int(0)
       gnefc = int(0)
+      gnisland = int(0)
+      idofadr = int(0)
+      iefcadr = int(0)
       for i in range(nisland):
-        n = island_nv_out[worldid, i]
-        joins = island_ne_out[worldid, i] == 0 and island_nf_out[worldid, i] == 0
-        if g >= 0 and merge and joins and gnv + n <= merge_nv:
+        n = ndof[i]
+        ne = counts[i * ROW_CLASSES + ROW_EQUALITY]
+        nf = counts[i * ROW_CLASSES + ROW_FRICTION]
+        nefc = ne + nf + counts[i * ROW_CLASSES + ROW_LIMIT] + counts[i * ROW_CLASSES + ROW_CONTACT]
+        if g >= 0 and merge and ne == 0 and nf == 0 and gnv + n <= merge_nv:
           gnv += n
-          gnefc += island_nefc_out[worldid, i]
+          gnefc += nefc
+          gnisland += 1
         else:
           if g >= 0:
             group_nv_out[worldid, g] = gnv
             group_nefc_out[worldid, g] = gnefc
+            group_nisland_out[worldid, g] = gnisland
           g += 1
           gnv = n
-          gnefc = island_nefc_out[worldid, i]
-          group_idofadr_out[worldid, g] = island_idofadr_out[worldid, i]
-          group_iefcadr_out[worldid, g] = island_iefcadr_out[worldid, i]
-          group_ne_out[worldid, g] = island_ne_out[worldid, i]
-          group_nf_out[worldid, g] = island_nf_out[worldid, i]
+          gnefc = nefc
+          gnisland = 1
+          group_idofadr_out[worldid, g] = idofadr
+          group_iefcadr_out[worldid, g] = iefcadr
+          group_ne_out[worldid, g] = ne
+          group_nf_out[worldid, g] = nf
           group_island0_out[worldid, g] = i
-          group_nisland_out[worldid, g] = 0
         island_group_out[worldid, i] = g
-        group_nisland_out[worldid, g] += 1
+        idofadr += n
+        iefcadr += nefc
       if g >= 0:
         group_nv_out[worldid, g] = gnv
         group_nefc_out[worldid, g] = gnefc
+        group_nisland_out[worldid, g] = gnisland
       ngroup_out[worldid] = g + 1
       # the tiled kernels read all ntree entries
       for k in range(g + 1, ntree):
