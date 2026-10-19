@@ -5832,12 +5832,11 @@ def _use_island_solve(m: types.Model) -> bool:
     and m.ntree > 1
     and not (m.opt.disableflags & types.DisableBit.ISLAND)
     and m.opt.integrator != types.IntegratorType.DISCRETE
-    and not (m.opt.enableflags & types.EnableBit.SLEEP)
   )
   if not supported:
     raise ValueError(
       "opt.island_solve requires the Newton solver, a sparse Jacobian, more than one tree, islands enabled,"
-      " a non-discrete integrator, and sleep disabled"
+      " and a non-discrete integrator"
     )
   return True
 
@@ -5851,7 +5850,8 @@ def _island_solver():
 
 @event_scope
 def solve(m: types.Model, d: types.Data):
-  if m.opt.enableflags & types.EnableBit.SLEEP:
+  island_solve = d.njmax > 0 and m.nv > 0 and _use_island_solve(m) and _island_solver().supported(m)
+  if (m.opt.enableflags & types.EnableBit.SLEEP) and not island_solve:
     island.update_active_dofs(m, d)
     if m.opt.integrator != types.IntegratorType.DISCRETE:
       solve_compact(m, d)
@@ -5862,7 +5862,8 @@ def solve(m: types.Model, d: types.Data):
   if d.njmax == 0 or m.nv == 0:
     wp.copy(d.qacc, d.qacc_smooth)
     d.solver_niter.fill_(0)
-  elif _use_island_solve(m) and _island_solver().supported(m):
+  elif island_solve:
+    # sleeping islands are skipped; make_constraint found the islands sleep() reads
     _island_solver().solve(m, d)
   else:
     ctx = _create_solver_context(m, d, island=_use_island_solve(m))

@@ -401,6 +401,63 @@ class IslandSolverTest(absltest.TestCase):
     self.assertLess(niter.min(), niter.max())
     self.assertGreaterEqual(d.solver_niter.numpy()[0], niter.max())
 
+  def test_sleep(self):
+    """Sleeping islands are skipped as by the compact solve: same states, qacc = 0, no force."""
+    xml = """
+    <mujoco>
+      <option jacobian="sparse"><flag sleep="enable"/></option>
+      <worldbody>
+        <geom type="plane" size="5 5 .1"/>
+        <body pos="0 0 .1"><freejoint/><geom type="box" size=".1 .1 .1"/></body>
+        <body pos="0 0 .35"><freejoint/><geom type="box" size=".1 .1 .1"/></body>
+        <body pos="1 0 .1"><freejoint/><geom type="box" size=".1 .1 .1"/></body>
+        <body pos="1 0 4"><freejoint/><geom type="sphere" size=".08"/></body>
+        <body pos="0 2 1">
+          <joint type="hinge" axis="0 1 0" range="-10 10" limited="true" damping=".1"/>
+          <geom type="capsule" fromto="0 0 0 .5 0 0" size=".05"/>
+        </body>
+        <body pos="2 2 .5"><joint name="spin" type="hinge" axis="0 0 1"/><geom type="box" size=".3 .05 .05"/></body>
+      </worldbody>
+      <actuator><motor joint="spin"/></actuator>
+    </mujoco>
+    """
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjd = mujoco.MjData(mjm)
+    mjd.ctrl[0] = 0.5
+    mujoco.mj_forward(mjm, mjd)
+    hinge = mjm.jnt_dofadr[4]
+    runs = []
+    for island_solve in (False, True):
+      m = mjw.put_model(mjm)
+      m.opt.island_solve = island_solve
+      d = mjw.put_data(mjm, mjd, nconmax=32, njmax=128)
+      self.assertEqual(island.island_rows(m), island_solve)
+      states = []
+      for i in range(700):
+        # trees fall asleep after the solve: check those asleep before and after the step
+        awake_before = d.tree_awake.numpy()[0].copy()
+        mjw.step(m, d)
+        if i % 50 == 49:
+          states.append(d.tree_asleep.numpy()[0].copy())
+          if island_solve:
+            awake = d.tree_awake.numpy()[0] | awake_before
+            qacc = d.qacc.numpy()[0]
+            for t in range(mjm.ntree):
+              if not awake[t]:
+                dofs = slice(mjm.tree_dofadr[t], mjm.tree_dofadr[t] + mjm.tree_dofnum[t])
+                np.testing.assert_array_equal(qacc[dofs], 0.0, err_msg=f"step {i} tree {t}")
+            # the limit row of the hinge, which falls asleep at its limit
+            nefc = d.nefc.numpy()[0]
+            limit = (d.efc.type.numpy()[0, :nefc] == mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT).nonzero()[0]
+            if not awake[mjm.dof_treeid[hinge]] and len(limit):
+              np.testing.assert_array_equal(d.efc.force.numpy()[0, limit], 0.0, err_msg=f"step {i}")
+      runs.append((np.array(states), d.qpos.numpy()[0]))
+    # a ball wakes a sleeping box mid-run; both then fall asleep again
+    (states0, qpos0), (states1, qpos1) = runs
+    self.assertTrue((states0[:, 2] < 0).any() and (states0[:, 2] >= 0).any())
+    np.testing.assert_array_equal(states1, states0)
+    np.testing.assert_allclose(qpos1, qpos0, atol=1e-3)
+
   def test_island_groups(self):
     """Consecutive islands share a group up to MERGE_NV DOFs; the solution is unchanged."""
     mjm, mjd, m, d = _fixture()

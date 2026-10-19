@@ -1078,6 +1078,7 @@ class SlotBuffers:
     self.group_island0 = wp.empty(shape, dtype=int)
     self.group_nisland = wp.empty(shape, dtype=int)
     self.group_slot = wp.empty(shape, dtype=wp.vec4i)
+    self.group_asleep = wp.empty(shape, dtype=bool)
     self.island_slot = wp.empty(shape, dtype=wp.vec4i)
     self.dof_group = wp.empty((d.nworld, m.nv), dtype=int)
     self.dof_slotcol = wp.empty((d.nworld, m.nv), dtype=int)
@@ -1152,6 +1153,8 @@ def _island_world(ntree: int):
     # Model:
     nv: int,
     tree_dofnum: wp.array[int],
+    # Data in:
+    tree_awake_in: wp.array2d[int],
     # In:
     tree_nrow_in: wp.array2d[int],
     merge: bool,
@@ -1189,6 +1192,7 @@ def _island_world(ntree: int):
     group_nisland_out: wp.array2d[int],
     group_slot_out: wp.array2d[wp.vec4i],
     island_slot_out: wp.array2d[wp.vec4i],
+    group_asleep_out: wp.array2d[bool],
   ):
     """A world's islands, their rows, DOFs and groups, after the constraints merged their trees.
 
@@ -1283,8 +1287,10 @@ def _island_world(ntree: int):
           free += n
 
       # groups: runs of consecutive islands up to merge_nv DOFs; islands after a group's first add
-      # only limit and contact rows, so the group's rows stay in class order
+      # only limit and contact rows, so the group's rows stay in class order, and sleep with it (an
+      # island's trees sleep together: constraints to sleeping trees wake them)
       g = int(-1)
+      gasleep = bool(False)
       gnv = int(0)
       gnefc = int(0)
       gnisland = int(0)
@@ -1295,7 +1301,10 @@ def _island_world(ntree: int):
         ne = counts[i * ROW_CLASSES + ROW_EQUALITY]
         nf = counts[i * ROW_CLASSES + ROW_FRICTION]
         nefc = ne + nf + counts[i * ROW_CLASSES + ROW_LIMIT] + counts[i * ROW_CLASSES + ROW_CONTACT]
-        if g >= 0 and merge and ne == 0 and nf == 0 and gnv + n <= merge_nv:
+        asleep = bool(False)
+        if tree_awake_in:
+          asleep = tree_awake_in[worldid, island_root_out[worldid, i]] == 0
+        if g >= 0 and merge and ne == 0 and nf == 0 and gnv + n <= merge_nv and asleep == gasleep:
           gnv += n
           gnefc += nefc
           gnisland += 1
@@ -1308,6 +1317,8 @@ def _island_world(ntree: int):
           gnv = n
           gnefc = nefc
           gnisland = 1
+          gasleep = asleep
+          group_asleep_out[worldid, g] = asleep
           group_idofadr_out[worldid, g] = idofadr
           group_iefcadr_out[worldid, g] = iefcadr
           group_ne_out[worldid, g] = ne
@@ -1327,6 +1338,7 @@ def _island_world(ntree: int):
         group_nefc_out[worldid, k] = 0
         group_idofadr_out[worldid, k] = 0
         group_iefcadr_out[worldid, k] = 0
+        group_asleep_out[worldid, k] = False
       for i in range(nisland, ntree):
         island_group_out[worldid, i] = -1
     _block_sync()
@@ -1405,14 +1417,20 @@ def _island_rows(
   island_iefcadr_in: wp.array2d[int],
   # In:
   island_group_in: wp.array2d[int],
+  group_asleep_in: wp.array2d[bool],
   # Data out:
+  efc_force_out: wp.array2d[float],
+  efc_state_out: wp.array2d[int],
   efc_island_out: wp.array2d[int],
   map_efc2iefc_out: wp.array2d[int],
   map_iefc2efc_out: wp.array2d[int],
   # Out:
   efc_group_out: wp.array2d[int],
 ):
-  """Rows are in island order: identity maps, and each row's island and group."""
+  """Rows are in island order: identity maps, and each row's island and group.
+
+  Rows of sleeping groups are not solved: no force.
+  """
   worldid, efcid = wp.tid()
   if efcid >= nefc_in[worldid]:
     efc_island_out[worldid, efcid] = -1
@@ -1429,7 +1447,11 @@ def _island_rows(
   efc_island_out[worldid, efcid] = lo
   map_efc2iefc_out[worldid, efcid] = efcid
   map_iefc2efc_out[worldid, efcid] = efcid
-  efc_group_out[worldid, efcid] = island_group_in[worldid, lo]
+  g = island_group_in[worldid, lo]
+  efc_group_out[worldid, efcid] = g
+  if group_asleep_in[worldid, g]:
+    efc_force_out[worldid, efcid] = 0.0
+    efc_state_out[worldid, efcid] = types.ConstraintState.SATISFIED
 
 
 def island_layout(
@@ -1448,6 +1470,7 @@ def island_layout(
     inputs=[
       m.nv,
       m.tree_dofnum,
+      d.tree_awake if m.opt.enableflags & types.EnableBit.SLEEP else None,
       tree_nrow,
       MERGE,
       MERGE_NV,
@@ -1484,6 +1507,7 @@ def island_layout(
       buf.group_nisland,
       buf.group_slot,
       buf.island_slot,
+      buf.group_asleep,
     ],
     block_dim=types.BlockDim.island_scan_sizes,
   )
@@ -1511,8 +1535,8 @@ def island_rows_done(m: types.Model, d: types.Data):
   wp.launch(
     _island_rows,
     dim=(d.nworld, d.njmax),
-    inputs=[d.nefc, d.nisland, d.island_iefcadr, buf.island_group],
-    outputs=[d.efc.island, d.map_efc2iefc, d.map_iefc2efc, buf.efc_group],
+    inputs=[d.nefc, d.nisland, d.island_iefcadr, buf.island_group, buf.group_asleep],
+    outputs=[d.efc.force, d.efc.state, d.efc.island, d.map_efc2iefc, d.map_iefc2efc, buf.efc_group],
   )
 
 
@@ -1526,7 +1550,6 @@ def island_rows(m: types.Model) -> bool:
     and m.ntree > 1
     and m.nflex == 0
     and not (m.opt.disableflags & types.DisableBit.ISLAND)
-    and not (m.opt.enableflags & types.EnableBit.SLEEP)
     and m.opt.integrator != types.IntegratorType.DISCRETE
     # these read the Jacobian, which islands in slots write only to their slot
     and m.nefmdof == 0

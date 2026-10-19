@@ -194,6 +194,7 @@ def _group_lists(
   ngroup_in: wp.array[int],
   group_nv_in: wp.array2d[int],
   island_slot_in: wp.array2d[wp.vec4i],
+  group_asleep_in: wp.array2d[bool],
   small: int,
   # Out:
   group_count_out: wp.array[int],
@@ -215,6 +216,9 @@ def _group_lists(
   packed = worldid * ntree + g
   width = island_slot_in[worldid, g][0]
   group_problem_out[worldid, g] = -1
+  if group_asleep_in[worldid, g]:
+    done_out[worldid, g] = True
+    return
   if width > 0 and width == small:
     group_list_out[4, wp.atomic_add(group_count_out, 4, 1)] = packed
     wp.atomic_add(group_count_out, 7, 1)
@@ -1718,7 +1722,10 @@ def _scatter_dofs(
 
 @wp.kernel
 def _free_dofs(
+  # Model:
+  dof_treeid: wp.array[int],
   # Data in:
+  tree_awake_in: wp.array2d[int],
   qfrc_smooth_in: wp.array2d[float],
   qacc_smooth_in: wp.array2d[float],
   dof_island_in: wp.array2d[int],
@@ -1727,8 +1734,14 @@ def _free_dofs(
   qfrc_constraint_out: wp.array2d[float],
   efc_Ma_out: wp.array2d[float],
 ):
-  """DOFs outside all islands have no constraints (M qacc_smooth = qfrc_smooth)."""
+  """DOFs outside all islands have no constraints (M qacc_smooth = qfrc_smooth); sleeping: rest."""
   worldid, dofid = wp.tid()
+  if tree_awake_in:
+    if tree_awake_in[worldid, dof_treeid[dofid]] == 0:
+      qacc_out[worldid, dofid] = 0.0
+      qfrc_constraint_out[worldid, dofid] = 0.0
+      efc_Ma_out[worldid, dofid] = 0.0
+      return
   if dof_island_in[worldid, dofid] < 0:
     qacc_out[worldid, dofid] = qacc_smooth_in[worldid, dofid]
     qfrc_constraint_out[worldid, dofid] = 0.0
@@ -2203,13 +2216,19 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   wp.launch(
     _free_dofs,
     dim=(d.nworld, m.nv),
-    inputs=[d.qfrc_smooth, d.qacc_smooth, g.dof_group],
+    inputs=[
+      m.dof_treeid,
+      d.tree_awake if m.opt.enableflags & types.EnableBit.SLEEP else None,
+      d.qfrc_smooth,
+      d.qacc_smooth,
+      g.dof_group,
+    ],
     outputs=[d.qacc, d.qfrc_constraint, d.efc.Ma],
   )
   wp.launch(
     _group_lists,
     dim=(d.nworld, m.ntree),
-    inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot, island.small_width()],
+    inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot, g.group_asleep, island.small_width()],
     outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done],
   )
   if m.opt.graph_conditional:
