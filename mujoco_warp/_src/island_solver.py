@@ -874,13 +874,13 @@ def _grad(final: bool):
     frc_out: wp.array2d[float],
     grad_out: wp.array2d[float],
   ):
-    """J'force (dense rows) and the gradient of a group, a lane per column (zero on padding).
+    """J'force (dense rows) and the gradient of a group, a warp per group and a lane per column.
 
     As _update_constraint_init_qfrc_constraint_dense and _update_gradient_grad for a world; sparse
     rows' J'force is accumulated by _rows. The final pass only forms J'force (qfrc_constraint).
     """
-    bid, lane = wp.tid()
-    for e in range(bid, group_count_in[0], nblock):
+    slot, lane = wp.tid()
+    for e in range(slot, group_count_in[0], nblock):
       worldid = group_list_in[0, e] // ntree
       g = group_list_in[0, e] % ntree
       if wp.static(not FINAL):
@@ -891,7 +891,7 @@ def _grad(final: bool):
         if block[0] == 0:
           continue
       vbase = vbase_in[worldid, g]
-      for col in range(lane, ntile_in[worldid, g] * _TILE, wp.block_dim()):
+      for col in range(lane, ntile_in[worldid, g] * _TILE, _TILE):
         row = vbase + col
         frc = float(0.0)
         if block[0] > 0:
@@ -2397,15 +2397,17 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
 
 def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final: bool):
   nrow = ctx.qacc.shape[1]
-  wp.launch_tiled(
+  # warp slots striding over the groups, several per block (full occupancy; no tile operations)
+  nslot = _nblock(4)
+  wp.launch(
     _grad(final),
-    dim=_nblock(),
+    dim=(nslot, _TILE),
     inputs=[
       g.group_slot.shape[1],
       d.efc.force,
       ctx.group_count,
       ctx.group_list,
-      _nblock(),
+      nslot,
       g.group_slot,
       g.J,
       ctx.ntile,
@@ -2417,7 +2419,7 @@ def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final
       ctx.qfrc_smooth,
     ],
     outputs=[ctx.frc, ctx.grad.reshape((d.nworld, nrow))],
-    block_dim=_TILE,
+    block_dim=4 * _TILE,
   )
 
 
