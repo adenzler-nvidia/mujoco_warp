@@ -3995,12 +3995,13 @@ def _efc_contact_jac_groups(
   group_nv_in: wp.array2d[int],
   group_island0_in: wp.array2d[int],
   group_nisland_in: wp.array2d[int],
+  elliptic: bool,
   # Data out:
   efc_Jqvel_out: wp.array2d[float],
   # Out:
   slot_J_out: wp.array3d[float],
 ):
-  """Dense contact rows of an island group (pyramidal), as _efc_contact_jac_dense for a world.
+  """Dense contact rows of an island group, as _efc_contact_jac_dense for a world.
 
   One block per group, one lane per group-local column; the group's contact rows are the contact
   class of each of its islands. Rows are written whole (zero where a DOF does not move the contact).
@@ -4059,7 +4060,20 @@ def _efc_contact_jac_groups(
         j1r = wp.dot(jacr_dif, frame1)
         j2r = wp.dot(jacr_dif, frame2)
       J = j0p
-      if condim > 1:
+      if elliptic:
+        # one row per frame axis: translation for the first three, rotation after
+        dimid = efcid - contact_efc_address_in[conid, 0]
+        if dimid == 1:
+          J = j1p
+        elif dimid == 2:
+          J = j2p
+        elif dimid == 3:
+          J = j0r
+        elif dimid == 4:
+          J = j1r
+        elif dimid == 5:
+          J = j2r
+      elif condim > 1:
         dimid = efcid - contact_efc_address_in[conid, 0]
         dimid2 = dimid / 2 + 1
         frii_sign = friction_in[conid, dimid2 - 1] * (1.0 - 2.0 * float(dimid & 1))
@@ -6644,6 +6658,7 @@ def make_constraint(m: types.Model, d: types.Data):
                     g.group_nv,
                     g.group_island0,
                     g.group_nisland,
+                    m.opt.cone == types.ConeType.ELLIPTIC,
                   ],
                   outputs=[d.efc.Jqvel, slot_J],
                   block_dim=32,

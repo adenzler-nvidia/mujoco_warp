@@ -1282,6 +1282,11 @@ class SolverTest(parameterized.TestCase):
     np.testing.assert_allclose(force1, force0, rtol=1e-4, atol=1e-4)
     _assert_eq(qacc1, mjd.qacc, "qacc")
 
+    if cone == ConeType.ELLIPTIC:
+      # elliptic models take the island solver too; the world solve's island paths below are only
+      # reached for pyramidal cones
+      return
+
     # tile pool entries outside the island blocks are neither written nor read
     m.opt.island_solve = True
     # the world solve's island paths read every island's rows from the sparse Jacobian
@@ -1296,26 +1301,25 @@ class SolverTest(parameterized.TestCase):
     self.assertGreater(d.solver_niter.numpy()[0], 1)
     np.testing.assert_allclose(d.qacc.numpy()[0], qacc1, rtol=1e-3, atol=1e-3)
 
-    if cone == ConeType.PYRAMIDAL:
-      # each pool block is M + J'DJ over the quadratic rows of its island
-      nefc = d.nefc.numpy()[0]
-      J = np.zeros((nefc, mjm.nv))
-      rownnz, rowadr = d.efc.J_rownnz.numpy()[0], d.efc.J_rowadr.numpy()[0]
-      colind, Jval = d.efc.J_colind.numpy()[0, 0], d.efc.J.numpy()[0, 0]
-      for r in range(nefc):
-        J[r, colind[rowadr[r] : rowadr[r] + rownnz[r]]] = Jval[rowadr[r] : rowadr[r] + rownnz[r]]
-      DQ = d.efc.D.numpy()[0, :nefc] * (d.efc.state.numpy()[0, :nefc] == types.ConstraintState.QUADRATIC)
-      M = np.zeros((mjm.nv, mjm.nv))
-      mujoco.mj_fullM(mjm, mjd, M)
-      pool, row2dof = ctx.h.numpy()[0], ctx.h_row2dof.numpy()[0]
-      for i in np.flatnonzero(ctx.island_ntile.numpy()[0]):
-        c, tilebase, vbase = ctx.island_ntile.numpy()[0, i], ctx.island_tilebase.numpy()[0, i], ctx.island_vbase.numpy()[0, i]
-        dofs = row2dof[vbase : vbase + d.island_nv.numpy()[0, i]]
-        H = M[np.ix_(dofs, dofs)] + J[:, dofs].T @ (DQ[:, None] * J[:, dofs])
-        for ra in range(len(dofs)):
-          for rb in range(ra, len(dofs)):
-            entry = pool[16 * (tilebase + (ra // 16) * c + rb // 16) + ra % 16, rb % 16]
-            np.testing.assert_allclose(entry, H[ra, rb], rtol=1e-4, atol=1e-4)
+    # each pool block is M + J'DJ over the quadratic rows of its island
+    nefc = d.nefc.numpy()[0]
+    J = np.zeros((nefc, mjm.nv))
+    rownnz, rowadr = d.efc.J_rownnz.numpy()[0], d.efc.J_rowadr.numpy()[0]
+    colind, Jval = d.efc.J_colind.numpy()[0, 0], d.efc.J.numpy()[0, 0]
+    for r in range(nefc):
+      J[r, colind[rowadr[r] : rowadr[r] + rownnz[r]]] = Jval[rowadr[r] : rowadr[r] + rownnz[r]]
+    DQ = d.efc.D.numpy()[0, :nefc] * (d.efc.state.numpy()[0, :nefc] == types.ConstraintState.QUADRATIC)
+    M = np.zeros((mjm.nv, mjm.nv))
+    mujoco.mj_fullM(mjm, mjd, M)
+    pool, row2dof = ctx.h.numpy()[0], ctx.h_row2dof.numpy()[0]
+    for i in np.flatnonzero(ctx.island_ntile.numpy()[0]):
+      c, tilebase, vbase = ctx.island_ntile.numpy()[0, i], ctx.island_tilebase.numpy()[0, i], ctx.island_vbase.numpy()[0, i]
+      dofs = row2dof[vbase : vbase + d.island_nv.numpy()[0, i]]
+      H = M[np.ix_(dofs, dofs)] + J[:, dofs].T @ (DQ[:, None] * J[:, dofs])
+      for ra in range(len(dofs)):
+        for rb in range(ra, len(dofs)):
+          entry = pool[16 * (tilebase + (ra // 16) * c + rb // 16) + ra % 16, rb % 16]
+          np.testing.assert_allclose(entry, H[ra, rb], rtol=1e-4, atol=1e-4)
 
     # a short rollout stays close to the monolithic solve (the pyramidal stack alone varies by ~5e-4
     # run to run, so this only catches plumbing errors such as frozen DOFs or a stale warmstart);

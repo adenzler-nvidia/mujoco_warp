@@ -14,6 +14,8 @@
 # ==============================================================================
 """Tests for the island Newton solver."""
 
+import itertools
+
 import mujoco
 import numpy as np
 from absl.testing import absltest
@@ -36,7 +38,7 @@ def _chain() -> str:
   return chain + "</body>" * 13
 
 
-def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
+def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True, cone: int = ConeType.PYRAMIDAL):
   """Islands of every kind: single boxes, stacks (2, 3 tiles per side), a weld, an arm, a chain."""
   pos = {
     "s0": "0 0 .049",
@@ -69,9 +71,7 @@ def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True):
     <keyframe><key qvel="{" ".join(map(str, qvel))}"/></keyframe>
   </mujoco>
   """
-  mjm, mjd, m, d = test_data.fixture(
-    xml=xml, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
-  )
+  mjm, mjd, m, d = test_data.fixture(xml=xml, keyframe=0, overrides={"opt.cone": cone, "opt.solver": SolverType.NEWTON})
   m.opt.island_solve = True
   # rows in island order, dense rows for groups up to dense_nv DOFs; no stale Jacobian entry may be
   # used
@@ -93,6 +93,36 @@ def _assert_Ma(mjm, mjd, d):
   M = np.zeros((mjm.nv, mjm.nv))
   mujoco.mj_fullM(mjm, mjd, M)
   np.testing.assert_allclose(d.efc.Ma.numpy()[0], M @ d.qacc.numpy()[0], rtol=1e-4, atol=1e-4)
+
+
+def _cone_hessian(m, d, J, rows, dofs, jaref):
+  """Curvature of the elliptic contacts in the cone among rows (MuJoCo's cone Hessian)."""
+  H = np.zeros((len(dofs), len(dofs)))
+  efc_type, efc_id, state, D = (a.numpy()[0] for a in (d.efc.type, d.efc.id, d.efc.state, d.efc.D))
+  address, friction, dim = d.contact.efc_address.numpy(), d.contact.friction.numpy(), d.contact.dim.numpy()
+  for r in rows:
+    if efc_type[r] != mujoco.mjtConstraint.mjCNSTR_CONTACT_ELLIPTIC:
+      continue
+    con = efc_id[r]
+    if address[con, 0] != r or state[r] != mujoco.mjtConstraintState.mjCNSTRSTATE_CONE:
+      continue
+    mu = friction[con, 0] * m.opt.impratio_invsqrt.numpy()[0]
+    dm = D[r] / (mu * mu * (1.0 + mu * mu))
+    tangent = [address[con, k] for k in range(1, dim[con])]
+    scale = friction[con, : len(tangent)]
+    u = jaref[tangent] * scale
+    t = max(np.linalg.norm(u), mujoco.mjMINVAL)
+    z0 = mu * J[r, dofs]
+    z = scale[:, None] * J[np.ix_(tangent, dofs)]
+    p = u @ z / t
+    mu_n_over_t = mu * mu * jaref[r] / t
+    H += dm * (
+      np.outer(z0, z0)
+      - mu * (np.outer(z0, p) + np.outer(p, z0))
+      + mu_n_over_t * np.outer(p, p)
+      + (mu * mu - mu_n_over_t) * z.T @ z
+    )
+  return H
 
 
 def _dense_groups(g, ngroup):
@@ -278,9 +308,11 @@ class IslandSolverTest(absltest.TestCase):
     Single trees (boxes, the chain, the arm) take the dense world solver; several trees (stacks, the
     welded pair, merged groups) the block path.
     """
-    for dense_nv, merge in ((32, True), (32, False), (16, True), (0, True)):
-      with self.subTest(dense_nv=dense_nv, merge=merge):
-        mjm, mjd, m, d = _fixture(dense_nv, merge)
+    for (dense_nv, merge), cone in itertools.product(
+      ((32, True), (32, False), (16, True), (0, True)), (ConeType.PYRAMIDAL, ConeType.ELLIPTIC)
+    ):
+      with self.subTest(dense_nv=dense_nv, merge=merge, cone=cone.name):
+        mjm, mjd, m, d = _fixture(dense_nv, merge, cone)
         d.efc.Ma.fill_(np.nan)
         island_solver.solve(m, d)
         # the chain's accelerations end within about 1e-3 of MuJoCo's (atomic sums are unordered)
@@ -288,7 +320,7 @@ class IslandSolverTest(absltest.TestCase):
         np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
         _assert_Ma(mjm, mjd, d)
         # from a nonzero start point (M qacc at the start matters)
-        mjm, mjd, m, d = _fixture(dense_nv, merge)
+        mjm, mjd, m, d = _fixture(dense_nv, merge, cone)
         d.qacc_warmstart.assign(0.5 * mjd.qacc[None])
         island_solver.solve(m, d)
         np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
@@ -296,15 +328,25 @@ class IslandSolverTest(absltest.TestCase):
   def test_hessian(self):
     """Each island's H block is M + J'DJ over its quadratic rows, after incremental updates."""
     niter = 0
-    for dense_nv, merge in ((32, True), (32, False), (0, True)):
-      with self.subTest(dense_nv=dense_nv, merge=merge):
-        niter = max(niter, self._check_hessian(dense_nv, merge))
+    for dense_nv, merge, cone in (
+      (32, True, ConeType.PYRAMIDAL),
+      (32, False, ConeType.PYRAMIDAL),
+      (0, True, ConeType.PYRAMIDAL),
+      (32, True, ConeType.ELLIPTIC),
+      (0, True, ConeType.ELLIPTIC),
+    ):
+      with self.subTest(dense_nv=dense_nv, merge=merge, cone=cone.name):
+        niter = max(niter, self._check_hessian(dense_nv, merge, cone))
     # incremental updates (niter is unwritten for dense groups)
     self.assertGreater(niter, 1)
 
-  def _check_hessian(self, dense_nv, merge):
-    mjm, mjd, m, d = _fixture(dense_nv, merge)
+  def _check_hessian(self, dense_nv, merge, cone):
+    mjm, mjd, m, d = _fixture(dense_nv, merge, cone)
     ctx = island_solver.solve(m, d)
+    elliptic = cone == ConeType.ELLIPTIC
+    # elliptic: H is assembled at the final point (quadratic rows and the cone curvature)
+    if elliptic:
+      quadratic = d.efc.state.numpy()[0] == mujoco.mjtConstraintState.mjCNSTRSTATE_QUADRATIC
 
     M = np.zeros((mjm.nv, mjm.nv))
     mujoco.mj_fullM(mjm, mjd, M)
@@ -329,10 +371,13 @@ class IslandSolverTest(absltest.TestCase):
         # convergence is measured relative to the island's inertia trace (meaninertia * nv)
         meaninertia = ctx.dense.m.stat.meaninertia.numpy()[problem[i]]
         np.testing.assert_allclose(meaninertia * island.dense_width(m), np.trace(Hi), rtol=1e-5)
-        for r in range(island_iefcadr[i], island_iefcadr[i] + island_nefc[i]):
+        rows = range(island_iefcadr[i], island_iefcadr[i] + island_nefc[i])
+        for r in rows:
           if state[r] == mujoco.mjtConstraintState.mjCNSTRSTATE_QUADRATIC:
             Jr = J[iefc2efc[r], dofs]
             Hi += D[iefc2efc[r]] * np.outer(Jr, Jr)
+        if elliptic:
+          Hi += _cone_hessian(m, d, J, rows, dofs, ctx.dense.ctx.Jaref.numpy()[0])
         Hp = dense_h[problem[i]]
         n = len(dofs)
         np.testing.assert_allclose(np.triu(Hp[:n, :n]), np.triu(Hi), rtol=1e-4, atol=1e-4, err_msg=f"dense group {i}")
@@ -347,9 +392,11 @@ class IslandSolverTest(absltest.TestCase):
       # convergence is measured relative to the island's inertia trace, as in MuJoCo
       np.testing.assert_allclose(ctx.scale.numpy()[0, i], np.trace(Hi), rtol=1e-5)
       for r in rows:
-        if row_quad[r]:
+        if quadratic[r] if elliptic else row_quad[r]:
           Jr = J[iefc2efc[r], dofs]
           Hi += D[iefc2efc[r]] * np.outer(Jr, Jr)
+      if elliptic:
+        Hi += _cone_hessian(m, d, J, rows, dofs, ctx.row_jaref.numpy()[0])
       for a in range(len(dofs)):
         for b in range(a, len(dofs)):
           T = island_solver._TILE

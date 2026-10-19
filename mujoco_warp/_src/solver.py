@@ -3076,6 +3076,93 @@ def _elliptic_hessian_entry_from_projections(
 
 
 @wp.kernel
+def _update_gradient_JTCJ_ragged(
+  # Model:
+  opt_impratio_invsqrt: wp.array[float],
+  # Data in:
+  contact_friction_in: wp.array[types.vec5],
+  contact_dim_in: wp.array[int],
+  contact_efc_address_in: wp.array2d[int],
+  contact_worldid_in: wp.array[int],
+  efc_J_in: wp.array3d[float],
+  efc_D_in: wp.array2d[float],
+  efc_state_in: wp.array2d[int],
+  naconmax_in: int,
+  nacon_in: wp.array[int],
+  # In:
+  ctx_Jaref_in: wp.array2d[float],
+  ctx_done_in: wp.array[bool],
+  ctx_efc_problem_in: wp.array2d[int],
+  nblock: int,
+  # Out:
+  ctx_h_out: wp.array3d[float],
+):
+  """_update_gradient_JTCJ_dense over the island solver's problems (rows of worlds)."""
+  bid, lane = wp.tid()
+  lanes = wp.block_dim()
+  nv = ctx_h_out.shape[1]
+  for conid in range(bid, wp.min(nacon_in[0], naconmax_in), nblock):
+    condim = contact_dim_in[conid]
+    if condim == 1:
+      continue
+    worldid = contact_worldid_in[conid]
+    efcid0 = contact_efc_address_in[conid, 0]
+    if efcid0 < 0:
+      continue
+    if efc_state_in[worldid, efcid0] != types.ConstraintState.CONE:
+      continue
+    problem = ctx_efc_problem_in[worldid, efcid0]
+    if problem < 0:
+      continue
+    if ctx_done_in[problem]:
+      continue
+    fri = contact_friction_in[conid]
+    mu = fri[0] * opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
+    mu2 = mu * mu
+    dm = math.safe_div(efc_D_in[worldid, efcid0], mu2 * (1.0 + mu2))
+    if dm == 0.0:
+      continue
+    n = ctx_Jaref_in[worldid, efcid0] * mu
+    tt = float(0.0)
+    for dim in range(1, condim):
+      efcid = contact_efc_address_in[conid, dim]
+      if efcid >= 0:
+        u = ctx_Jaref_in[worldid, efcid] * fri[dim - 1]
+        tt += u * u
+    inv_t = math.safe_div(1.0, wp.max(wp.sqrt(tt), types.MJ_MINVAL))
+    mu_n_over_t = mu * n * inv_t
+    for entry in range(lane, nv * nv, lanes):
+      a = entry // nv
+      b = entry % nv
+      projection1 = float(0.0)
+      projection2 = float(0.0)
+      tangent_dot = float(0.0)
+      for dim in range(1, condim):
+        efcid = contact_efc_address_in[conid, dim]
+        if efcid >= 0:
+          scale = fri[dim - 1]
+          u = ctx_Jaref_in[worldid, efcid] * scale
+          z1 = scale * efc_J_in[worldid, efcid, a]
+          z2 = scale * efc_J_in[worldid, efcid, b]
+          projection1 += u * z1
+          projection2 += u * z2
+          tangent_dot += z1 * z2
+      h = _elliptic_hessian_entry_from_projections(
+        dm,
+        mu,
+        mu_n_over_t,
+        mu2 - mu_n_over_t,
+        mu * efc_J_in[worldid, efcid0, a],
+        mu * efc_J_in[worldid, efcid0, b],
+        projection1 * inv_t,
+        projection2 * inv_t,
+        tangent_dot,
+      )
+      if h != 0.0:
+        wp.atomic_add(ctx_h_out[problem, a], b, h)
+
+
+@wp.kernel
 def _update_gradient_JTCJ_dense(
   # Model:
   opt_impratio_invsqrt: wp.array[float],
@@ -3933,7 +4020,31 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
           outputs=[ctx.h],
         )
 
-    if m.opt.cone == types.ConeType.ELLIPTIC and not (m.is_sparse or sc):
+    if m.opt.cone == types.ConeType.ELLIPTIC and ctx.efc_world is not None:
+      nblock = wp.get_device().sm_count * 4 if wp.get_device().is_cuda else 1
+      wp.launch(
+        _update_gradient_JTCJ_ragged,
+        dim=(nblock, 64),
+        inputs=[
+          m.opt.impratio_invsqrt,
+          d.contact.friction,
+          d.contact.dim,
+          d.contact.efc_address,
+          d.contact.worldid,
+          d.efc.J,
+          d.efc.D,
+          d.efc.state,
+          d.naconmax,
+          d.nacon,
+          ctx.Jaref,
+          ctx.done,
+          ctx.efc_problem,
+          nblock,
+        ],
+        outputs=[ctx.h],
+        block_dim=64,
+      )
+    elif m.opt.cone == types.ConeType.ELLIPTIC and not (m.is_sparse or sc):
       # Optimization: launching update_gradient_JTCJ with limited number of blocks on a GPU.
       # Profiling suggests that only a fraction of blocks out of the original
       # d.njmax blocks do the actual work. It aims to minimize #CTAs with no

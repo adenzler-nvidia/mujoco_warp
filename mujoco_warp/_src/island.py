@@ -1566,7 +1566,6 @@ def island_rows(m: types.Model) -> bool:
   """Whether constraint rows are built in island order."""
   return (
     m.opt.island_solve
-    and m.opt.cone == types.ConeType.PYRAMIDAL
     and m.opt.solver == types.SolverType.NEWTON
     and m.is_sparse
     and m.ntree > 1

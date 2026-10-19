@@ -38,6 +38,9 @@ from mujoco_warp._src.solver import _ROW_FRICTION
 from mujoco_warp._src.solver import _ROW_OTHER
 from mujoco_warp._src.solver import _active_check
 from mujoco_warp._src.solver import _eval_constraint
+from mujoco_warp._src.solver import _eval_elliptic_alpha_zero
+from mujoco_warp._src.solver import _eval_elliptic_reference
+from mujoco_warp._src.solver import _eval_elliptic_shifted
 from mujoco_warp._src.solver import _eval_pt
 from mujoco_warp._src.solver import _eval_pt_3alphas
 from mujoco_warp._src.solver import _in_bracket
@@ -92,6 +95,8 @@ class IslandContext:
   # its J'J term in the next H update (D or -D where it flipped, else 0)
   row_quad: wp.array2d[bool]
   row_w: wp.array2d[float]
+  # elliptic cones: per-contact quadratics along the search (see _cone_quad)
+  row_cone: wp.array2d[wp.vec3]
   # per-island dense blocks: inertia, Hessian and its factor
   M: wp.array3d[float]
   H: wp.array3d[float]
@@ -497,15 +502,70 @@ def _init_islands(
       wp.atomic_add(nsolving_out, 0, 1)
 
 
+@wp.struct
+class _Elliptic:
+  """A row's elliptic contact (efcid0 < 0: none), as _update_constraint_efc gathers it."""
+
+  efcid0: int
+  jaref0: float
+  D0: float
+  mu: float
+  ufrictionj: float
+  TT: float
+
+
+@wp.func
+def _elliptic_row(
+  # Model:
+  opt_impratio_invsqrt: wp.array[float],
+  # Data in:
+  contact_friction_in: wp.array[types.vec5],
+  contact_dim_in: wp.array[int],
+  contact_efc_address_in: wp.array2d[int],
+  efc_D_in: wp.array2d[float],
+  # In:
+  worldid: int,
+  row: int,
+  conid: int,
+  row_jaref_in: wp.array2d[float],
+) -> _Elliptic:
+  cone = _Elliptic()
+  cone.efcid0 = -1
+  efcid0 = contact_efc_address_in[conid, 0]
+  if efcid0 < 0:
+    return cone
+  friction = contact_friction_in[conid]
+  cone.mu = friction[0] * opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
+  cone.jaref0 = row_jaref_in[worldid, efcid0]
+  cone.D0 = efc_D_in[worldid, efcid0]
+  for j in range(1, contact_dim_in[conid]):
+    efcidj = contact_efc_address_in[conid, j]
+    if efcidj < 0:
+      return cone
+    uj = row_jaref_in[worldid, efcidj] * friction[j - 1]
+    cone.TT += uj * uj
+    if row == efcidj:
+      cone.ufrictionj = uj * friction[j - 1]
+  cone.efcid0 = efcid0
+  return cone
+
+
 @cache_kernel
-def _rows(initial: bool):
+def _rows(initial: bool, elliptic: bool):
   INITIAL = initial
+  ELLIPTIC = elliptic
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
+    # Model:
+    opt_impratio_invsqrt: wp.array[float],
     # Data in:
     nefc_in: wp.array[int],
+    contact_friction_in: wp.array[types.vec5],
+    contact_dim_in: wp.array[int],
+    contact_efc_address_in: wp.array2d[int],
     efc_type_in: wp.array2d[int],
+    efc_id_in: wp.array2d[int],
     efc_J_rownnz_in: wp.array2d[int],
     efc_J_rowadr_in: wp.array2d[int],
     efc_J_colind_in: wp.array3d[int],
@@ -546,20 +606,35 @@ def _rows(initial: bool):
         continue
       category = _row_category(efc_type_in[worldid, row])
       D = efc_D_in[worldid, row]
+      cone = _Elliptic()
+      cone.efcid0 = -1
+      if wp.static(ELLIPTIC):
+        if efc_type_in[worldid, row] == types.ConstraintType.CONTACT_ELLIPTIC:
+          cone = _elliptic_row(
+            opt_impratio_invsqrt,
+            contact_friction_in,
+            contact_dim_in,
+            contact_efc_address_in,
+            efc_D_in,
+            worldid,
+            row,
+            efc_id_in[worldid, row],
+            row_jaref_in,
+          )
       res = _eval_constraint(
         category == _ROW_EQUALITY,
         category == _ROW_FRICTION,
-        False,
+        cone.efcid0 >= 0,
         row_jaref_in[worldid, row],
         D,
         efc_frictionloss_in[worldid, row],
-        0,
-        -1,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        row,
+        cone.efcid0,
+        cone.jaref0,
+        cone.D0,
+        cone.mu,
+        cone.ufrictionj,
+        cone.TT,
       )
       state = int(res[1])
       if wp.static(not INITIAL):
@@ -569,7 +644,13 @@ def _rows(initial: bool):
       efc_state_out[worldid, row] = state
       quad = state == types.ConstraintState.QUADRATIC.value
       w = float(0.0)
-      if wp.static(INITIAL):
+      if wp.static(ELLIPTIC):
+        # H is assembled again at every point (_JTDACJ_sparse): no incremental update and no
+        # stable-state shortcut
+        if wp.static(not INITIAL):
+          changed_out[worldid, islandid] = True
+          state_changed_out[worldid, islandid] = True
+      elif wp.static(INITIAL):
         row_quad_out[worldid, row] = quad
         w = wp.where(quad, D, 0.0)
       elif quad != row_quad_out[worldid, row]:
@@ -801,9 +882,108 @@ def _dense_factor(ntile: int):
   return kernel
 
 
+@wp.struct
+class _ConeData:
+  """Elliptic contacts for the linesearch; row_cone: per-contact quadratics, as ctx.quad."""
+
+  impratio_invsqrt: wp.array[float]
+  contact_friction: wp.array[types.vec5]
+  contact_dim: wp.array[int]
+  contact_efc_address: wp.array2d[int]
+  efc_id: wp.array2d[int]
+  row_cone: wp.array2d[wp.vec3]
+
+
+def _cone_data(m: types.Model, d: types.Data, ctx: IslandContext) -> _ConeData:
+  cones = _ConeData()
+  cones.impratio_invsqrt = m.opt.impratio_invsqrt
+  cones.contact_friction = d.contact.friction
+  cones.contact_dim = d.contact.dim
+  cones.contact_efc_address = d.contact.efc_address
+  cones.efc_id = d.efc.id
+  cones.row_cone = ctx.row_cone
+  return cones
+
+
+@wp.func
+def _is_cone(elliptic: bool, constraint_type: int) -> bool:
+  return elliptic and constraint_type == types.ConstraintType.CONTACT_ELLIPTIC
+
+
+@wp.func
+def _cone_quad(
+  # Data in:
+  efc_D_in: wp.array2d[float],
+  # In:
+  cones: _ConeData,
+  worldid: int,
+  row: int,
+  row_jaref_in: wp.array2d[float],
+  row_jv_in: wp.array2d[float],
+):
+  """A contact's quadratics along the search, written by its first row (as in the world solver)."""
+  conid = cones.efc_id[worldid, row]
+  if row != cones.contact_efc_address[conid, 0]:
+    return
+  jaref = row_jaref_in[worldid, row]
+  jv = row_jv_in[worldid, row]
+  D = efc_D_in[worldid, row]
+  jvD = jv * D
+  quad = wp.vec3(0.5 * jaref * jaref * D, jvD * jaref, 0.5 * jv * jvD)
+  friction = cones.contact_friction[conid]
+  mu = friction[0] * cones.impratio_invsqrt[worldid % cones.impratio_invsqrt.shape[0]]
+  uu = float(0.0)
+  uv = float(0.0)
+  vv = float(0.0)
+  for j in range(1, cones.contact_dim[conid]):
+    efcidj = cones.contact_efc_address[conid, j]
+    if efcidj >= 0:
+      jvj = row_jv_in[worldid, efcidj]
+      jarefj = row_jaref_in[worldid, efcidj]
+      dj = efc_D_in[worldid, efcidj]
+      quad += wp.vec3(0.5 * jarefj * dj * jarefj, jvj * dj * jarefj, 0.5 * jvj * dj * jvj)
+      # rescale to make the primal cone circular
+      uj = jarefj * friction[j - 1]
+      vj = jvj * friction[j - 1]
+      uu += uj * uj
+      uv += uj * vj
+      vv += vj * vj
+  mu2 = mu * mu
+  cones.row_cone[worldid, row] = quad
+  cones.row_cone[worldid, cones.contact_efc_address[conid, 1]] = wp.vec3(jaref * mu, jv * mu, uu)
+  cones.row_cone[worldid, cones.contact_efc_address[conid, 2]] = wp.vec3(uv, vv, D / (mu2 * (1.0 + mu2)))
+
+
+@wp.func
+def _cone_pt(
+  # In:
+  cones: _ConeData,
+  worldid: int,
+  row: int,
+  alpha: float,
+  zero: bool,
+) -> wp.vec3:
+  """A contact's cost, slope and curvature at alpha on its first row (0 on its other rows).
+
+  zero: at alpha = 0 (the cost itself), else shifted by the cost at 0.
+  """
+  conid = cones.efc_id[worldid, row]
+  if row != cones.contact_efc_address[conid, 0]:
+    return wp.vec3(0.0)
+  quad = cones.row_cone[worldid, row]
+  quad1 = cones.row_cone[worldid, cones.contact_efc_address[conid, 1]]
+  quad2 = cones.row_cone[worldid, cones.contact_efc_address[conid, 2]]
+  mu = cones.contact_friction[conid][0] * cones.impratio_invsqrt[worldid % cones.impratio_invsqrt.shape[0]]
+  if zero:
+    return _eval_elliptic_alpha_zero(mu, quad, quad1, quad2)
+  cost0, T0, r0, state0 = _eval_elliptic_reference(mu, quad, quad1, quad2)
+  return _eval_elliptic_shifted(mu, quad, quad1, quad2, alpha, cost0, T0, r0, state0)
+
+
 @cache_kernel
-def _newton_step(ls_iterations: int, warn_overflow: int):
+def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool):
   LS_ITERATIONS = ls_iterations
+  ELLIPTIC = elliptic
 
   @wp.func
   def step(
@@ -845,6 +1025,7 @@ def _newton_step(ls_iterations: int, warn_overflow: int):
     search_dot_in: wp.array2d[float],
     newton_decrement_in: wp.array2d[float],
     state_changed_in: wp.array2d[bool],
+    cones: _ConeData,
     # Data out:
     solver_niter_out: wp.array[int],
     overflow_out: wp.array[int],
@@ -946,12 +1127,25 @@ def _newton_step(ls_iterations: int, warn_overflow: int):
       if category == _ROW_EQUALITY:
         jvD = jv * D
         local_gauss += wp.vec2(jvD * jaref, 0.5 * jv * jvD)
-      else:
+      elif not _is_cone(wp.static(ELLIPTIC), efc_type_in[worldid, row]):
         local_p0 += _row_eval_pt_alpha_zero(category, D, efc_frictionloss_in[worldid, row], jaref, jv)
     dof_sums = wp.tile_reduce(wp.add, wp.tile(local_dof, preserve_type=True))[0]
     gauss_rows = wp.tile_reduce(wp.add, wp.tile(local_gauss, preserve_type=True))[0]
     p0_rows = wp.tile_reduce(wp.add, wp.tile(local_p0, preserve_type=True))[0]
     _sync()  # jv of all rows is written
+    if wp.static(ELLIPTIC):
+      # the contacts' quadratics, then their part of p0
+      for r in range(lane, nrow, nthread):
+        row = rowadr0 + r
+        if efc_type_in[worldid, row] == types.ConstraintType.CONTACT_ELLIPTIC:
+          _cone_quad(efc_D_in, cones, worldid, row, row_jaref_out, row_jv_out)
+      _sync()
+      local_cone = wp.vec3(0.0)
+      for r in range(lane, nrow, nthread):
+        row = rowadr0 + r
+        if efc_type_in[worldid, row] == types.ConstraintType.CONTACT_ELLIPTIC:
+          local_cone += _cone_pt(cones, worldid, row, 0.0, True)
+      p0_rows += wp.tile_reduce(wp.add, wp.tile(local_cone, preserve_type=True))[0]
 
     gauss1 = gauss_rows[0] + dof_sums[0]
     gauss2 = gauss_rows[1] + 0.5 * dof_sums[1]
@@ -968,7 +1162,9 @@ def _newton_step(ls_iterations: int, warn_overflow: int):
     for r in range(lane, nrow, nthread):
       row = rowadr0 + r
       category = _row_category(efc_type_in[worldid, row])
-      if category != _ROW_EQUALITY:
+      if _is_cone(wp.static(ELLIPTIC), efc_type_in[worldid, row]):
+        local_lo_in += _cone_pt(cones, worldid, row, lo_alpha_in, False)
+      elif category != _ROW_EQUALITY:
         local_lo_in += _row_eval_pt(
           category,
           lo_alpha_in,
@@ -1005,7 +1201,12 @@ def _newton_step(ls_iterations: int, warn_overflow: int):
         for r in range(lane, nrow, nthread):
           row = rowadr0 + r
           category = _row_category(efc_type_in[worldid, row])
-          if category != _ROW_EQUALITY:
+          if _is_cone(wp.static(ELLIPTIC), efc_type_in[worldid, row]):
+            plo = _cone_pt(cones, worldid, row, lo_next_alpha, False)
+            phi = _cone_pt(cones, worldid, row, hi_next_alpha, False)
+            pmid = _cone_pt(cones, worldid, row, mid_alpha, False)
+            local_combined += wp.mat33(plo[0], phi[0], pmid[0], plo[1], phi[1], pmid[1], plo[2], phi[2], pmid[2])
+          elif category != _ROW_EQUALITY:
             D = efc_D_in[worldid, row]
             f = efc_frictionloss_in[worldid, row]
             jaref = row_jaref_out[worldid, row]
@@ -1110,8 +1311,8 @@ def _newton_step(ls_iterations: int, warn_overflow: int):
 
 
 @cache_kernel
-def _linesearch(ls_iterations: int, warn_overflow: int):
-  step = _newton_step(ls_iterations, warn_overflow)
+def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool):
+  step = _newton_step(ls_iterations, warn_overflow, elliptic)
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1155,6 +1356,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
     search_dot_in: wp.array2d[float],
     newton_decrement_in: wp.array2d[float],
     state_changed_in: wp.array2d[bool],
+    cones: _ConeData,
     # Data out:
     solver_niter_out: wp.array[int],
     overflow_out: wp.array[int],
@@ -1217,6 +1419,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int):
         search_dot_in,
         newton_decrement_in,
         state_changed_in,
+        cones,
         solver_niter_out,
         overflow_out,
         done_out,
@@ -1243,7 +1446,8 @@ def _quad_weight(state: int, D: float, active: float) -> float:
 
 @cache_kernel
 def _solve_small(ls_iterations: int, warn_overflow: int):
-  step = _newton_step(ls_iterations, warn_overflow)
+  # pyramidal cones only: keep island.SMALL_NV = 0 (the default) with elliptic cones
+  step = _newton_step(ls_iterations, warn_overflow, False)
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
@@ -1281,6 +1485,7 @@ def _solve_small(ls_iterations: int, warn_overflow: int):
     island_slot_in: wp.array2d[wp.vec4i],
     dof2row_in: wp.array2d[int],
     iJ_in: wp.array3d[float],
+    cones: _ConeData,
     # Data out:
     solver_niter_out: wp.array[int],
     efc_force_out: wp.array2d[float],
@@ -1440,6 +1645,7 @@ def _solve_small(ls_iterations: int, warn_overflow: int):
           search_dot_out,
           newton_decrement_out,
           state_changed_out,
+          cones,
           solver_niter_out,
           overflow_out,
           done_out,
@@ -1796,6 +2002,7 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     row_jv=wp.empty((nworld, njmax), dtype=float),
     row_quad=wp.zeros((nworld, njmax), dtype=bool),
     row_w=wp.zeros((nworld, njmax), dtype=float),
+    row_cone=wp.empty((nworld, njmax) if m.opt.cone == types.ConeType.ELLIPTIC else (0, 0), dtype=wp.vec3),
     M=wp.empty(pool, dtype=float),
     H=wp.empty(pool, dtype=float),
     U=wp.empty(pool, dtype=float),
@@ -1828,17 +2035,51 @@ def _nblock(per_sm: int = 1) -> int:
   return wp.get_device().sm_count * 32 * per_sm
 
 
+def _seed_pool(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
+  """H = M (identity on padding) for the block path's groups."""
+  wp.launch_tiled(
+    _pool_seed,
+    dim=_nblock(),
+    inputs=[
+      m.ntree,
+      m.dof_treeid,
+      m.tree_dofadr,
+      m.tree_dofnum,
+      m.M_rownnz,
+      m.M_rowadr,
+      m.M_colind,
+      m.M_hinit_i,
+      d.M,
+      g.group_nv,
+      _nblock(),
+      ctx.group_count,
+      ctx.group_list,
+      ctx.row2dof,
+      ctx.tilebase,
+      ctx.ntile,
+      ctx.vbase,
+    ],
+    outputs=[ctx.M, ctx.H],
+    block_dim=_ISLAND_THREADS,
+  )
+
+
 def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers, initial: bool):
   """Constraint state at the current point, J'force of sparse islands and the H updates."""
   if not initial:
     ctx.state_changed.zero_()
     ctx.changed.zero_()
   wp.launch(
-    _rows(initial),
+    _rows(initial, m.opt.cone == types.ConeType.ELLIPTIC),
     dim=(d.nworld, _lanes(d.nworld, d.njmax)),
     inputs=[
+      m.opt.impratio_invsqrt,
       d.nefc,
+      d.contact.friction,
+      d.contact.dim,
+      d.contact.efc_address,
       d.efc.type,
+      d.efc.id,
       d.efc.J_rownnz,
       d.efc.J_rowadr,
       d.efc.J_colind,
@@ -1858,10 +2099,12 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
     outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.row_w, ctx.frc, ctx.H, ctx.changed, ctx.state_changed],
   )
 
+  elliptic = m.opt.cone == types.ConeType.ELLIPTIC
+
   def sparse_h():
     # dense rows have no constraint groups
     wp.launch(
-      _JTDACJ_sparse(False, m.opt.cone, 3, _TILE),
+      _JTDACJ_sparse(False, m.opt.cone, max(3, int(m.nmaxcondim)) if elliptic else 3, _TILE),
       dim=(d.nworld, _jtdaj_groups_per_world(d.nworld, d.njmax), _JTDAJ_THREADS_PER_GROUP),
       inputs=[
         m.opt.impratio_invsqrt,
@@ -1884,15 +2127,24 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
         _jtdaj_groups_per_world(d.nworld, d.njmax),
       ],
       outputs=[ctx.H],
-      block_dim=m.block_dim.update_gradient_JTDAJ_sparse,
+      # elliptic: one block per constraint group (the cone terms are shared per block)
+      block_dim=(1 if wp.get_device().is_cpu else _JTDAJ_THREADS_PER_GROUP)
+      if elliptic
+      else m.block_dim.update_gradient_JTDAJ_sparse,
     )
 
-  # the initial H of sparse groups, only if there is one
-  if initial:
+  def seeded_h():
+    _seed_pool(m, d, ctx, g)
+    sparse_h()
+
+  # the initial H of sparse groups, only if there is one; with elliptic cones, H at every point (the
+  # cone curvature depends on jaref)
+  if initial or elliptic:
+    h = sparse_h if initial else seeded_h
     if m.opt.graph_conditional:
-      wp.capture_if(ctx.group_count[5:6], on_true=sparse_h)
+      wp.capture_if(ctx.group_count[5:6], on_true=h)
     else:
-      sparse_h()
+      h()
 
 
 def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final: bool):
@@ -1982,7 +2234,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       launch()
 
   wp.launch_tiled(
-    _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow)),
+    _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow), m.opt.cone == types.ConeType.ELLIPTIC),
     dim=_nblock(2),
     inputs=[
       m.ntree,
@@ -2022,6 +2274,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.search_dot,
       ctx.newton_decrement,
       ctx.state_changed,
+      _cone_data(m, d, ctx),
     ],
     outputs=[
       d.solver_niter,
@@ -2069,31 +2322,7 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     inputs=[d.qacc_warmstart, d.qfrc_smooth, d.qacc_smooth, warmstart, _lanes(d.nworld, nrow), ctx.nrow_used, ctx.row2dof],
     outputs=[ctx.qacc, ctx.qfrc_smooth, ctx.frc],
   )
-  wp.launch_tiled(
-    _pool_seed,
-    dim=_nblock(),
-    inputs=[
-      m.ntree,
-      m.dof_treeid,
-      m.tree_dofadr,
-      m.tree_dofnum,
-      m.M_rownnz,
-      m.M_rowadr,
-      m.M_colind,
-      m.M_hinit_i,
-      d.M,
-      g.group_nv,
-      _nblock(),
-      ctx.group_count,
-      ctx.group_list,
-      ctx.row2dof,
-      ctx.tilebase,
-      ctx.ntile,
-      ctx.vbase,
-    ],
-    outputs=[ctx.M, ctx.H],
-    block_dim=_ISLAND_THREADS,
-  )
+  _seed_pool(m, d, ctx, g)
   wp.launch(
     _init_rows,
     dim=(d.nworld, _lanes(d.nworld, d.njmax)),
@@ -2183,6 +2412,7 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
         g.group_slot,
         ctx.dof2row,
         g.J,
+        _cone_data(m, d, ctx),
       ],
       outputs=[
         d.solver_niter,
