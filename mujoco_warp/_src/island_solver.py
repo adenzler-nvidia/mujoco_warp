@@ -976,7 +976,11 @@ def _factor(max_size: int):
 
 
 def _tile_newton(n: int, ntile: int):
-  """Newton direction of a group of ntile x ntile pool tiles, as one n x n tile (or its factor)."""
+  """Newton direction of a group of ntile x ntile pool tiles, factored as one n x n tile.
+
+  One tile (n <= _TILE: the group fits n) is factored every time, as in the world solver; two keep
+  their factor in U and only solve with it while no row changes.
+  """
 
   @wp.func
   def func(
@@ -990,22 +994,28 @@ def _tile_newton(n: int, ntile: int):
     U_out: wp.array2d[float],
     search_out: wp.array[float],
   ) -> wp.vec2:
+    if wp.static(ntile == 1):
+      # as _update_gradient_cholesky: refactoring a tile costs less than keeping its factor
+      H = wp.tile_load(H_in, shape=(n, n), offset=(row0, 0), storage="shared")
+      wp.tile_cholesky_inplace(H, fill_mode="upper")
+      b1 = wp.tile_load(grad_in, shape=n, offset=vbase)
+      x1 = wp.tile_cholesky_solve(H, b1, fill_mode="upper")
+      wp.tile_store(search_out, wp.tile_map(wp.neg, x1), offset=vbase)
+      return wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b1, x1))[0]
     U = wp.tile_zeros(shape=(n, n), dtype=float, storage="shared")
     # the block's upper tiles (0, 0), (0, 1), (1, 1); the factorization reads no others
     if factorize:
-      wp.tile_assign(U, wp.tile_load(H_in, shape=(wp.static(min(n, _TILE)), wp.static(min(n, _TILE))), offset=(row0, 0)))
+      wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, _TILE), offset=(row0, 0)))
       if wp.static(ntile == 2):
         wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
         wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
       wp.tile_cholesky_inplace(U, fill_mode="upper")
-      wp.tile_store(
-        U_out, wp.tile_view(U, offset=(0, 0), shape=(wp.static(min(n, _TILE)), wp.static(min(n, _TILE)))), offset=(row0, 0)
-      )
+      wp.tile_store(U_out, wp.tile_view(U, offset=(0, 0), shape=(_TILE, _TILE)), offset=(row0, 0))
       if wp.static(ntile == 2):
         wp.tile_store(U_out, wp.tile_view(U, offset=(0, _TILE), shape=(_TILE, _TILE)), offset=(row0 + _TILE, 0))
         wp.tile_store(U_out, wp.tile_view(U, offset=(_TILE, _TILE), shape=(_TILE, _TILE)), offset=(row0 + 3 * _TILE, 0))
     else:
-      wp.tile_assign(U, wp.tile_load(U_out, shape=(wp.static(min(n, _TILE)), wp.static(min(n, _TILE))), offset=(row0, 0)))
+      wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, _TILE), offset=(row0, 0)))
       if wp.static(ntile == 2):
         wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
         wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
@@ -1018,16 +1028,16 @@ def _tile_newton(n: int, ntile: int):
 
 
 @cache_kernel
-def _dense_factor(ntile: int, width: int):
+def _dense_factor(ntile: int):
   """Newton directions of the groups of ntile tiles per side, as _update_gradient_cholesky.
 
-  Factored as one tile in shared memory where rows changed, else solved with the stored factor;
-  one-tile groups that fit the dense row width are factored at that width.
+  One-tile groups of at most half a tile of DOFs are factored at half the size (cuSolverDx is
+  slower at sizes between).
   """
   N = ntile * _TILE
-  NARROW = ntile == 1 and width < _TILE
+  HALF = _TILE // 2
   full = _tile_newton(N, ntile)
-  narrow = _tile_newton(width, 1) if NARROW else full
+  half = _tile_newton(HALF, 1) if ntile == 1 else full
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
@@ -1073,8 +1083,8 @@ def _dense_factor(ntile: int, width: int):
       row0 = _TILE * tilebase_in[worldid, islandid]
       factorize = changed_in[worldid, islandid] or niter_in[worldid, islandid] == 0
       sums = wp.vec2(0.0)
-      if wp.static(NARROW) and island_nv_in[worldid, islandid] <= wp.static(width):
-        sums = wp.static(narrow)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
+      if wp.static(ntile == 1) and island_nv_in[worldid, islandid] <= HALF:
+        sums = wp.static(half)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
       else:
         sums = wp.static(full)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
       if lane == 0:
@@ -2418,7 +2428,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
 
   def dense_factor(ntile: int):
     wp.launch_tiled(
-      _dense_factor(ntile, g.J.shape[2]),
+      _dense_factor(ntile),
       dim=_nblock(),
       inputs=[
         m.ntree,
