@@ -1144,6 +1144,14 @@ def _is_root(active: int, parent: int, tree: int) -> int:
   return wp.where(active >= 0 and parent == tree, 1, 0)
 
 
+@wp.func
+def _island_rows_fit(neq: int, nfrc: int, nrow: int, rowadr: int, rowmax: int) -> wp.vec3i:
+  """An island's (equality, friction, all) rows below rowmax: nefc overflow drops the rest."""
+  nrow = wp.min(nrow, wp.max(rowmax - rowadr, 0))
+  neq = wp.min(neq, nrow)
+  return wp.vec3i(neq, wp.min(nfrc, nrow - neq), nrow)
+
+
 @cache_kernel
 def _island_world(ntree: int):
   NT = ntree * ROW_CLASSES
@@ -1155,6 +1163,7 @@ def _island_world(ntree: int):
     tree_dofnum: wp.array[int],
     # Data in:
     tree_awake_in: wp.array2d[int],
+    njmax_in: int,
     # In:
     tree_nrow_in: wp.array2d[int],
     merge: bool,
@@ -1257,10 +1266,13 @@ def _island_world(ntree: int):
     for i in range(lane, ntree, lanes):
       ne = counts[i * ROW_CLASSES + ROW_EQUALITY]
       nf = counts[i * ROW_CLASSES + ROW_FRICTION]
-      island_ne_out[worldid, i] = ne
-      island_nf_out[worldid, i] = nf
-      island_nefc_out[worldid, i] = ne + nf + counts[i * ROW_CLASSES + ROW_LIMIT] + counts[i * ROW_CLASSES + ROW_CONTACT]
-      island_iefcadr_out[worldid, i] = island_rowadr_out[worldid, i * ROW_CLASSES]
+      nefc = ne + nf + counts[i * ROW_CLASSES + ROW_LIMIT] + counts[i * ROW_CLASSES + ROW_CONTACT]
+      iefcadr = island_rowadr_out[worldid, i * ROW_CLASSES]
+      fit = _island_rows_fit(ne, nf, nefc, iefcadr, njmax_in)
+      island_ne_out[worldid, i] = fit[0]
+      island_nf_out[worldid, i] = fit[1]
+      island_nefc_out[worldid, i] = fit[2]
+      island_iefcadr_out[worldid, i] = iefcadr
       # the first DOF of each island is set per DOF (_island_dof_maps)
       island_dofadr_out[worldid, i] = nv
     if lane == 0:
@@ -1298,9 +1310,18 @@ def _island_world(ntree: int):
       iefcadr = int(0)
       for i in range(nisland):
         n = ndof[i]
-        ne = counts[i * ROW_CLASSES + ROW_EQUALITY]
-        nf = counts[i * ROW_CLASSES + ROW_FRICTION]
-        nefc = ne + nf + counts[i * ROW_CLASSES + ROW_LIMIT] + counts[i * ROW_CLASSES + ROW_CONTACT]
+        nrow = (
+          counts[i * ROW_CLASSES + ROW_EQUALITY]
+          + counts[i * ROW_CLASSES + ROW_FRICTION]
+          + counts[i * ROW_CLASSES + ROW_LIMIT]
+          + counts[i * ROW_CLASSES + ROW_CONTACT]
+        )
+        fit = _island_rows_fit(
+          counts[i * ROW_CLASSES + ROW_EQUALITY], counts[i * ROW_CLASSES + ROW_FRICTION], nrow, iefcadr, njmax_in
+        )
+        ne = fit[0]
+        nf = fit[1]
+        nefc = fit[2]
         asleep = bool(False)
         if tree_awake_in:
           asleep = tree_awake_in[worldid, island_root_out[worldid, i]] == 0
@@ -1326,7 +1347,7 @@ def _island_world(ntree: int):
           group_island0_out[worldid, g] = i
         island_group_out[worldid, i] = g
         idofadr += n
-        iefcadr += nefc
+        iefcadr += nrow
       if g >= 0:
         group_nv_out[worldid, g] = gnv
         group_nefc_out[worldid, g] = gnefc
@@ -1471,6 +1492,7 @@ def island_layout(
       m.nv,
       m.tree_dofnum,
       d.tree_awake if m.opt.enableflags & types.EnableBit.SLEEP else None,
+      d.njmax,
       tree_nrow,
       MERGE,
       MERGE_NV,

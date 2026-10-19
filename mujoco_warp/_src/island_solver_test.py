@@ -401,6 +401,24 @@ class IslandSolverTest(absltest.TestCase):
     self.assertLess(niter.min(), niter.max())
     self.assertGreaterEqual(d.solver_niter.numpy()[0], niter.max())
 
+  def test_nefc_overflow(self):
+    """Islands and groups end at njmax when nefc overflows: their rows past it don't exist."""
+    mjm, mjd, m, d = _fixture()
+    nefc = int(d.nefc.numpy()[0])
+    njmax = nefc // 2
+    # put_data checks njmax against mjd's rows: start from fresh data with the same state
+    d = mjw.put_data(mjm, mujoco.MjData(mjm), nconmax=d.naconmax, njmax=njmax)
+    d.qpos.assign(mjd.qpos[None])
+    d.qvel.assign(mjd.qvel[None])
+    mjw.forward(m, d)
+    self.assertGreater(d.nefc.numpy()[0], njmax)
+    g = island.slot_buffers(m, d)
+    n, ng = d.nisland.numpy()[0], g.ngroup.numpy()[0]
+    for adr, nrow in ((d.island_iefcadr, d.island_nefc), (g.group_iefcadr, g.group_nefc)):
+      adr, nrow = adr.numpy()[0, : max(n, ng)], nrow.numpy()[0, : max(n, ng)]
+      self.assertLessEqual((adr + nrow)[nrow > 0].max(), njmax)
+    self.assertTrue(np.isfinite(d.qacc.numpy()).all())
+
   def test_sleep(self):
     """Sleeping islands are skipped as by the compact solve: same states, qacc = 0, no force."""
     xml = """
