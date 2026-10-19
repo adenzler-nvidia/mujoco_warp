@@ -451,29 +451,32 @@ class IslandSolverTest(absltest.TestCase):
       d = mjw.put_data(mjm, mjd, nconmax=32, njmax=128)
       self.assertEqual(island.island_rows(m), island_solve)
       states = []
-      for i in range(700):
+      for i in range(800):
         # trees fall asleep after the solve: check those asleep before and after the step
         awake_before = d.tree_awake.numpy()[0].copy()
         mjw.step(m, d)
-        if i % 50 == 49:
+        if i % 10 == 9:
           states.append(d.tree_asleep.numpy()[0].copy())
           if island_solve:
             awake = d.tree_awake.numpy()[0] | awake_before
-            qacc = d.qacc.numpy()[0]
             for t in range(mjm.ntree):
               if not awake[t]:
                 dofs = slice(mjm.tree_dofadr[t], mjm.tree_dofadr[t] + mjm.tree_dofnum[t])
-                np.testing.assert_array_equal(qacc[dofs], 0.0, err_msg=f"step {i} tree {t}")
+                for a in (d.qacc, d.qfrc_constraint, d.efc.Ma):
+                  np.testing.assert_array_equal(a.numpy()[0, dofs], 0.0, err_msg=f"step {i} tree {t}")
             # the limit row of the hinge, which falls asleep at its limit
             nefc = d.nefc.numpy()[0]
             limit = (d.efc.type.numpy()[0, :nefc] == mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT).nonzero()[0]
             if not awake[mjm.dof_treeid[hinge]] and len(limit):
               np.testing.assert_array_equal(d.efc.force.numpy()[0, limit], 0.0, err_msg=f"step {i}")
       runs.append((np.array(states), d.qpos.numpy()[0]))
-    # a ball wakes a sleeping box mid-run; both then fall asleep again
     (states0, qpos0), (states1, qpos1) = runs
-    self.assertTrue((states0[:, 2] < 0).any() and (states0[:, 2] >= 0).any())
-    np.testing.assert_array_equal(states1, states0)
+    asleep0, asleep1 = states0 >= 0, states1 >= 0
+    # a ball wakes a sleeping box mid-run; both then fall asleep again (rounding shifts when trees
+    # cross the sleep threshold, so compare the settled end)
+    self.assertTrue((asleep1[:-1] & ~asleep1[1:]).any())
+    np.testing.assert_array_equal(asleep1[-1], asleep0[-1])
+    self.assertEqual(asleep1[-1].sum(), mjm.ntree - 1)
     np.testing.assert_allclose(qpos1, qpos0, atol=1e-3)
 
   def test_island_groups(self):
