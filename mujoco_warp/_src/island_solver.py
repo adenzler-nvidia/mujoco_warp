@@ -939,10 +939,9 @@ def _grad(final: bool):
         frc = float(0.0)
         if block[0] > 0:
           if col < block[0]:
+            # independent loads (no test of the force first): the row loop is latency bound
             for r in range(block[3], block[3] + block[2]):
-              force = efc_force_in[worldid, r]
-              if force != 0.0:
-                frc += iJ_in[worldid, r, col] * force
+              frc += iJ_in[worldid, r, col] * efc_force_in[worldid, r]
           frc_out[worldid, row] = frc
         else:
           frc = frc_out[worldid, row]
