@@ -590,6 +590,7 @@ def _rows(initial: bool, elliptic: bool):
     done_in: wp.array2d[bool],
     dof2row_in: wp.array2d[int],
     row_jaref_in: wp.array2d[float],
+    iJ_in: wp.array3d[float],
     lanes: int,
     # Data out:
     efc_force_out: wp.array2d[float],
@@ -668,7 +669,21 @@ def _rows(initial: bool, elliptic: bool):
         w = wp.where(quad, D, -D)
       row_w_out[worldid, row] = w
 
-      if island_slot_in[worldid, islandid][0] > 0:
+      block = island_slot_in[worldid, islandid]
+      if block[0] > 0:
+        # dense rows: a flipped row's rank-1 update of the group's tile, as
+        # _update_gradient_h_incremental_rows (_dense_rows_h assembles the initial H)
+        if wp.static(not INITIAL):
+          if w != 0.0:
+            row0 = _TILE * tilebase_in[worldid, islandid]
+            for i in range(block[0]):
+              Ji = iJ_in[worldid, row, i]
+              if Ji != 0.0:
+                wJi = w * Ji
+                for j in range(i, block[0]):
+                  Jj = iJ_in[worldid, row, j]
+                  if Jj != 0.0:
+                    wp.atomic_add(H_out[worldid, row0 + i], j, wJi * Jj)
         continue
       force = res[0]
       if wp.static(INITIAL):
@@ -960,9 +975,59 @@ def _factor(max_size: int):
   return kernel
 
 
+def _tile_newton(n: int, ntile: int):
+  """Newton direction of a group of ntile x ntile pool tiles, as one n x n tile (or its factor)."""
+
+  @wp.func
+  def func(
+    # In:
+    H_in: wp.array2d[float],
+    grad_in: wp.array[float],
+    row0: int,
+    vbase: int,
+    factorize: bool,
+    # Out:
+    U_out: wp.array2d[float],
+    search_out: wp.array[float],
+  ) -> wp.vec2:
+    U = wp.tile_zeros(shape=(n, n), dtype=float, storage="shared")
+    # the block's upper tiles (0, 0), (0, 1), (1, 1); the factorization reads no others
+    if factorize:
+      wp.tile_assign(U, wp.tile_load(H_in, shape=(wp.static(min(n, _TILE)), wp.static(min(n, _TILE))), offset=(row0, 0)))
+      if wp.static(ntile == 2):
+        wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
+        wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
+      wp.tile_cholesky_inplace(U, fill_mode="upper")
+      wp.tile_store(
+        U_out, wp.tile_view(U, offset=(0, 0), shape=(wp.static(min(n, _TILE)), wp.static(min(n, _TILE)))), offset=(row0, 0)
+      )
+      if wp.static(ntile == 2):
+        wp.tile_store(U_out, wp.tile_view(U, offset=(0, _TILE), shape=(_TILE, _TILE)), offset=(row0 + _TILE, 0))
+        wp.tile_store(U_out, wp.tile_view(U, offset=(_TILE, _TILE), shape=(_TILE, _TILE)), offset=(row0 + 3 * _TILE, 0))
+    else:
+      wp.tile_assign(U, wp.tile_load(U_out, shape=(wp.static(min(n, _TILE)), wp.static(min(n, _TILE))), offset=(row0, 0)))
+      if wp.static(ntile == 2):
+        wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
+        wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
+    b = wp.tile_load(grad_in, shape=n, offset=vbase)
+    x = wp.tile_cholesky_solve(U, b, fill_mode="upper")
+    wp.tile_store(search_out, wp.tile_map(wp.neg, x), offset=vbase)
+    return wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b, x))[0]
+
+  return func
+
+
 @cache_kernel
-def _dense_factor(ntile: int):
+def _dense_factor(ntile: int, width: int):
+  """Newton directions of the groups of ntile tiles per side, as _update_gradient_cholesky.
+
+  Factored as one tile in shared memory where rows changed, else solved with the stored factor;
+  one-tile groups that fit the dense row width are factored at that width.
+  """
   N = ntile * _TILE
+  NARROW = ntile == 1 and width < _TILE
+  full = _tile_newton(N, ntile)
+  narrow = _tile_newton(width, 1) if NARROW else full
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
@@ -970,6 +1035,7 @@ def _dense_factor(ntile: int):
     ntree: int,
     # Data in:
     nisland_in: wp.array[int],
+    island_nv_in: wp.array2d[int],
     # In:
     group_count_in: wp.array[int],
     group_list_in: wp.array2d[int],
@@ -980,20 +1046,17 @@ def _dense_factor(ntile: int):
     vbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
     niter_in: wp.array2d[int],
+    changed_in: wp.array2d[bool],
     state_changed_in: wp.array2d[bool],
     grad_in: wp.array2d[float],
     H_in: wp.array3d[float],
     # Out:
+    U_out: wp.array3d[float],
     search_out: wp.array2d[float],
     search_dot_out: wp.array2d[float],
     newton_decrement_out: wp.array2d[float],
     grad_scale_out: wp.array2d[float],
   ):
-    """Newton search direction of an island of ntile tiles per side, factored as one tile.
-
-    As _update_gradient_cholesky for a world: the island's H (the pool's upper tiles) is factored
-    in shared memory every iteration.
-    """
     bid, lane = wp.tid()
     for e in range(bid, group_count_in[cls], nblock):
       worldid = group_list_in[cls, e] // ntree
@@ -1008,19 +1071,12 @@ def _dense_factor(ntile: int):
         continue
       vbase = vbase_in[worldid, islandid]
       row0 = _TILE * tilebase_in[worldid, islandid]
-      # the block's upper tiles (0, 0), (0, 1), (1, 1); the factorization reads no others
-      U = wp.tile_zeros(shape=(N, N), dtype=float, storage="shared")
-      wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0, 0)), offset=(0, 0))
-      if wp.static(ntile == 2):
-        wp.tile_assign(U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
-        wp.tile_assign(
-          U, wp.tile_load(H_in[worldid], shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE)
-        )
-      wp.tile_cholesky_inplace(U, fill_mode="upper")
-      b = wp.tile_load(grad_in[worldid], shape=N, offset=vbase)
-      x = wp.tile_cholesky_solve(U, b, fill_mode="upper")
-      wp.tile_store(search_out[worldid], wp.tile_map(wp.neg, x), offset=vbase)
-      sums = wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b, x))[0]
+      factorize = changed_in[worldid, islandid] or niter_in[worldid, islandid] == 0
+      sums = wp.vec2(0.0)
+      if wp.static(NARROW) and island_nv_in[worldid, islandid] <= wp.static(width):
+        sums = wp.static(narrow)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
+      else:
+        sums = wp.static(full)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
       if lane == 0:
         search_dot_out[worldid, islandid] = sums[0]
         newton_decrement_out[worldid, islandid] = sums[1]
@@ -2243,6 +2299,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       ctx.done,
       ctx.dof2row,
       ctx.row_jaref,
+      g.J,
       _lanes(d.nworld, d.njmax),
     ],
     outputs=[d.efc.force, d.efc.state, ctx.row_quad, ctx.row_w, ctx.frc, ctx.H, ctx.changed, ctx.state_changed],
@@ -2320,7 +2377,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       _seed_pool(m, d, ctx, g, skip_done=True)
     if initial or elliptic:
       sparse_h()
-    dense_h(initial or elliptic)
+      dense_h(True)
 
   if m.opt.graph_conditional:
     wp.capture_if(ctx.group_count[5:6], on_true=h)
@@ -2361,11 +2418,12 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
 
   def dense_factor(ntile: int):
     wp.launch_tiled(
-      _dense_factor(ntile),
+      _dense_factor(ntile, g.J.shape[2]),
       dim=_nblock(),
       inputs=[
         m.ntree,
         g.ngroup,
+        g.group_nv,
         ctx.group_count,
         ctx.group_list,
         ntile,
@@ -2375,11 +2433,12 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
         ctx.vbase,
         ctx.done,
         ctx.niter,
+        ctx.changed,
         ctx.state_changed,
         ctx.grad.reshape((d.nworld, nrow)),
         ctx.H,
       ],
-      outputs=[ctx.search.reshape((d.nworld, nrow)), ctx.search_dot, ctx.newton_decrement, ctx.grad_scale],
+      outputs=[ctx.U, ctx.search.reshape((d.nworld, nrow)), ctx.search_dot, ctx.newton_decrement, ctx.grad_scale],
       block_dim=_ISLAND_THREADS,
     )
 
