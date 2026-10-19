@@ -853,58 +853,58 @@ def _grad(final: bool):
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
+    # Model:
+    ntree: int,
     # Data in:
-    efc_J_in: wp.array3d[float],
     efc_force_in: wp.array2d[float],
-    dof_island_in: wp.array2d[int],
     # In:
-    island_slot_in: wp.array2d[wp.vec4i],
+    group_count_in: wp.array[int],
+    group_list_in: wp.array2d[int],
+    nblock: int,
+    group_slot_in: wp.array2d[wp.vec4i],
     iJ_in: wp.array3d[float],
-    row2dof_in: wp.array2d[int],
+    ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
     niter_in: wp.array2d[int],
     state_changed_in: wp.array2d[bool],
     Ma_in: wp.array2d[float],
     iqfrc_smooth_in: wp.array2d[float],
-    small: int,
-    lanes: int,
-    nrow_used_in: wp.array[int],
     # Out:
     frc_out: wp.array2d[float],
     grad_out: wp.array2d[float],
   ):
-    """J'force (dense islands) and the gradient of an aligned island DOF row (zero on padding).
+    """J'force (dense rows) and the gradient of a group, a lane per column (zero on padding).
 
-    Sparse islands' J'force is accumulated by _sparse_rows. The final pass only computes J'force
-    (qfrc_constraint) of dense islands.
+    As _update_constraint_init_qfrc_constraint_dense and _update_gradient_grad for a world; sparse
+    rows' J'force is accumulated by _rows. The final pass only forms J'force (qfrc_constraint).
     """
-    worldid, lane = wp.tid()
-    for row in range(lane, nrow_used_in[worldid], lanes):
-      dofid = row2dof_in[worldid, row]
-      if dofid < 0:
-        if wp.static(not FINAL):
-          grad_out[worldid, row] = 0.0
-        continue
-      islandid = dof_island_in[worldid, dofid]
+    bid, lane = wp.tid()
+    for e in range(bid, group_count_in[0], nblock):
+      worldid = group_list_in[0, e] // ntree
+      g = group_list_in[0, e] % ntree
       if wp.static(not FINAL):
-        if done_in[worldid, islandid] or _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
+        if done_in[worldid, g] or _stable(niter_in[worldid, g], state_changed_in[worldid, g]):
           continue
-      block = island_slot_in[worldid, islandid]
-      frc = float(0.0)
-      if block[0] > 0:
-        col = row - vbase_in[worldid, islandid]
-        for r in range(block[2]):
-          force = efc_force_in[worldid, block[3] + r]
-          if force != 0.0:
-            frc += iJ_in[worldid, block[3] + r, col] * force
-        frc_out[worldid, row] = frc
-      elif wp.static(FINAL):
-        continue
-      else:
-        frc = frc_out[worldid, row]
-      if wp.static(not FINAL):
-        grad_out[worldid, row] = Ma_in[worldid, row] - iqfrc_smooth_in[worldid, row] - frc
+      block = group_slot_in[worldid, g]
+      if wp.static(FINAL):
+        if block[0] == 0:
+          continue
+      vbase = vbase_in[worldid, g]
+      for col in range(lane, ntile_in[worldid, g] * _TILE, wp.block_dim()):
+        row = vbase + col
+        frc = float(0.0)
+        if block[0] > 0:
+          if col < block[0]:
+            for r in range(block[3], block[3] + block[2]):
+              force = efc_force_in[worldid, r]
+              if force != 0.0:
+                frc += iJ_in[worldid, r, col] * force
+          frc_out[worldid, row] = frc
+        else:
+          frc = frc_out[worldid, row]
+        if wp.static(not FINAL):
+          grad_out[worldid, row] = Ma_in[worldid, row] - iqfrc_smooth_in[worldid, row] - frc
 
   return kernel
 
@@ -2397,27 +2397,27 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
 
 def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final: bool):
   nrow = ctx.qacc.shape[1]
-  wp.launch(
+  wp.launch_tiled(
     _grad(final),
-    dim=(d.nworld, _lanes(d.nworld, nrow)),
+    dim=_nblock(),
     inputs=[
-      d.efc.J,
+      g.group_slot.shape[1],
       d.efc.force,
-      g.dof_group,
+      ctx.group_count,
+      ctx.group_list,
+      _nblock(),
       g.group_slot,
       g.J,
-      ctx.row2dof,
+      ctx.ntile,
       ctx.vbase,
       ctx.done,
       ctx.niter,
       ctx.state_changed,
       ctx.Ma,
       ctx.qfrc_smooth,
-      island.small_width(),
-      _lanes(d.nworld, nrow),
-      ctx.nrow_used,
     ],
     outputs=[ctx.frc, ctx.grad.reshape((d.nworld, nrow))],
+    block_dim=_TILE,
   )
 
 
