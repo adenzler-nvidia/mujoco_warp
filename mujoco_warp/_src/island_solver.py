@@ -28,6 +28,7 @@ import dataclasses
 import warp as wp
 
 from mujoco_warp._src import island
+from mujoco_warp._src import math
 from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_pool_cholesky_newton_func
 from mujoco_warp._src.block_cholesky import solve_search_sums
@@ -37,6 +38,7 @@ from mujoco_warp._src.solver import _ROW_EQUALITY
 from mujoco_warp._src.solver import _ROW_FRICTION
 from mujoco_warp._src.solver import _ROW_OTHER
 from mujoco_warp._src.solver import _active_check
+from mujoco_warp._src.solver import _elliptic_hessian_entry_from_projections
 from mujoco_warp._src.solver import _eval_constraint
 from mujoco_warp._src.solver import _eval_elliptic_alpha_zero
 from mujoco_warp._src.solver import _eval_elliptic_reference
@@ -211,6 +213,7 @@ def _group_lists(
   island_slot_in: wp.array2d[wp.vec4i],
   group_asleep_in: wp.array2d[bool],
   small: int,
+  dense_solver: bool,
   # Out:
   group_count_out: wp.array[int],
   group_list_out: wp.array2d[int],
@@ -242,7 +245,7 @@ def _group_lists(
     wp.atomic_add(group_count_out, 7, 1)
     done_out[worldid, g] = True
     return
-  if width > 0:
+  if width > 0 and dense_solver:
     p = wp.atomic_add(group_count_out, 6, 1)
     group_list_out[6, p] = packed
     group_problem_out[worldid, g] = p
@@ -304,6 +307,7 @@ def _init_rows(
   iJ_in: wp.array3d[float],
   iqacc_in: wp.array2d[float],
   small: int,
+  dense_solver: bool,
   lanes: int,
   # Out:
   row_jaref_out: wp.array2d[float],
@@ -313,8 +317,8 @@ def _init_rows(
   for row in range(lane, wp.min(nefc_in[worldid], efc_aref_in.shape[1]), lanes):
     islandid = efc_island_in[worldid, row]
     block = island_slot_in[worldid, islandid]
-    # dense-path groups: the dense world solver computes its own
-    if block[0] > 0 and block[0] != small:
+    # groups on the dense world solver compute their own
+    if block[0] > 0 and block[0] != small and dense_solver:
       continue
     jaref = -efc_aref_in[worldid, row]
     if block[0] > 0:
@@ -383,6 +387,8 @@ def _pool_seed(
   tilebase_in: wp.array2d[int],
   ntile_in: wp.array2d[int],
   vbase_in: wp.array2d[int],
+  skip_done: bool,
+  done_in: wp.array2d[bool],
   # Out:
   iM_out: wp.array3d[float],
   H_out: wp.array3d[float],
@@ -399,6 +405,9 @@ def _pool_seed(
     packed = _own_group(group_count_in, group_list_in, e)
     worldid = packed // ntree
     g = packed % ntree
+    if skip_done:
+      if done_in[worldid, g]:
+        continue
     # block-path groups (list 0) start from H = M; one-tile groups build H from M each iteration
     block_path = e < group_count_in[0]
     n = island_nv_in[worldid, g]
@@ -685,6 +694,144 @@ def _rows(initial: bool, elliptic: bool):
   return kernel
 
 
+@wp.func
+def _row_weight(assemble: bool, D: float, state: int, row_w: float) -> float:
+  """A dense row's J'J weight: D if quadratic (assembly), else its flip weight (incremental)."""
+  if assemble:
+    return wp.where(state == types.ConstraintState.QUADRATIC.value, D, 0.0)
+  return row_w
+
+
+@cache_kernel
+def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
+  """H += J'WJ over the dense rows of a group (one tile), as _update_gradient_JTDAJ_dense_tiled.
+
+  assemble: W = D on quadratic rows (H = M + J'DJ, with the cone curvature of elliptic contacts),
+  for every group initially, else for the groups still iterating (elliptic cones: H at every
+  point). Else incremental: W = the flip weights of _rows, for the groups whose rows flipped.
+  """
+  W = width
+  K = 16
+  ASSEMBLE = assemble
+  ELLIPTIC = elliptic
+
+  @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
+  def kernel(
+    # Model:
+    ntree: int,
+    opt_impratio_invsqrt: wp.array[float],
+    # Data in:
+    contact_friction_in: wp.array[types.vec5],
+    contact_dim_in: wp.array[int],
+    contact_efc_address_in: wp.array2d[int],
+    efc_type_in: wp.array2d[int],
+    efc_id_in: wp.array2d[int],
+    efc_D_in: wp.array2d[float],
+    efc_state_in: wp.array2d[int],
+    # In:
+    group_count_in: wp.array[int],
+    group_list_in: wp.array2d[int],
+    nblock: int,
+    initial: bool,
+    group_slot_in: wp.array2d[wp.vec4i],
+    tilebase_in: wp.array2d[int],
+    done_in: wp.array2d[bool],
+    changed_in: wp.array2d[bool],
+    row_w_in: wp.array2d[float],
+    row_jaref_in: wp.array2d[float],
+    iJ_in: wp.array3d[float],
+    # Out:
+    H_out: wp.array3d[float],
+  ):
+    bid, lane = wp.tid()
+    for e in range(bid, group_count_in[0], nblock):
+      worldid = group_list_in[0, e] // ntree
+      g = group_list_in[0, e] % ntree
+      block = group_slot_in[worldid, g]
+      if block[0] == 0:
+        continue
+      if not initial:
+        if done_in[worldid, g]:
+          continue
+        if wp.static(not ASSEMBLE):
+          if not changed_in[worldid, g]:
+            continue
+      rowadr = block[3]
+      nrow = block[2]
+      row0 = _TILE * tilebase_in[worldid, g]
+      # views ending at the group's last row: the loads zero-fill past it (and past column W)
+      J = wp.array(ptr=iJ_in[worldid].ptr, shape=(rowadr + nrow, W), dtype=float)
+      D = wp.array(ptr=efc_D_in[worldid].ptr, shape=(rowadr + nrow,), dtype=float)
+      state = wp.array(ptr=efc_state_in[worldid].ptr, shape=(rowadr + nrow,), dtype=int)
+      rw = wp.array(ptr=row_w_in[worldid].ptr, shape=(rowadr + nrow,), dtype=float)
+      h = wp.tile_load(H_out[worldid], shape=(_TILE, _TILE), offset=(row0, 0))
+      for k in range(0, nrow, K):
+        J_k = wp.tile_load(J, shape=(K, _TILE), offset=(rowadr + k, 0), bounds_check=True)
+        w_k = wp.tile_map(
+          _row_weight,
+          wp.tile_full(shape=K, value=wp.static(ASSEMBLE), dtype=bool),
+          wp.tile_load(D, shape=K, offset=rowadr + k, bounds_check=True),
+          wp.tile_load(state, shape=K, offset=rowadr + k, bounds_check=True),
+          wp.tile_load(rw, shape=K, offset=rowadr + k, bounds_check=True),
+        )
+        JW = wp.tile_map(wp.mul, wp.tile_transpose(J_k), wp.tile_broadcast(w_k, shape=(_TILE, K)))
+        h += wp.tile_matmul(JW, J_k)
+      wp.tile_store(H_out[worldid], h, offset=(row0, 0))
+      if wp.static(ELLIPTIC and ASSEMBLE):
+        _sync()
+        # the cone curvature of the contacts in the cone (_update_gradient_JTCJ_dense); each lane
+        # keeps its entries over the contacts
+        for r in range(nrow):
+          efcid0 = rowadr + r
+          if efc_type_in[worldid, efcid0] != types.ConstraintType.CONTACT_ELLIPTIC:
+            continue
+          if efc_state_in[worldid, efcid0] != types.ConstraintState.CONE:
+            continue
+          conid = efc_id_in[worldid, efcid0]
+          if contact_efc_address_in[conid, 0] != efcid0:
+            continue
+          condim = contact_dim_in[conid]
+          fri = contact_friction_in[conid]
+          mu = fri[0] * opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
+          mu2 = mu * mu
+          dm = math.safe_div(efc_D_in[worldid, efcid0], mu2 * (1.0 + mu2))
+          n = row_jaref_in[worldid, efcid0] * mu
+          tt = float(0.0)
+          for dim in range(1, condim):
+            u = row_jaref_in[worldid, contact_efc_address_in[conid, dim]] * fri[dim - 1]
+            tt += u * u
+          inv_t = math.safe_div(1.0, wp.max(wp.sqrt(tt), types.MJ_MINVAL))
+          mu_n_over_t = mu * n * inv_t
+          for entry in range(lane, wp.static(W * W), wp.block_dim()):
+            a = entry // W
+            b = entry % W
+            projection1 = float(0.0)
+            projection2 = float(0.0)
+            tangent_dot = float(0.0)
+            for dim in range(1, condim):
+              efcid = contact_efc_address_in[conid, dim]
+              scale = fri[dim - 1]
+              u = row_jaref_in[worldid, efcid] * scale
+              z1 = scale * iJ_in[worldid, efcid, a]
+              z2 = scale * iJ_in[worldid, efcid, b]
+              projection1 += u * z1
+              projection2 += u * z2
+              tangent_dot += z1 * z2
+            H_out[worldid, row0 + a, b] += _elliptic_hessian_entry_from_projections(
+              dm,
+              mu,
+              mu_n_over_t,
+              mu2 - mu_n_over_t,
+              mu * iJ_in[worldid, efcid0, a],
+              mu * iJ_in[worldid, efcid0, b],
+              projection1 * inv_t,
+              projection2 * inv_t,
+              tangent_dot,
+            )
+
+  return kernel
+
+
 @cache_kernel
 def _grad(final: bool):
   FINAL = final
@@ -730,14 +877,14 @@ def _grad(final: bool):
           continue
       block = island_slot_in[worldid, islandid]
       frc = float(0.0)
-      if block[0] > 0 and block[0] == small:
+      if block[0] > 0:
         col = row - vbase_in[worldid, islandid]
         for r in range(block[2]):
           force = efc_force_in[worldid, block[3] + r]
           if force != 0.0:
             frc += iJ_in[worldid, block[3] + r, col] * force
         frc_out[worldid, row] = frc
-      elif wp.static(FINAL) or block[0] > 0:
+      elif wp.static(FINAL):
         continue
       else:
         frc = frc_out[worldid, row]
@@ -2035,8 +2182,8 @@ def _nblock(per_sm: int = 1) -> int:
   return wp.get_device().sm_count * 32 * per_sm
 
 
-def _seed_pool(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
-  """H = M (identity on padding) for the block path's groups."""
+def _seed_pool(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers, skip_done: bool = False):
+  """H = M (identity on padding) for the block path's groups (skip_done: those still iterating)."""
   wp.launch_tiled(
     _pool_seed,
     dim=_nblock(),
@@ -2058,6 +2205,8 @@ def _seed_pool(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.tilebase,
       ctx.ntile,
       ctx.vbase,
+      skip_done,
+      ctx.done,
     ],
     outputs=[ctx.M, ctx.H],
     block_dim=_ISLAND_THREADS,
@@ -2125,6 +2274,8 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
         ctx.row_jaref,
         ctx.world_done,
         _jtdaj_groups_per_world(d.nworld, d.njmax),
+        g.efc_group,
+        ctx.done,
       ],
       outputs=[ctx.H],
       # elliptic: one block per constraint group (the cone terms are shared per block)
@@ -2133,18 +2284,48 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       else m.block_dim.update_gradient_JTDAJ_sparse,
     )
 
-  def seeded_h():
-    _seed_pool(m, d, ctx, g)
-    sparse_h()
+  def dense_h(assemble: bool):
+    wp.launch_tiled(
+      _dense_rows_h(g.J.shape[2], assemble, elliptic),
+      dim=_nblock(),
+      inputs=[
+        m.ntree,
+        m.opt.impratio_invsqrt,
+        d.contact.friction,
+        d.contact.dim,
+        d.contact.efc_address,
+        d.efc.type,
+        d.efc.id,
+        d.efc.D,
+        d.efc.state,
+        ctx.group_count,
+        ctx.group_list,
+        _nblock(),
+        initial,
+        g.group_slot,
+        ctx.tilebase,
+        ctx.done,
+        ctx.changed,
+        ctx.row_w,
+        ctx.row_jaref,
+        g.J,
+      ],
+      outputs=[ctx.H],
+      block_dim=_ISLAND_THREADS,
+    )
 
-  # the initial H of sparse groups, only if there is one; with elliptic cones, H at every point (the
-  # cone curvature depends on jaref)
-  if initial or elliptic:
-    h = sparse_h if initial else seeded_h
-    if m.opt.graph_conditional:
-      wp.capture_if(ctx.group_count[5:6], on_true=h)
-    else:
-      h()
+  def h():
+    # elliptic cones: H at every point (the cone curvature depends on jaref)
+    if not initial and elliptic:
+      _seed_pool(m, d, ctx, g, skip_done=True)
+    if initial or elliptic:
+      sparse_h()
+    dense_h(initial or elliptic)
+
+  if m.opt.graph_conditional:
+    wp.capture_if(ctx.group_count[5:6], on_true=h)
+  else:
+    h()
 
 
 def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final: bool):
@@ -2340,6 +2521,7 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       g.J,
       ctx.qacc,
       island.small_width(),
+      island.DENSE_SOLVER,
       _lanes(d.nworld, d.njmax),
     ],
     outputs=[ctx.row_jaref],
@@ -2472,7 +2654,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   ctx = _create_context(m, d)
   # islands are solved in groups (see island.MERGE)
   g = island.slot_buffers(m, d)
-  dense = _create_dense(m, d, ctx, g)
+  dense = _create_dense(m, d, ctx, g) if island.DENSE_SOLVER else None
   ctx.dense = dense
   d.solver_niter.zero_()
   wp.launch(
@@ -2490,7 +2672,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   wp.launch(
     _group_lists,
     dim=(d.nworld, m.ntree),
-    inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot, g.group_asleep, island.small_width()],
+    inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot, g.group_asleep, island.small_width(), island.DENSE_SOLVER],
     outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done, ctx.ntile],
   )
   if m.opt.graph_conditional:
@@ -2498,10 +2680,11 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   else:
     _solve_own(m, d, ctx, g)
 
-  # two-tile groups: the dense world solver; it scatters last, over the block path's values
-  if m.opt.graph_conditional:
-    wp.capture_if(ctx.group_count[6:7], on_true=lambda: _solve_dense(m, d, ctx, g, dense))
-  else:
-    _solve_dense(m, d, ctx, g, dense)
+  # groups with dense rows on the dense world solver (island.DENSE_SOLVER); it scatters last
+  if dense is not None:
+    if m.opt.graph_conditional:
+      wp.capture_if(ctx.group_count[6:7], on_true=lambda: _solve_dense(m, d, ctx, g, dense))
+    else:
+      _solve_dense(m, d, ctx, g, dense)
 
   return ctx

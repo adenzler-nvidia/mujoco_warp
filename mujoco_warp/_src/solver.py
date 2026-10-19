@@ -3706,9 +3706,12 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int, po
     ctx_Jaref_in: wp.array2d[float],
     ctx_done_in: wp.array[bool],
     groups_per_world: int,
+    efc_group_in: wp.array2d[int],
+    group_done_in: wp.array2d[bool],
     # Out:
     h_out: wp.array3d[float],
   ):
+    """J'DJ and cone curvature of sparse constraint blocks; skips done island groups (optional)."""
     worldid, slot, lane = wp.tid()
     if wp.static(ELLIPTIC):
       lanes = wp.block_dim()
@@ -3719,6 +3722,12 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int, po
     count = efc_jtdaj_nblock_in[worldid]
     for groupid in range(slot, count, groups_per_world):
       head_row = efc_jtdaj_adr_in[worldid, groupid]
+      if efc_group_in:
+        group = efc_group_in[worldid, head_row]
+        if group < 0:
+          continue
+        if group_done_in[worldid, group]:
+          continue
       block_rows = efc_jtdaj_nrow_in[worldid, groupid]
       head_adr = efc_J_rowadr_in[worldid, head_row]
       support = efc_J_rownnz_in[worldid, head_row]
@@ -3911,6 +3920,8 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         ctx.Jaref,
         ctx.done,
         groups_per_world,
+        None,
+        None,
       ]
       elliptic = m.opt.cone == types.ConeType.ELLIPTIC
       threads_per_group = 1 if elliptic and wp.get_device().is_cpu else _JTDAJ_THREADS_PER_GROUP

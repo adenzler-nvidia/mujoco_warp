@@ -986,6 +986,9 @@ MERGE_NV = 32  # read at each make_constraint
 SMALL_NV = 0
 # groups of several trees also get dense rows; False: sparse (rows touch few of their columns)
 DENSE_TREES = False
+# groups with dense rows are solved by the dense world solver (island_solver._solve_dense); False:
+# by the island solver like every other group
+DENSE_SOLVER = False
 _dense = [True]
 
 

@@ -359,31 +359,10 @@ class IslandSolverTest(absltest.TestCase):
     ntiles = []
     width = g.group_slot.numpy()[0, :, 0]
     state = d.efc.state.numpy()[0]
-    dense_h, problem = ctx.dense.ctx.h.numpy(), ctx.group_problem.numpy()[0]
-    idof2dof, idofadr = d.map_idof2dof.numpy()[0], g.group_idofadr.numpy()[0]
     ndense = 0
-    dense = _dense_groups(g, g.ngroup.numpy()[0])
     for i in range(g.ngroup.numpy()[0]):
-      if dense[i]:
-        # dense groups: the dense world solver's H (upper triangle, identity padding)
-        dofs = idof2dof[idofadr[i] : idofadr[i] + island_nv[i]]
-        Hi = M[np.ix_(dofs, dofs)].copy()
-        # convergence is measured relative to the island's inertia trace (meaninertia * nv)
-        meaninertia = ctx.dense.m.stat.meaninertia.numpy()[problem[i]]
-        np.testing.assert_allclose(meaninertia * island.dense_width(m), np.trace(Hi), rtol=1e-5)
-        rows = range(island_iefcadr[i], island_iefcadr[i] + island_nefc[i])
-        for r in rows:
-          if state[r] == mujoco.mjtConstraintState.mjCNSTRSTATE_QUADRATIC:
-            Jr = J[iefc2efc[r], dofs]
-            Hi += D[iefc2efc[r]] * np.outer(Jr, Jr)
-        if elliptic:
-          Hi += _cone_hessian(m, d, J, rows, dofs, ctx.dense.ctx.Jaref.numpy()[0])
-        Hp = dense_h[problem[i]]
-        n = len(dofs)
-        np.testing.assert_allclose(np.triu(Hp[:n, :n]), np.triu(Hi), rtol=1e-4, atol=1e-4, err_msg=f"dense group {i}")
-        np.testing.assert_allclose(np.diag(Hp)[n:], 1.0)
-        ndense += 1
-        continue
+      # groups with dense rows (single trees) and sparse ones alike: a block of the pool
+      ndense += width[i] > 0
       c, tilebase, vbase = ctx.ntile.numpy()[0, i], ctx.tilebase.numpy()[0, i], ctx.vbase.numpy()[0, i]
       ntiles.append(c)
       dofs = row2dof[vbase : vbase + island_nv[i]]
@@ -406,7 +385,7 @@ class IslandSolverTest(absltest.TestCase):
     self.assertGreater(max(ntiles), 1)
     if dense_nv == 32:
       self.assertGreater(ndense, 0)
-    return max(ctx.niter.numpy()[0, i] for i in range(g.ngroup.numpy()[0]) if not dense[i])
+    return ctx.niter.numpy()[0, : g.ngroup.numpy()[0]].max()
 
   def test_gradient_scale(self):
     """The stored gradient times grad_scale is the gradient at the final point.
@@ -439,12 +418,7 @@ class IslandSolverTest(absltest.TestCase):
     _, _, m, d = _fixture(merge=False)
     ctx = island_solver.solve(m, d)
     g = island.slot_buffers(m, d)
-    # groups of the island solver (dense groups are solved by the dense world solver)
-    ngroup = g.ngroup.numpy()[0]
-    # the island solver's iterations, or the dense world solver's of the group's problem
-    dense = _dense_groups(g, ngroup)
-    problem = ctx.group_problem.numpy()[0, :ngroup]
-    niter = np.where(dense, ctx.dense.d.solver_niter.numpy()[np.maximum(problem, 0)], ctx.niter.numpy()[0, :ngroup])
+    niter = ctx.niter.numpy()[0, : g.ngroup.numpy()[0]]
     self.assertLess(niter.min(), niter.max())
     self.assertGreaterEqual(d.solver_niter.numpy()[0], niter.max())
 

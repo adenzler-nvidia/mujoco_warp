@@ -1086,6 +1086,8 @@ class SolverTest(parameterized.TestCase):
         ctx.Jaref,
         ctx.done,
         groups_per_world,
+        None,
+        None,
       ],
       outputs=[ctx.h],
       block_dim=m.block_dim.update_gradient_JTDAJ_sparse,
