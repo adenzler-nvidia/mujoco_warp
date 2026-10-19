@@ -389,6 +389,7 @@ def _pool_seed(
   vbase_in: wp.array2d[int],
   skip_done: bool,
   done_in: wp.array2d[bool],
+  group_slot_in: wp.array2d[wp.vec4i],
   # Out:
   iM_out: wp.array3d[float],
   H_out: wp.array3d[float],
@@ -410,6 +411,9 @@ def _pool_seed(
         continue
     # block-path groups (list 0) start from H = M; one-tile groups build H from M each iteration
     block_path = e < group_count_in[0]
+    # groups with dense rows: _dense_rows_h assembles H from M
+    if block_path and group_slot_in[worldid, g][0] > 0:
+      continue
     n = island_nv_in[worldid, g]
     ntile = ntile_in[worldid, g]
     tilebase = tilebase_in[worldid, g]
@@ -735,7 +739,15 @@ def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
     # Model:
     ntree: int,
     opt_impratio_invsqrt: wp.array[float],
+    dof_treeid: wp.array[int],
+    tree_dofadr: wp.array[int],
+    tree_dofnum: wp.array[int],
+    M_rownnz: wp.array[int],
+    M_rowadr: wp.array[int],
+    M_colind: wp.array[int],
+    M_hinit_i: wp.array[int],
     # Data in:
+    M_in: wp.array2d[float],
     contact_friction_in: wp.array[types.vec5],
     contact_dim_in: wp.array[int],
     contact_efc_address_in: wp.array2d[int],
@@ -749,7 +761,10 @@ def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
     nblock: int,
     initial: bool,
     group_slot_in: wp.array2d[wp.vec4i],
+    group_nv_in: wp.array2d[int],
     tilebase_in: wp.array2d[int],
+    vbase_in: wp.array2d[int],
+    row2dof_in: wp.array2d[int],
     done_in: wp.array2d[bool],
     changed_in: wp.array2d[bool],
     row_w_in: wp.array2d[float],
@@ -759,6 +774,7 @@ def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
     H_out: wp.array3d[float],
   ):
     bid, lane = wp.tid()
+    lanes = wp.block_dim()
     for e in range(bid, group_count_in[0], nblock):
       worldid = group_list_in[0, e] // ntree
       g = group_list_in[0, e] % ntree
@@ -779,7 +795,34 @@ def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
       D = wp.array(ptr=efc_D_in[worldid].ptr, shape=(rowadr + nrow,), dtype=float)
       state = wp.array(ptr=efc_state_in[worldid].ptr, shape=(rowadr + nrow,), dtype=int)
       rw = wp.array(ptr=row_w_in[worldid].ptr, shape=(rowadr + nrow,), dtype=float)
-      h = wp.tile_load(H_out[worldid], shape=(_TILE, _TILE), offset=(row0, 0))
+      if wp.static(ASSEMBLE):
+        # M's upper triangle, tree by tree (a group's DOFs are whole trees in order, each tree's CSR
+        # entries contiguous); identity on padding. Uniform trip counts: the scatters are collective
+        m_tile = wp.tile_zeros(shape=(wp.static(_TILE * _TILE),), dtype=float, storage="shared")
+        ndof = group_nv_in[worldid, g]
+        vbase = vbase_in[worldid, g]
+        c = int(0)
+        while c < ndof:
+          tree = dof_treeid[row2dof_in[worldid, vbase + c]]
+          dofadr = tree_dofadr[tree]
+          last = dofadr + tree_dofnum[tree] - 1
+          beg = M_rowadr[dofadr]
+          nent = M_rowadr[last] + M_rownnz[last] - beg
+          base = c - dofadr
+          for it in range((nent + lanes - 1) // lanes):
+            ent = it * lanes + lane
+            enable = ent < nent
+            ec = beg + wp.where(enable, ent, 0)
+            pos = (M_colind[ec] + base) * _TILE + M_hinit_i[ec] + base
+            wp.tile_scatter_add(m_tile, pos, wp.where(enable, M_in[worldid, ec], 0.0), enable)
+          c += tree_dofnum[tree]
+        for it in range((_TILE + lanes - 1) // lanes):
+          i = it * lanes + lane
+          enable = i >= ndof and i < _TILE
+          wp.tile_scatter_add(m_tile, wp.where(enable, i * _TILE + i, 0), 1.0, enable)
+        h = wp.tile_reshape(m_tile, (_TILE, _TILE))
+      else:
+        h = wp.tile_load(H_out[worldid], shape=(_TILE, _TILE), offset=(row0, 0))
       for k in range(0, nrow, K):
         J_k = wp.tile_load(J, shape=(K, _TILE), offset=(rowadr + k, 0), bounds_check=True)
         w_k = wp.tile_map(
@@ -2273,6 +2316,7 @@ def _seed_pool(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.vbase,
       skip_done,
       ctx.done,
+      g.group_slot,
     ],
     outputs=[ctx.M, ctx.H],
     block_dim=_ISLAND_THREADS,
@@ -2358,6 +2402,14 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       inputs=[
         m.ntree,
         m.opt.impratio_invsqrt,
+        m.dof_treeid,
+        m.tree_dofadr,
+        m.tree_dofnum,
+        m.M_rownnz,
+        m.M_rowadr,
+        m.M_colind,
+        m.M_hinit_i,
+        d.M,
         d.contact.friction,
         d.contact.dim,
         d.contact.efc_address,
@@ -2370,7 +2422,10 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
         _nblock(),
         initial,
         g.group_slot,
+        g.group_nv,
         ctx.tilebase,
+        ctx.vbase,
+        ctx.row2dof,
         ctx.done,
         ctx.changed,
         ctx.row_w,
