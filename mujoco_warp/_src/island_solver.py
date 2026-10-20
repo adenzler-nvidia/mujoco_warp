@@ -290,47 +290,53 @@ def _gather_dofs(
     ifrc_out[worldid, row] = 0.0
 
 
-@wp.kernel
-def _init_rows(
-  # Data in:
-  nefc_in: wp.array[int],
-  efc_J_rownnz_in: wp.array2d[int],
-  efc_J_rowadr_in: wp.array2d[int],
-  efc_J_colind_in: wp.array3d[int],
-  efc_J_in: wp.array3d[float],
-  efc_aref_in: wp.array2d[float],
-  efc_island_in: wp.array2d[int],
-  # In:
-  island_slot_in: wp.array2d[wp.vec4i],
-  vbase_in: wp.array2d[int],
-  dof2row_in: wp.array2d[int],
-  iJ_in: wp.array3d[float],
-  iqacc_in: wp.array2d[float],
-  small: int,
-  dense_solver: bool,
-  lanes: int,
-  # Out:
-  row_jaref_out: wp.array2d[float],
-):
-  """J qacc - aref of a row at the start point."""
-  worldid, lane = wp.tid()
-  for row in range(lane, wp.min(nefc_in[worldid], efc_aref_in.shape[1]), lanes):
-    islandid = efc_island_in[worldid, row]
-    block = island_slot_in[worldid, islandid]
-    # groups on the dense world solver compute their own
-    if block[0] > 0 and block[0] != small and dense_solver:
-      continue
-    jaref = -efc_aref_in[worldid, row]
-    if block[0] > 0:
-      vbase = vbase_in[worldid, islandid]
-      for c in range(block[0]):
-        jaref += iJ_in[worldid, row, c] * iqacc_in[worldid, vbase + c]
-    else:
-      rowadr = efc_J_rowadr_in[worldid, row]
-      for k in range(efc_J_rownnz_in[worldid, row]):
-        adr = rowadr + k
-        jaref += efc_J_in[worldid, 0, adr] * iqacc_in[worldid, dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
-    row_jaref_out[worldid, row] = jaref
+@cache_kernel
+def _init_rows(width: int):
+  """width: of the dense rows (static: the loop over a row unrolls; rows are zero past a group)."""
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    nefc_in: wp.array[int],
+    efc_J_rownnz_in: wp.array2d[int],
+    efc_J_rowadr_in: wp.array2d[int],
+    efc_J_colind_in: wp.array3d[int],
+    efc_J_in: wp.array3d[float],
+    efc_aref_in: wp.array2d[float],
+    efc_island_in: wp.array2d[int],
+    # In:
+    island_slot_in: wp.array2d[wp.vec4i],
+    vbase_in: wp.array2d[int],
+    dof2row_in: wp.array2d[int],
+    iJ_in: wp.array3d[float],
+    iqacc_in: wp.array2d[float],
+    small: int,
+    dense_solver: bool,
+    lanes: int,
+    # Out:
+    row_jaref_out: wp.array2d[float],
+  ):
+    """J qacc - aref of a row at the start point."""
+    worldid, lane = wp.tid()
+    for row in range(lane, wp.min(nefc_in[worldid], efc_aref_in.shape[1]), lanes):
+      islandid = efc_island_in[worldid, row]
+      block = island_slot_in[worldid, islandid]
+      # groups on the dense world solver compute their own
+      if block[0] > 0 and block[0] != small and dense_solver:
+        continue
+      jaref = -efc_aref_in[worldid, row]
+      if block[0] > 0:
+        vbase = vbase_in[worldid, islandid]
+        for c in range(wp.static(width)):
+          jaref += iJ_in[worldid, row, c] * iqacc_in[worldid, vbase + c]
+      else:
+        rowadr = efc_J_rowadr_in[worldid, row]
+        for k in range(efc_J_rownnz_in[worldid, row]):
+          adr = rowadr + k
+          jaref += efc_J_in[worldid, 0, adr] * iqacc_in[worldid, dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
+      row_jaref_out[worldid, row] = jaref
+
+  return kernel
 
 
 @wp.func
@@ -1236,9 +1242,10 @@ def _cone_pt(
 
 
 @cache_kernel
-def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool):
+def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: int):
   LS_ITERATIONS = ls_iterations
   ELLIPTIC = elliptic
+  WIDTH = width
 
   @wp.func
   def step(
@@ -1368,7 +1375,8 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool):
         jv = row_jv_out[worldid, row]
       else:
         if block[0] > 0:
-          for c in range(block[0]):
+          # rows are zero past a group's columns: a static loop unrolls
+          for c in range(wp.static(WIDTH)):
             jv += iJ_in[worldid, row, c] * search[vbase + c]
         else:
           rowadr = efc_J_rowadr_in[worldid, row]
@@ -1566,8 +1574,8 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool):
 
 
 @cache_kernel
-def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool):
-  step = _newton_step(ls_iterations, warn_overflow, elliptic)
+def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: int):
+  step = _newton_step(ls_iterations, warn_overflow, elliptic, width)
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1702,7 +1710,7 @@ def _quad_weight(state: int, D: float, active: float) -> float:
 @cache_kernel
 def _solve_small(ls_iterations: int, warn_overflow: int):
   # pyramidal cones only: keep island.SMALL_NV = 0 (the default) with elliptic cones
-  step = _newton_step(ls_iterations, warn_overflow, False)
+  step = _newton_step(ls_iterations, warn_overflow, False, island.small_width())
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
@@ -2540,7 +2548,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       launch()
 
   wp.launch_tiled(
-    _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow), m.opt.cone == types.ConeType.ELLIPTIC),
+    _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow), m.opt.cone == types.ConeType.ELLIPTIC, g.J.shape[2]),
     dim=_nblock(2),
     inputs=[
       m.ntree,
@@ -2630,7 +2638,7 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
   )
   _seed_pool(m, d, ctx, g)
   wp.launch(
-    _init_rows,
+    _init_rows(g.J.shape[2]),
     dim=(d.nworld, _lanes(d.nworld, d.njmax)),
     inputs=[
       d.nefc,
