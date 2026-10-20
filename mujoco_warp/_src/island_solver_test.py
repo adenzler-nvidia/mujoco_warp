@@ -125,12 +125,6 @@ def _cone_hessian(m, d, J, rows, dofs, jaref):
   return H
 
 
-def _dense_groups(g, ngroup):
-  """Groups the dense world solver takes (dense rows, not the one-tile groups of _solve_small)."""
-  width = g.group_slot.numpy()[0, :ngroup, 0]
-  return (width > 0) & (width != island.small_width())
-
-
 def _dense_J(d):
   """World 0's Jacobian, including the rows of islands in slots (kept only there)."""
   nefc = d.nefc.numpy()[0]
@@ -249,12 +243,11 @@ class IslandSolverTest(absltest.TestCase):
       group_slot, J = g.group_slot.numpy()[0], g.J.numpy()[0]
       nv, rownnz = g.group_nv.numpy()[0], d.efc.J_rownnz.numpy()[0]
       ngroup = g.ngroup.numpy()[0]
-      # dense rows for single trees up to the dense width (one-tile groups: their own width)
+      # dense rows for single trees up to the dense width
       idof2dof, idofadr = d.map_idof2dof.numpy()[0], g.group_idofadr.numpy()[0]
       tree_nv = m.tree_dofnum.numpy()[m.dof_treeid.numpy()[idof2dof[idofadr[:ngroup]]]]
       wide = np.where((nv[:ngroup] <= island.dense_width(m)) & (tree_nv == nv[:ngroup]), island.dense_width(m), 0)
-      small = island.small_width()
-      np.testing.assert_array_equal(group_slot[:ngroup, 0], np.where(nv[:ngroup] <= small, small, wide))
+      np.testing.assert_array_equal(group_slot[:ngroup, 0], wide)
       widths.update(group_slot[:ngroup, 0])
       for i in range(ngroup):
         width, _, nrow, rowadr = group_slot[i]
@@ -400,11 +393,7 @@ class IslandSolverTest(absltest.TestCase):
     grad_true = ctx.Ma.numpy()[0] - ctx.qfrc_smooth.numpy()[0] - ctx.frc.numpy()[0]
     grad, scale = ctx.grad.numpy()[0, :, 0], ctx.grad_scale.numpy()[0, :nisland]
     vbase, nv = ctx.vbase.numpy()[0, :nisland], g.group_nv.numpy()[0, :nisland]
-    dense = _dense_groups(g, nisland)
     for i in range(nisland):
-      # dense groups are solved by the dense world solver
-      if dense[i]:
-        continue
       rows = slice(vbase[i], vbase[i] + nv[i])
       # the gradient is a difference of force terms: its float32 noise scales with them, not with
       # the (converged, near zero) gradient
