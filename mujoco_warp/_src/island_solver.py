@@ -280,7 +280,11 @@ def _gather_dofs(
 
 @cache_kernel
 def _init_rows(width: int):
-  """width: of the dense rows (static: the loop over a row unrolls; rows are zero past a group)."""
+  """width: of the dense rows (static: the loop over a row unrolls; rows are zero past a group).
+
+  A dense row loads as vec4s (the width is a multiple of 4, see io._island_tree_nv): the strided
+  scalar loads of a row per thread miss L1.
+  """
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -299,23 +303,30 @@ def _init_rows(width: int):
     iJ_in: wp.array3d[float],
     iqacc_in: wp.array2d[float],
     dense_solver: bool,
-    lanes: int,
     # Out:
     row_jaref_out: wp.array2d[float],
   ):
-    """J qacc - aref of a row at the start point."""
-    worldid, lane = wp.tid()
-    for row in range(lane, wp.min(nefc_in[worldid], efc_aref_in.shape[1]), lanes):
+    """J qacc - aref of a row at the start point, a thread per row as _solve_init_jaref."""
+    worldid, row = wp.tid()
+    if row < wp.min(nefc_in[worldid], efc_aref_in.shape[1]):
       islandid = efc_island_in[worldid, row]
       block = island_slot_in[worldid, islandid]
       # groups on the dense world solver compute their own
       if block[0] > 0 and dense_solver:
-        continue
+        return
       jaref = -efc_aref_in[worldid, row]
       if block[0] > 0:
         vbase = vbase_in[worldid, islandid]
-        for c in range(wp.static(width)):
-          jaref += iJ_in[worldid, row, c] * iqacc_in[worldid, vbase + c]
+        J4 = wp.array(ptr=iJ_in[worldid, row].ptr, shape=(wp.static(width // 4),), dtype=wp.vec4)
+        for c in range(wp.static(width // 4)):
+          j = J4[c]
+          q = vbase + 4 * c
+          jaref += (
+            j[0] * iqacc_in[worldid, q]
+            + j[1] * iqacc_in[worldid, q + 1]
+            + j[2] * iqacc_in[worldid, q + 2]
+            + j[3] * iqacc_in[worldid, q + 3]
+          )
       else:
         rowadr = efc_J_rowadr_in[worldid, row]
         for k in range(efc_J_rownnz_in[worldid, row]):
@@ -2519,7 +2530,7 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
   _seed_pool(m, d, ctx, g)
   wp.launch(
     _init_rows(g.J.shape[2]),
-    dim=(d.nworld, _lanes(d.nworld, d.njmax)),
+    dim=(d.nworld, d.njmax),
     inputs=[
       d.nefc,
       d.efc.J_rownnz,
@@ -2534,7 +2545,6 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       g.J,
       ctx.qacc,
       island.DENSE_SOLVER,
-      _lanes(d.nworld, d.njmax),
     ],
     outputs=[ctx.row_jaref],
   )
