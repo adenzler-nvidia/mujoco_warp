@@ -964,6 +964,7 @@ def _grad(final: bool):
     state_changed_in: wp.array2d[bool],
     Ma_in: wp.array2d[float],
     iqfrc_smooth_in: wp.array2d[float],
+    grad_scale_in: wp.array2d[float],
     # Out:
     frc_out: wp.array2d[float],
     grad_out: wp.array2d[float],
@@ -971,8 +972,9 @@ def _grad(final: bool):
     """J'force (dense rows) and the gradient of a group, a warp per group and a lane per column.
 
     As _update_constraint_init_qfrc_constraint_dense and _update_gradient_grad for a world; sparse
-    rows' J'force is accumulated by _rows. The final pass forms J'force (qfrc_constraint) where the
-    last iteration skipped it.
+    rows' J'force is accumulated by _rows. Where the last iteration skipped J'force, the final pass
+    recovers it (qfrc_constraint) from the gradient, as _qfrc_constraint_from_grad: while the states
+    hold, the gradient is grad_scale times the stored one.
     """
     slot, lane = wp.tid()
     for e in range(slot, group_count_in[0], nblock):
@@ -987,6 +989,12 @@ def _grad(final: bool):
         if block[0] == 0 or not _stable(niter_in[worldid, g], state_changed_in[worldid, g]):
           continue
       vbase = vbase_in[worldid, g]
+      if wp.static(FINAL):
+        grad_scale = grad_scale_in[worldid, g]
+        for col in range(lane, ntile_in[worldid, g] * _TILE, _TILE):
+          row = vbase + col
+          frc_out[worldid, row] = Ma_in[worldid, row] - iqfrc_smooth_in[worldid, row] - grad_scale * grad_out[worldid, row]
+        continue
       for col in range(lane, ntile_in[worldid, g] * _TILE, _TILE):
         row = vbase + col
         frc = float(0.0)
@@ -2283,6 +2291,7 @@ def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final
       ctx.state_changed,
       ctx.Ma,
       ctx.qfrc_smooth,
+      ctx.grad_scale,
     ],
     outputs=[ctx.frc, ctx.grad.reshape((d.nworld, nrow))],
     block_dim=4 * _TILE,
