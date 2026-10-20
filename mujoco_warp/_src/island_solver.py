@@ -526,6 +526,50 @@ def _elliptic_row(
   return cone
 
 
+@wp.kernel
+def _mul_m_search(
+  # Model:
+  ntree: int,
+  M_mulm_rowadr: wp.array[int],
+  M_mulm_col: wp.array[int],
+  M_mulm_madr: wp.array[int],
+  # Data in:
+  M_in: wp.array2d[float],
+  island_nv_in: wp.array2d[int],
+  # In:
+  group_count_in: wp.array[int],
+  group_list_in: wp.array2d[int],
+  vbase_in: wp.array2d[int],
+  row2dof_in: wp.array2d[int],
+  done_in: wp.array2d[bool],
+  niter_in: wp.array2d[int],
+  state_changed_in: wp.array2d[bool],
+  search_in: wp.array2d[float],
+  # Out:
+  mv_out: wp.array2d[float],
+):
+  """M search of a group's DOF for the linesearch, a thread per (group, DOF), as for a world.
+
+  An unchanged search direction (stable states) keeps it.
+  """
+  e, lane = wp.tid()
+  if e >= group_count_in[0]:
+    return
+  worldid = group_list_in[0, e] // ntree
+  g = group_list_in[0, e] % ntree
+  if done_in[worldid, g] or _stable(niter_in[worldid, g], state_changed_in[worldid, g]):
+    return
+  vbase = vbase_in[worldid, g]
+  for la in range(lane, island_nv_in[worldid, g], _TILE):
+    # sparse M: a group's DOFs are whole trees in order (column col of DOF dof: row + col - dof)
+    row = vbase + la
+    dof = row2dof_in[worldid, row]
+    mv = float(0.0)
+    for k in range(M_mulm_rowadr[dof], M_mulm_rowadr[dof + 1]):
+      mv += M_in[worldid, M_mulm_madr[k]] * search_in[worldid, row + M_mulm_col[k] - dof]
+    mv_out[worldid, row] = mv
+
+
 @cache_kernel
 def _rows(initial: bool, elliptic: bool):
   INITIAL = initial
@@ -1366,16 +1410,8 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
     local_dof = wp.vec2(0.0)
     for la in range(lane, ndof, nthread):
       row = vbase + la
-      # an unchanged search direction keeps its M search and J search
-      mv = float(0.0)
-      if stable:
-        mv = mv_out[worldid, row]
-      else:
-        # sparse M: a group's DOFs are whole trees in order (column col of DOF dof: row + col - dof)
-        dof = row2dof_in[worldid, row]
-        for k in range(M_mulm_rowadr[dof], M_mulm_rowadr[dof + 1]):
-          mv += M_in[worldid, M_mulm_madr[k]] * search[row + M_mulm_col[k] - dof]
-        mv_out[worldid, row] = mv
+      # M search: _mul_m_search
+      mv = mv_out[worldid, row]
       s = search[row]
       local_dof += wp.vec2(s * (Ma_out[worldid, row] - iqfrc_smooth_in[worldid, row]), s * mv)
     local_gauss = wp.vec2(0.0)
@@ -2367,6 +2403,27 @@ def _launch_done(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
 def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
   """A Newton iteration, as the world solver's: linesearch, constraints, direction, done test."""
   nrow = ctx.qacc.shape[1]
+  wp.launch(
+    _mul_m_search,
+    dim=(d.nworld * m.ntree, _TILE),
+    inputs=[
+      m.ntree,
+      m.M_mulm_rowadr,
+      m.M_mulm_col,
+      m.M_mulm_madr,
+      d.M,
+      g.group_nv,
+      ctx.group_count,
+      ctx.group_list,
+      ctx.vbase,
+      ctx.row2dof,
+      ctx.done,
+      ctx.niter,
+      ctx.state_changed,
+      ctx.search.reshape((d.nworld, nrow)),
+    ],
+    outputs=[ctx.mv],
+  )
   wp.launch_tiled(
     _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow), m.opt.cone == types.ConeType.ELLIPTIC, g.J.shape[2]),
     dim=_nblock(2),
