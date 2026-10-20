@@ -1076,16 +1076,13 @@ def _tile_newton(n: int, ntile: int):
 
 
 @cache_kernel
-def _dense_factor(ntile: int):
+def _dense_factor(ntile: int, size: int):
   """Newton directions of the groups of ntile tiles per side, as _update_gradient_cholesky.
 
-  One-tile groups of at most half a tile of DOFs are factored at half the size (cuSolverDx is
-  slower at sizes between).
+  One-tile groups are factored at a few sizes, a kernel each (several tile sizes in a kernel take
+  shared memory from its occupancy): the groups of more than nv_min and at most size DOFs.
   """
-  N = ntile * _TILE
-  HALF = _TILE // 2
-  full = _tile_newton(N, ntile)
-  half = _tile_newton(HALF, 1) if ntile == 1 else full
+  newton = _tile_newton(size, ntile)
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
@@ -1099,6 +1096,7 @@ def _dense_factor(ntile: int):
     group_list_in: wp.array2d[int],
     cls: int,
     nblock: int,
+    nv_min: int,
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
@@ -1125,16 +1123,15 @@ def _dense_factor(ntile: int):
         continue
       if ntile_in[worldid, islandid] != wp.static(ntile):
         continue
+      nv = island_nv_in[worldid, islandid]
+      if nv <= nv_min or nv > wp.static(size):
+        continue
       if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
         continue
       vbase = vbase_in[worldid, islandid]
       row0 = _TILE * tilebase_in[worldid, islandid]
       factorize = changed_in[worldid, islandid] or niter_in[worldid, islandid] == 0
-      sums = wp.vec2(0.0)
-      if wp.static(ntile == 1) and island_nv_in[worldid, islandid] <= HALF:
-        sums = wp.static(half)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
-      else:
-        sums = wp.static(full)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
+      sums = wp.static(newton)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
       if lane == 0:
         search_dot_out[worldid, islandid] = sums[0]
         newton_decrement_out[worldid, islandid] = sums[1]
@@ -2503,9 +2500,9 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
   ctx.nsolving.zero_()
   _launch_grad(d, ctx, g, final=False)
 
-  def dense_factor(ntile: int):
+  def dense_factor(ntile: int, size: int, nv_min: int):
     wp.launch_tiled(
-      _dense_factor(ntile),
+      _dense_factor(ntile, size),
       dim=_nblock(),
       inputs=[
         m.ntree,
@@ -2515,6 +2512,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
         ctx.group_list,
         ntile,
         _nblock(),
+        nv_min,
         ctx.tilebase,
         ctx.ntile,
         ctx.vbase,
@@ -2554,8 +2552,11 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     )
 
   # each size class only when some group has it (one-tile groups nearly always: no conditional)
-  dense_factor(1)
-  for cls, launch in ((2, lambda: dense_factor(2)), (3, blocked_factor)):
+  # one-tile groups at half a tile, at the dense row width (single trees) and at a full tile
+  sizes = sorted({_TILE // 2, min(max(g.J.shape[2], _TILE // 2), _TILE), _TILE})
+  for lo, size in zip([0] + sizes[:-1], sizes):
+    dense_factor(1, size, lo)
+  for cls, launch in ((2, lambda: dense_factor(2, 2 * _TILE, 0)), (3, blocked_factor)):
     if m.opt.graph_conditional:
       wp.capture_if(ctx.group_count[cls : cls + 1], on_true=launch)
     else:
