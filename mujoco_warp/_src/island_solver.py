@@ -1304,8 +1304,13 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
     row_jv_out: wp.array2d[float],
     nsolving_out: wp.array[int],
     grad_scale_out: wp.array2d[float],
+    changed_out: wp.array2d[bool],
+    state_changed_out: wp.array2d[bool],
   ):
-    """Convergence test, linesearch and update of one group (see _linesearch_iterative_kernel)."""
+    """Convergence test, linesearch and update of one group (see _linesearch_iterative_kernel).
+
+    The group's change flags are read by now: cleared, for _rows to set at the new point.
+    """
     nthread = wp.block_dim()
     ndof = island_nv_in[worldid, islandid]
     nrow = island_nefc_in[worldid, islandid]
@@ -1565,6 +1570,8 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
       row_jaref_out[worldid, row] += alpha * row_jv_out[worldid, row]
     if lane == 0:
       niter_out[worldid, islandid] = niter + 1
+      changed_out[worldid, islandid] = False
+      state_changed_out[worldid, islandid] = False
       alpha_out[worldid, islandid] = alpha
       grad_scale_out[worldid, islandid] = grad_scale - alpha
       improvement_out[worldid, islandid] = improvement
@@ -1636,6 +1643,8 @@ def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: i
     row_jv_out: wp.array2d[float],
     nsolving_out: wp.array[int],
     grad_scale_out: wp.array2d[float],
+    changed_out: wp.array2d[bool],
+    state_changed_out: wp.array2d[bool],
   ):
     """Convergence test, linesearch and update of one island (see _linesearch_iterative_kernel)."""
     bid, lane = wp.tid()
@@ -1697,6 +1706,8 @@ def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: i
         row_jv_out,
         nsolving_out,
         grad_scale_out,
+        changed_out,
+        state_changed_out,
       )
 
   return kernel
@@ -1775,6 +1786,7 @@ def _solve_small(ls_iterations: int, warn_overflow: int):
     grad_scale_out: wp.array2d[float],
     row_quad_out: wp.array2d[bool],
     H_out: wp.array3d[float],
+    changed_out: wp.array2d[bool],
   ):
     """The whole Newton solve of one-tile groups (e.g. free bodies), one block per group.
 
@@ -1923,6 +1935,8 @@ def _solve_small(ls_iterations: int, warn_overflow: int):
           row_jv_out,
           nsolving_out,
           grad_scale_out,
+          changed_out,
+          state_changed_out,
         )
         _sync()
         if done_out[worldid, islandid]:
@@ -2332,9 +2346,6 @@ def _seed_pool(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
 
 def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers, initial: bool):
   """Constraint state at the current point, J'force of sparse islands and the H updates."""
-  if not initial:
-    ctx.state_changed.zero_()
-    ctx.changed.zero_()
   wp.launch(
     _rows(initial, m.opt.cone == types.ConeType.ELLIPTIC),
     dim=(d.nworld, _lanes(d.nworld, d.njmax)),
@@ -2451,10 +2462,12 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       sparse_h()
       dense_h(True)
 
-  if m.opt.graph_conditional:
-    wp.capture_if(ctx.group_count[5:6], on_true=h)
-  else:
-    h()
+  # H is assembled initially and, with elliptic cones, at every point; else _rows updates it
+  if initial or elliptic:
+    if m.opt.graph_conditional:
+      wp.capture_if(ctx.group_count[5:6], on_true=h)
+    else:
+      h()
 
 
 def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final: bool):
@@ -2540,8 +2553,9 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       block_dim=_ISLAND_THREADS,
     )
 
-  # each size class only when some group has it
-  for cls, launch in ((1, lambda: dense_factor(1)), (2, lambda: dense_factor(2)), (3, blocked_factor)):
+  # each size class only when some group has it (one-tile groups nearly always: no conditional)
+  dense_factor(1)
+  for cls, launch in ((2, lambda: dense_factor(2)), (3, blocked_factor)):
     if m.opt.graph_conditional:
       wp.capture_if(ctx.group_count[cls : cls + 1], on_true=launch)
     else:
@@ -2605,6 +2619,8 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.row_jv,
       ctx.nsolving,
       ctx.grad_scale,
+      ctx.changed,
+      ctx.state_changed,
     ],
     block_dim=_LINESEARCH_THREADS,
   )
@@ -2754,6 +2770,7 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
         ctx.grad_scale,
         ctx.row_quad,
         ctx.H,
+        ctx.changed,
       ],
       block_dim=_LINESEARCH_THREADS,
     )
