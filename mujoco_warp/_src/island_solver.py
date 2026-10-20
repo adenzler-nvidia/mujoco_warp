@@ -219,10 +219,9 @@ def _group_lists(
 ):
   """Compacted lists of the groups that exist, by solve path, and the tiles of the own groups.
 
-  Lists 0-3: the island solver's groups (all, and by tiles per side: 1, 2, >= 3; counts 5 and 7
-  are the same as count 0). List 6: groups with dense rows on the dense world solver
-  (island.DENSE_SOLVER, see _solve_dense), problem index in group_problem; done for the island
-  solver.
+  Lists 0-3: the island solver's groups (all, and by tiles per side: 1, 2, >= 3). List 6: groups
+  with dense rows on the dense world solver (island.DENSE_SOLVER, see _solve_dense), problem index
+  in group_problem; done for the island solver.
   """
   worldid, g = wp.tid()
   ntile_out[worldid, g] = 0
@@ -241,8 +240,6 @@ def _group_lists(
     done_out[worldid, g] = True
     return
   group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed
-  wp.atomic_add(group_count_out, 5, 1)
-  wp.atomic_add(group_count_out, 7, 1)
   ntile = _ntile(group_nv_in[worldid, g])
   ntile_out[worldid, g] = ntile
   c = wp.min(ntile, 3)
@@ -876,7 +873,6 @@ def _done(warn_overflow: int):
     # In:
     group_count_in: wp.array[int],
     group_list_in: wp.array2d[int],
-    nblock: int,
     group_nv_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     scale_in: wp.array2d[float],
@@ -893,50 +889,49 @@ def _done(warn_overflow: int):
     done_out: wp.array2d[bool],
     nsolving_out: wp.array[int],
   ):
-    """Convergence test of the groups still iterating, as _solve_done for a world; counts the rest.
+    """Convergence test of a group still iterating, a thread per group, as _solve_done per world.
 
     While a group's states hold, its gradient and Newton decrement are grad_scale times the stored
-    ones (the stable-state fast path).
+    ones (the stable-state fast path). Counts the groups still iterating.
     """
-    bid, lane = wp.tid()
-    for e in range(bid, group_count_in[0], nblock):
-      worldid = group_list_in[0, e] // ntree
-      g = group_list_in[0, e] % ntree
-      if done_out[worldid, g]:
-        continue
-      niter = niter_in[worldid, g]
+    e = wp.tid()
+    if e >= group_count_in[0]:
+      return
+    worldid = group_list_in[0, e] // ntree
+    g = group_list_in[0, e] % ntree
+    if done_out[worldid, g]:
+      return
+    niter = niter_in[worldid, g]
+    converged = False
+    if niter > 0:
       vbase = vbase_in[worldid, g]
       grad_scale = grad_scale_in[worldid, g]
       grad_dot = float(0.0)
-      for la in range(lane, group_nv_in[worldid, g], wp.block_dim()):
+      for la in range(group_nv_in[worldid, g]):
         grad_dot += grad_in[worldid, vbase + la] * grad_in[worldid, vbase + la]
-      grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0] * grad_scale * grad_scale
-      if lane != 0:
-        continue
+      grad_dot *= grad_scale * grad_scale
       scale = scale_in[worldid, g]
       tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
-      converged = False
-      if niter > 0:
-        improvement = improvement_in[worldid, g]
-        converged = (
-          (alpha_in[worldid, g] == 0.0)
-          or (improvement > 0.0 and improvement / scale < tolerance)
-          or (wp.sqrt(grad_dot) / scale < tolerance)
-          or (0.5 * newton_decrement_in[worldid, g] * grad_scale * grad_scale / scale < tolerance)
-        )
-      if converged or niter >= opt_iterations:
-        done_out[worldid, g] = True
-        if not converged and opt_iterations > 0:
-          if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
-            wp.printf(
-              "solver iterations limit reached - please increase iterations beyond %u\n"
-              "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)\n",
-              opt_iterations,
-            )
-          wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
-        wp.atomic_max(solver_niter_out, worldid, niter)
-      else:
-        wp.atomic_add(nsolving_out, 0, 1)
+      improvement = improvement_in[worldid, g]
+      converged = (
+        (alpha_in[worldid, g] == 0.0)
+        or (improvement > 0.0 and improvement / scale < tolerance)
+        or (wp.sqrt(grad_dot) / scale < tolerance)
+        or (0.5 * newton_decrement_in[worldid, g] * grad_scale * grad_scale / scale < tolerance)
+      )
+    if converged or niter >= opt_iterations:
+      done_out[worldid, g] = True
+      if not converged and opt_iterations > 0:
+        if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
+          wp.printf(
+            "solver iterations limit reached - please increase iterations beyond %u\n"
+            "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)\n",
+            opt_iterations,
+          )
+        wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
+      wp.atomic_max(solver_niter_out, worldid, niter)
+    else:
+      wp.atomic_add(nsolving_out, 0, 1)
 
   return kernel
 
@@ -2264,7 +2259,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
   # H is assembled initially and, with elliptic cones, at every point; else _rows updates it
   if initial or elliptic:
     if m.opt.graph_conditional:
-      wp.capture_if(ctx.group_count[5:6], on_true=h)
+      wp.capture_if(ctx.group_count[0:1], on_true=h)
     else:
       h()
 
@@ -2365,16 +2360,15 @@ def _direction(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
 def _launch_done(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
   ctx.nsolving.zero_()
   nrow = ctx.qacc.shape[1]
-  wp.launch_tiled(
+  wp.launch(
     _done(int(m.opt.warn_overflow)),
-    dim=_nblock(2),
+    dim=d.nworld * m.ntree,
     inputs=[
       m.ntree,
       m.opt.tolerance,
       m.opt.iterations,
       ctx.group_count,
       ctx.group_list,
-      _nblock(2),
       g.group_nv,
       ctx.vbase,
       ctx.scale,
@@ -2386,7 +2380,6 @@ def _launch_done(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
       ctx.newton_decrement,
     ],
     outputs=[d.solver_niter, d.overflow, ctx.done, ctx.nsolving],
-    block_dim=_LINESEARCH_THREADS,
   )
 
 
@@ -2583,7 +2576,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done, ctx.ntile],
   )
   if m.opt.graph_conditional:
-    wp.capture_if(ctx.group_count[7:8], on_true=lambda: _solve_own(m, d, ctx, g))
+    wp.capture_if(ctx.group_count[0:1], on_true=lambda: _solve_own(m, d, ctx, g))
   else:
     _solve_own(m, d, ctx, g)
 
