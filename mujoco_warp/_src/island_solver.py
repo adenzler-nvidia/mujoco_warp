@@ -280,13 +280,13 @@ def _gather_dofs(
 
 @cache_kernel
 def _init_rows(width: int):
-  """width: of the dense rows (static: the loop over a row unrolls; rows are zero past a group).
+  """width: of the dense rows (rows are zero past a group).
 
-  A dense row loads as vec4s (the width is a multiple of 4, see io._island_tree_nv): the strided
-  scalar loads of a row per thread miss L1.
+  The loop over a row unrolls (max_unroll, 16 by default, would keep a loop over 28 columns
+  dynamic), so a row's loads are in flight together.
   """
 
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, module_options={"max_unroll": width})
   def kernel(
     # Data in:
     nefc_in: wp.array[int],
@@ -317,16 +317,8 @@ def _init_rows(width: int):
       jaref = -efc_aref_in[worldid, row]
       if block[0] > 0:
         vbase = vbase_in[worldid, islandid]
-        J4 = wp.array(ptr=iJ_in[worldid, row].ptr, shape=(wp.static(width // 4),), dtype=wp.vec4)
-        for c in range(wp.static(width // 4)):
-          j = J4[c]
-          q = vbase + 4 * c
-          jaref += (
-            j[0] * iqacc_in[worldid, q]
-            + j[1] * iqacc_in[worldid, q + 1]
-            + j[2] * iqacc_in[worldid, q + 2]
-            + j[3] * iqacc_in[worldid, q + 3]
-          )
+        for c in range(wp.static(width)):
+          jaref += iJ_in[worldid, row, c] * iqacc_in[worldid, vbase + c]
       else:
         rowadr = efc_J_rowadr_in[worldid, row]
         for k in range(efc_J_rownnz_in[worldid, row]):
@@ -1434,7 +1426,8 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
         jv = row_jv_out[worldid, row]
       else:
         if block[0] > 0:
-          # rows are zero past a group's columns: a static loop unrolls
+          # rows are zero past a group's columns. A dynamic loop (beyond max_unroll): unrolled, it
+          # was slower
           for c in range(wp.static(WIDTH)):
             jv += iJ_in[worldid, row, c] * search[vbase + c]
         else:
