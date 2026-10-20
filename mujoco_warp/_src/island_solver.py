@@ -866,6 +866,82 @@ def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
 
 
 @cache_kernel
+def _done(warn_overflow: int):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    ntree: int,
+    opt_tolerance: wp.array[float],
+    opt_iterations: int,
+    # In:
+    group_count_in: wp.array[int],
+    group_list_in: wp.array2d[int],
+    nblock: int,
+    group_nv_in: wp.array2d[int],
+    vbase_in: wp.array2d[int],
+    scale_in: wp.array2d[float],
+    niter_in: wp.array2d[int],
+    alpha_in: wp.array2d[float],
+    improvement_in: wp.array2d[float],
+    grad_in: wp.array2d[float],
+    grad_scale_in: wp.array2d[float],
+    newton_decrement_in: wp.array2d[float],
+    # Data out:
+    solver_niter_out: wp.array[int],
+    overflow_out: wp.array[int],
+    # Out:
+    done_out: wp.array2d[bool],
+    nsolving_out: wp.array[int],
+  ):
+    """Convergence test of the groups still iterating, as _solve_done for a world; counts the rest.
+
+    While a group's states hold, its gradient and Newton decrement are grad_scale times the stored
+    ones (the stable-state fast path).
+    """
+    bid, lane = wp.tid()
+    for e in range(bid, group_count_in[0], nblock):
+      worldid = group_list_in[0, e] // ntree
+      g = group_list_in[0, e] % ntree
+      if done_out[worldid, g]:
+        continue
+      niter = niter_in[worldid, g]
+      vbase = vbase_in[worldid, g]
+      grad_scale = grad_scale_in[worldid, g]
+      grad_dot = float(0.0)
+      for la in range(lane, group_nv_in[worldid, g], wp.block_dim()):
+        grad_dot += grad_in[worldid, vbase + la] * grad_in[worldid, vbase + la]
+      grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0] * grad_scale * grad_scale
+      if lane != 0:
+        continue
+      scale = scale_in[worldid, g]
+      tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
+      converged = False
+      if niter > 0:
+        improvement = improvement_in[worldid, g]
+        converged = (
+          (alpha_in[worldid, g] == 0.0)
+          or (improvement > 0.0 and improvement / scale < tolerance)
+          or (wp.sqrt(grad_dot) / scale < tolerance)
+          or (0.5 * newton_decrement_in[worldid, g] * grad_scale * grad_scale / scale < tolerance)
+        )
+      if converged or niter >= opt_iterations:
+        done_out[worldid, g] = True
+        if not converged and opt_iterations > 0:
+          if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
+            wp.printf(
+              "solver iterations limit reached - please increase iterations beyond %u\n"
+              "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)\n",
+              opt_iterations,
+            )
+          wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
+        wp.atomic_max(solver_niter_out, worldid, niter)
+      else:
+        wp.atomic_add(nsolving_out, 0, 1)
+
+  return kernel
+
+
+@cache_kernel
 def _grad(final: bool):
   FINAL = final
 
@@ -895,7 +971,8 @@ def _grad(final: bool):
     """J'force (dense rows) and the gradient of a group, a warp per group and a lane per column.
 
     As _update_constraint_init_qfrc_constraint_dense and _update_gradient_grad for a world; sparse
-    rows' J'force is accumulated by _rows. The final pass only forms J'force (qfrc_constraint).
+    rows' J'force is accumulated by _rows. The final pass forms J'force (qfrc_constraint) where the
+    last iteration skipped it.
     """
     slot, lane = wp.tid()
     for e in range(slot, group_count_in[0], nblock):
@@ -906,7 +983,8 @@ def _grad(final: bool):
           continue
       block = group_slot_in[worldid, g]
       if wp.static(FINAL):
-        if block[0] == 0:
+        # J'force is at the solution unless the last iteration was stable (it skips J'force)
+        if block[0] == 0 or not _stable(niter_in[worldid, g], state_changed_in[worldid, g]):
           continue
       vbase = vbase_in[worldid, g]
       for col in range(lane, ntile_in[worldid, g] * _TILE, _TILE):
@@ -1293,35 +1371,9 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
     ls_tolerance = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
     niter = niter_out[worldid, islandid]
 
-    # --- termination (see _solve_done); the gradient is grad_scale * the stored one ---
+    # the gradient is grad_scale * the stored one while the states hold (see _done)
     stable = _stable(niter, state_changed_in[worldid, islandid])
     grad_scale = grad_scale_out[worldid, islandid]
-    grad_dot = float(0.0)
-    for la in range(lane, ndof, nthread):
-      grad_dot += grad_in[worldid, vbase + la] * grad_in[worldid, vbase + la]
-    grad_dot = wp.tile_reduce(wp.add, wp.tile(grad_dot))[0] * grad_scale * grad_scale
-    converged = False
-    if niter > 0:
-      improvement = improvement_out[worldid, islandid]
-      converged = (
-        (alpha_out[worldid, islandid] == 0.0)
-        or (improvement > 0.0 and improvement / scale < tolerance)
-        or (wp.sqrt(grad_dot) / scale < tolerance)
-        or (0.5 * newton_decrement_in[worldid, islandid] * grad_scale * grad_scale / scale < tolerance)
-      )
-    if converged or niter >= opt_iterations:
-      if lane == 0:
-        done_out[worldid, islandid] = True
-        if not converged and opt_iterations > 0:
-          if wp.static(bool(warn_overflow & OverflowType.ITERATIONS)):
-            wp.printf(
-              "solver iterations limit reached - please increase iterations beyond %u\n"
-              "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)\n",
-              opt_iterations,
-            )
-          wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
-        wp.atomic_max(solver_niter_out, worldid, niter)
-      return
 
     # --- linesearch along search ---
     search = search_in[worldid]
@@ -1544,7 +1596,6 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
       alpha_out[worldid, islandid] = alpha
       grad_scale_out[worldid, islandid] = grad_scale - alpha
       improvement_out[worldid, islandid] = improvement
-      wp.atomic_add(nsolving_out, 0, 1)
 
   return step
 
@@ -2238,9 +2289,9 @@ def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final
   )
 
 
-def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
+def _direction(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
+  """Gradient and Newton direction at the current point (as the world solver's _update_gradient)."""
   nrow = ctx.qacc.shape[1]
-  ctx.nsolving.zero_()
   _launch_grad(d, ctx, g, final=False)
 
   def dense_factor(ntile: int):
@@ -2301,6 +2352,38 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     else:
       launch()
 
+
+def _launch_done(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
+  ctx.nsolving.zero_()
+  nrow = ctx.qacc.shape[1]
+  wp.launch_tiled(
+    _done(int(m.opt.warn_overflow)),
+    dim=_nblock(2),
+    inputs=[
+      m.ntree,
+      m.opt.tolerance,
+      m.opt.iterations,
+      ctx.group_count,
+      ctx.group_list,
+      _nblock(2),
+      g.group_nv,
+      ctx.vbase,
+      ctx.scale,
+      ctx.niter,
+      ctx.alpha,
+      ctx.improvement,
+      ctx.grad.reshape((d.nworld, nrow)),
+      ctx.grad_scale,
+      ctx.newton_decrement,
+    ],
+    outputs=[d.solver_niter, d.overflow, ctx.done, ctx.nsolving],
+    block_dim=_LINESEARCH_THREADS,
+  )
+
+
+def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
+  """A Newton iteration, as the world solver's: linesearch, constraints, direction, done test."""
+  nrow = ctx.qacc.shape[1]
   wp.launch_tiled(
     _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow), m.opt.cone == types.ConeType.ELLIPTIC, g.J.shape[2]),
     dim=_nblock(2),
@@ -2364,8 +2447,9 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     ],
     block_dim=_LINESEARCH_THREADS,
   )
-  # constraint evaluation at the updated point, for the next iteration
   _evaluate(m, d, ctx, g, initial=False)
+  _direction(m, d, ctx, g)
+  _launch_done(m, d, ctx, g)
 
 
 def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
@@ -2440,18 +2524,19 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     outputs=[ctx.Ma, ctx.scale, ctx.done, ctx.niter, ctx.alpha, ctx.improvement, ctx.nsolving],
     block_dim=_ISLAND_THREADS,
   )
-  # initial constraint evaluation; H = M + J'DJ over the quadratic rows
+  # initial constraint evaluation (H = M + J'DJ over the quadratic rows), direction and done test
   _evaluate(m, d, ctx, g, initial=True)
+  _direction(m, d, ctx, g)
+  _launch_done(m, d, ctx, g)
 
-  # each body ends with ctx.nsolving = the number of islands still iterating
+  # each iteration ends with ctx.nsolving = the number of islands still iterating
   if m.opt.graph_conditional:
     wp.capture_while(ctx.nsolving, while_body=_iteration, m=m, d=d, ctx=ctx, g=g)
   else:
-    # the last pass only marks islands at the iteration limit as done
-    for _ in range(m.opt.iterations + 1):
+    for _ in range(m.opt.iterations):
       _iteration(m, d, ctx, g)
 
-  # J'force at the solution (stable iterations skip it), then scatter back
+  # J'force where the last iteration skipped it, then scatter back
   _launch_grad(d, ctx, g, final=True)
   wp.launch(
     _scatter_dofs,
