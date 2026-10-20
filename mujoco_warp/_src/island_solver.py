@@ -216,6 +216,7 @@ def _group_lists(
   group_problem_out: wp.array2d[int],
   done_out: wp.array2d[bool],
   ntile_out: wp.array2d[int],
+  scale_out: wp.array2d[float],
 ):
   """Compacted lists of the groups that exist, by solve path, and the tiles of the own groups.
 
@@ -225,6 +226,7 @@ def _group_lists(
   """
   worldid, g = wp.tid()
   ntile_out[worldid, g] = 0
+  scale_out[worldid, g] = 0.0
   if g >= ngroup_in[worldid]:
     return
   packed = worldid * ntree + g
@@ -429,16 +431,11 @@ def _init_islands(
   M_mulm_col: wp.array[int],
   M_mulm_madr: wp.array[int],
   # Data in:
-  nisland_in: wp.array[int],
   M_in: wp.array2d[float],
   island_nv_in: wp.array2d[int],
   # In:
   group_count_in: wp.array[int],
   group_list_in: wp.array2d[int],
-  cls: int,
-  nblock: int,
-  tilebase_in: wp.array2d[int],
-  ntile_in: wp.array2d[int],
   vbase_in: wp.array2d[int],
   iqacc_in: wp.array2d[float],
   row2dof_in: wp.array2d[int],
@@ -449,42 +446,36 @@ def _init_islands(
   niter_out: wp.array2d[int],
   alpha_out: wp.array2d[float],
   improvement_out: wp.array2d[float],
-  nsolving_out: wp.array[int],
 ):
-  """Start every island: M qacc and its convergence scale (the inertia trace); H = M is seeded."""
-  bid, lane = wp.tid()
-  for e in range(bid, group_count_in[cls], nblock):
-    worldid = group_list_in[cls, e] // ntree
-    islandid = group_list_in[cls, e] % ntree
-    if islandid >= nisland_in[worldid]:
-      if lane == 0:
-        done_out[worldid, islandid] = True
-      continue
-    nthread = wp.block_dim()
-    ndof = island_nv_in[worldid, islandid]
-    tilebase = tilebase_in[worldid, islandid]
-    ntile = ntile_in[worldid, islandid]
-    vbase = vbase_in[worldid, islandid]
-    trace = float(0.0)
-    for la in range(lane, ndof, nthread):
-      # sparse M: a group's DOFs are whole trees in order (column col of DOF dof: row + col - dof)
-      row = vbase + la
-      dof = row2dof_in[worldid, row]
-      ma = float(0.0)
-      for k in range(M_mulm_rowadr[dof], M_mulm_rowadr[dof + 1]):
-        ma += M_in[worldid, M_mulm_madr[k]] * iqacc_in[worldid, row + M_mulm_col[k] - dof]
-      Ma_out[worldid, row] = ma
-      # the diagonal is the last entry of the row of the lower triangle
-      trace += M_in[worldid, M_rowadr[dof] + M_rownnz[dof] - 1]
-    # MuJoCo scales an island's convergence tests by its inertia trace instead of meaninertia * nv
-    trace = wp.tile_reduce(wp.add, wp.tile(trace))[0]
-    if lane == 0:
-      scale_out[worldid, islandid] = trace
-      done_out[worldid, islandid] = False
-      niter_out[worldid, islandid] = 0
-      alpha_out[worldid, islandid] = 0.0
-      improvement_out[worldid, islandid] = 0.0
-      wp.atomic_add(nsolving_out, 0, 1)
+  """Start a group, a thread per (group, DOF): M qacc and the convergence scale.
+
+  The scale is the inertia trace, summed into scale (zeroed by _group_lists).
+  """
+  e, lane = wp.tid()
+  if e >= group_count_in[0]:
+    return
+  worldid = group_list_in[0, e] // ntree
+  g = group_list_in[0, e] % ntree
+  if lane == 0:
+    done_out[worldid, g] = False
+    niter_out[worldid, g] = 0
+    alpha_out[worldid, g] = 0.0
+    improvement_out[worldid, g] = 0.0
+  vbase = vbase_in[worldid, g]
+  trace = float(0.0)
+  for la in range(lane, island_nv_in[worldid, g], _TILE):
+    # sparse M: a group's DOFs are whole trees in order (column col of DOF dof: row + col - dof)
+    row = vbase + la
+    dof = row2dof_in[worldid, row]
+    ma = float(0.0)
+    for k in range(M_mulm_rowadr[dof], M_mulm_rowadr[dof + 1]):
+      ma += M_in[worldid, M_mulm_madr[k]] * iqacc_in[worldid, row + M_mulm_col[k] - dof]
+    Ma_out[worldid, row] = ma
+    # the diagonal is the last entry of the row of the lower triangle
+    trace += M_in[worldid, M_rowadr[dof] + M_rownnz[dof] - 1]
+  # MuJoCo scales an island's convergence tests by its inertia trace instead of meaninertia * nv
+  if trace != 0.0:
+    wp.atomic_add(scale_out, worldid, g, trace)
 
 
 @wp.struct
@@ -686,24 +677,20 @@ def _rows(initial: bool, elliptic: bool):
 
 
 @wp.func
-def _row_weight(assemble: bool, D: float, state: int, row_w: float) -> float:
-  """A dense row's J'J weight: D if quadratic (assembly), else its flip weight (incremental)."""
-  if assemble:
-    return wp.where(state == types.ConstraintState.QUADRATIC.value, D, 0.0)
-  return row_w
+def _quad_weight(D: float, state: int) -> float:
+  return wp.where(state == types.ConstraintState.QUADRATIC.value, D, 0.0)
 
 
 @cache_kernel
-def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
-  """H += J'WJ over the dense rows of a group (one tile), as _update_gradient_JTDAJ_dense_tiled.
+def _dense_rows_h(width: int, elliptic: bool):
+  """H = M + J'DJ over the quadratic dense rows of a group, as _update_gradient_JTDAJ_dense_tiled.
 
-  assemble: W = D on quadratic rows (H = M + J'DJ, with the cone curvature of elliptic contacts),
-  for every group initially, else for the groups still iterating (elliptic cones: H at every
-  point). Else incremental: W = the flip weights of _rows, for the groups whose rows flipped.
+  With the cone curvature of elliptic contacts. For every group initially, else (elliptic cones: H
+  at every point) for the groups still iterating. Assembled at the row width W and stored into the
+  group's tile, the rest of which is identity padding.
   """
   W = width
   K = 16
-  ASSEMBLE = assemble
   ELLIPTIC = elliptic
 
   @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
@@ -738,8 +725,6 @@ def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
     vbase_in: wp.array2d[int],
     row2dof_in: wp.array2d[int],
     done_in: wp.array2d[bool],
-    changed_in: wp.array2d[bool],
-    row_w_in: wp.array2d[float],
     row_jaref_in: wp.array2d[float],
     iJ_in: wp.array3d[float],
     # Out:
@@ -756,9 +741,6 @@ def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
       if not initial:
         if done_in[worldid, g]:
           continue
-        if wp.static(not ASSEMBLE):
-          if not changed_in[worldid, g]:
-            continue
       rowadr = block[3]
       nrow = block[2]
       row0 = _TILE * tilebase_in[worldid, g]
@@ -766,48 +748,49 @@ def _dense_rows_h(width: int, assemble: bool, elliptic: bool):
       J = wp.array(ptr=iJ_in[worldid].ptr, shape=(rowadr + nrow, W), dtype=float)
       D = wp.array(ptr=efc_D_in[worldid].ptr, shape=(rowadr + nrow,), dtype=float)
       state = wp.array(ptr=efc_state_in[worldid].ptr, shape=(rowadr + nrow,), dtype=int)
-      rw = wp.array(ptr=row_w_in[worldid].ptr, shape=(rowadr + nrow,), dtype=float)
-      if wp.static(ASSEMBLE):
-        # M's upper triangle, tree by tree (a group's DOFs are whole trees in order, each tree's CSR
-        # entries contiguous); identity on padding. Uniform trip counts: the scatters are collective
-        m_tile = wp.tile_zeros(shape=(wp.static(_TILE * _TILE),), dtype=float, storage="shared")
-        ndof = group_nv_in[worldid, g]
-        vbase = vbase_in[worldid, g]
-        c = int(0)
-        while c < ndof:
-          tree = dof_treeid[row2dof_in[worldid, vbase + c]]
-          dofadr = tree_dofadr[tree]
-          last = dofadr + tree_dofnum[tree] - 1
-          beg = M_rowadr[dofadr]
-          nent = M_rowadr[last] + M_rownnz[last] - beg
-          base = c - dofadr
-          for it in range((nent + lanes - 1) // lanes):
-            ent = it * lanes + lane
-            enable = ent < nent
-            ec = beg + wp.where(enable, ent, 0)
-            pos = (M_colind[ec] + base) * _TILE + M_hinit_i[ec] + base
-            wp.tile_scatter_add(m_tile, pos, wp.where(enable, M_in[worldid, ec], 0.0), enable)
-          c += tree_dofnum[tree]
-        for it in range((_TILE + lanes - 1) // lanes):
-          i = it * lanes + lane
-          enable = i >= ndof and i < _TILE
-          wp.tile_scatter_add(m_tile, wp.where(enable, i * _TILE + i, 0), 1.0, enable)
-        h = wp.tile_reshape(m_tile, (_TILE, _TILE))
-      else:
-        h = wp.tile_load(H_out[worldid], shape=(_TILE, _TILE), offset=(row0, 0))
+      # M's upper triangle, tree by tree (a group's DOFs are whole trees in order, each tree's CSR
+      # entries contiguous); identity on padding. Uniform trip counts: the scatters are collective
+      m_tile = wp.tile_zeros(shape=(wp.static(W * W),), dtype=float, storage="shared")
+      ndof = group_nv_in[worldid, g]
+      vbase = vbase_in[worldid, g]
+      c = int(0)
+      while c < ndof:
+        tree = dof_treeid[row2dof_in[worldid, vbase + c]]
+        dofadr = tree_dofadr[tree]
+        last = dofadr + tree_dofnum[tree] - 1
+        beg = M_rowadr[dofadr]
+        nent = M_rowadr[last] + M_rownnz[last] - beg
+        base = c - dofadr
+        for it in range((nent + lanes - 1) // lanes):
+          ent = it * lanes + lane
+          enable = ent < nent
+          ec = beg + wp.where(enable, ent, 0)
+          pos = (M_colind[ec] + base) * W + M_hinit_i[ec] + base
+          wp.tile_scatter_add(m_tile, pos, wp.where(enable, M_in[worldid, ec], 0.0), enable)
+        c += tree_dofnum[tree]
+      for it in range((W + lanes - 1) // lanes):
+        i = it * lanes + lane
+        enable = i >= ndof and i < W
+        wp.tile_scatter_add(m_tile, wp.where(enable, i * W + i, 0), 1.0, enable)
+      h = wp.tile_reshape(m_tile, (W, W))
       for k in range(0, nrow, K):
-        J_k = wp.tile_load(J, shape=(K, _TILE), offset=(rowadr + k, 0), bounds_check=True)
-        w_k = wp.tile_map(
-          _row_weight,
-          wp.tile_full(shape=K, value=wp.static(ASSEMBLE), dtype=bool),
+        J_k = wp.tile_load(J, shape=(K, W), offset=(rowadr + k, 0), bounds_check=True)
+        D_k = wp.tile_map(
+          _quad_weight,
           wp.tile_load(D, shape=K, offset=rowadr + k, bounds_check=True),
           wp.tile_load(state, shape=K, offset=rowadr + k, bounds_check=True),
-          wp.tile_load(rw, shape=K, offset=rowadr + k, bounds_check=True),
         )
-        JW = wp.tile_map(wp.mul, wp.tile_transpose(J_k), wp.tile_broadcast(w_k, shape=(_TILE, K)))
-        h += wp.tile_matmul(JW, J_k)
+        JD = wp.tile_map(wp.mul, wp.tile_transpose(J_k), wp.tile_broadcast(D_k, shape=(W, K)))
+        h += wp.tile_matmul(JD, J_k)
       wp.tile_store(H_out[worldid], h, offset=(row0, 0))
-      if wp.static(ELLIPTIC and ASSEMBLE):
+      # the rest of the tile: identity on the padding diagonal
+      if wp.static(W < _TILE):
+        for idx in range(lane, wp.static(_TILE * _TILE), lanes):
+          r = idx // _TILE
+          c = idx % _TILE
+          if r >= W or c >= W:
+            H_out[worldid, row0 + r, c] = wp.where(r == c, 1.0, 0.0)
+      if wp.static(ELLIPTIC):
         _sync()
         # the cone curvature of the contacts in the cone (_update_gradient_JTCJ_dense); each lane
         # keeps its entries over the contacts
@@ -2207,9 +2190,9 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       else m.block_dim.update_gradient_JTDAJ_sparse,
     )
 
-  def dense_h(assemble: bool):
+  def dense_h():
     wp.launch_tiled(
-      _dense_rows_h(g.J.shape[2], assemble, elliptic),
+      _dense_rows_h(g.J.shape[2], elliptic),
       dim=_nblock(),
       inputs=[
         m.ntree,
@@ -2239,8 +2222,6 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
         ctx.vbase,
         ctx.row2dof,
         ctx.done,
-        ctx.changed,
-        ctx.row_w,
         ctx.row_jaref,
         g.J,
       ],
@@ -2254,7 +2235,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       _seed_pool(m, d, ctx, g, skip_done=True)
     if initial or elliptic:
       sparse_h()
-      dense_h(True)
+      dense_h()
 
   # H is assembled initially and, with elliptic cones, at every point; else _rows updates it
   if initial or elliptic:
@@ -2500,9 +2481,9 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     ],
     outputs=[ctx.row_jaref],
   )
-  wp.launch_tiled(
+  wp.launch(
     _init_islands,
-    dim=_nblock(),
+    dim=(d.nworld * m.ntree, _TILE),
     inputs=[
       m.ntree,
       m.M_rownnz,
@@ -2510,21 +2491,15 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       m.M_mulm_rowadr,
       m.M_mulm_col,
       m.M_mulm_madr,
-      g.ngroup,
       d.M,
       g.group_nv,
       ctx.group_count,
       ctx.group_list,
-      0,
-      _nblock(),
-      ctx.tilebase,
-      ctx.ntile,
       ctx.vbase,
       ctx.qacc,
       ctx.row2dof,
     ],
-    outputs=[ctx.Ma, ctx.scale, ctx.done, ctx.niter, ctx.alpha, ctx.improvement, ctx.nsolving],
-    block_dim=_ISLAND_THREADS,
+    outputs=[ctx.Ma, ctx.scale, ctx.done, ctx.niter, ctx.alpha, ctx.improvement],
   )
   # initial constraint evaluation (H = M + J'DJ over the quadratic rows), direction and done test
   _evaluate(m, d, ctx, g, initial=True)
@@ -2573,7 +2548,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     _group_lists,
     dim=(d.nworld, m.ntree),
     inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot, g.group_asleep, island.DENSE_SOLVER],
-    outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done, ctx.ntile],
+    outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done, ctx.ntile, ctx.scale],
   )
   if m.opt.graph_conditional:
     wp.capture_if(ctx.group_count[0:1], on_true=lambda: _solve_own(m, d, ctx, g))
