@@ -24,7 +24,6 @@ DOFs, islands and the tile pairs of each island's Hessian.
 """
 
 import dataclasses
-from typing import Any
 
 import warp as wp
 
@@ -354,11 +353,6 @@ def _sync():
   pass
 
 
-# a shared tile's element, without the barrier that tile element assignment ends with
-@wp.func_native(snippet="t.data(wp::tile_coord(i)) = v;")
-def _tile_setf(t: Any, i: int, v: float): ...
-
-
 @wp.kernel
 def _pool_seed(
   # Model:
@@ -401,11 +395,11 @@ def _pool_seed(
     if skip_done:
       if done_in[worldid, g]:
         continue
-    # one-tile groups: _dense_rows_h and _sparse_rows_h assemble H from M
-    ntile = ntile_in[worldid, g]
-    if ntile == 1:
+    # groups with dense rows: _dense_rows_h assembles H from M
+    if group_slot_in[worldid, g][0] > 0:
       continue
     n = island_nv_in[worldid, g]
+    ntile = ntile_in[worldid, g]
     tilebase = tilebase_in[worldid, g]
     vbase = vbase_in[worldid, g]
     for idx in range(lane, ntile * ntile * TILE2, nthread):
@@ -894,183 +888,6 @@ def _dense_rows_h(width: int, elliptic: bool):
               projection2 * inv_t,
               tangent_dot,
             )
-
-  return kernel
-
-
-@cache_kernel
-def _sparse_rows_h(elliptic: bool):
-  """H = M + J'DJ of a one-tile group with sparse rows, as _dense_rows_h.
-
-  The rows are scattered into a shared tile, K at a time, and multiplied as tiles (no atomics).
-  With the cone curvature of elliptic contacts over their support, as _JTDACJ_sparse.
-  """
-  K = 16
-  ELLIPTIC = elliptic
-
-  @wp.kernel(module="unique", enable_backward=False, module_options={"enable_mathdx_gemm": False})
-  def kernel(
-    # Model:
-    ntree: int,
-    opt_impratio_invsqrt: wp.array[float],
-    dof_treeid: wp.array[int],
-    tree_dofadr: wp.array[int],
-    tree_dofnum: wp.array[int],
-    M_rownnz: wp.array[int],
-    M_rowadr: wp.array[int],
-    M_colind: wp.array[int],
-    M_hinit_i: wp.array[int],
-    # Data in:
-    M_in: wp.array2d[float],
-    contact_friction_in: wp.array[types.vec5],
-    contact_dim_in: wp.array[int],
-    contact_efc_address_in: wp.array2d[int],
-    efc_type_in: wp.array2d[int],
-    efc_id_in: wp.array2d[int],
-    efc_J_rownnz_in: wp.array2d[int],
-    efc_J_rowadr_in: wp.array2d[int],
-    efc_J_colind_in: wp.array3d[int],
-    efc_J_in: wp.array3d[float],
-    efc_D_in: wp.array2d[float],
-    efc_state_in: wp.array2d[int],
-    # In:
-    group_count_in: wp.array[int],
-    group_list_in: wp.array2d[int],
-    nblock: int,
-    initial: bool,
-    group_slot_in: wp.array2d[wp.vec4i],
-    group_nv_in: wp.array2d[int],
-    tilebase_in: wp.array2d[int],
-    vbase_in: wp.array2d[int],
-    row2dof_in: wp.array2d[int],
-    dof2row_in: wp.array2d[int],
-    done_in: wp.array2d[bool],
-    row_jaref_in: wp.array2d[float],
-    # Out:
-    H_out: wp.array3d[float],
-  ):
-    bid, lane = wp.tid()
-    lanes = wp.block_dim()
-    jflat = wp.tile_zeros(shape=(wp.static(K * _TILE),), dtype=float, storage="shared")
-    for e in range(bid, group_count_in[1], nblock):
-      worldid = group_list_in[1, e] // ntree
-      g = group_list_in[1, e] % ntree
-      block = group_slot_in[worldid, g]
-      if block[0] > 0:
-        continue
-      if not initial:
-        if done_in[worldid, g]:
-          continue
-      rowadr = block[3]
-      nrow = block[2]
-      row0 = _TILE * tilebase_in[worldid, g]
-      vbase = vbase_in[worldid, g]
-      D = wp.array(ptr=efc_D_in[worldid].ptr, shape=(rowadr + nrow,), dtype=float)
-      state = wp.array(ptr=efc_state_in[worldid].ptr, shape=(rowadr + nrow,), dtype=int)
-      # M's upper triangle, tree by tree, identity on padding, as _dense_rows_h
-      m_tile = wp.tile_zeros(shape=(wp.static(_TILE * _TILE),), dtype=float, storage="shared")
-      ndof = group_nv_in[worldid, g]
-      c = int(0)
-      while c < ndof:
-        tree = dof_treeid[row2dof_in[worldid, vbase + c]]
-        dofadr = tree_dofadr[tree]
-        last = dofadr + tree_dofnum[tree] - 1
-        beg = M_rowadr[dofadr]
-        nent = M_rowadr[last] + M_rownnz[last] - beg
-        base = c - dofadr
-        for it in range((nent + lanes - 1) // lanes):
-          ent = it * lanes + lane
-          enable = ent < nent
-          ec = beg + wp.where(enable, ent, 0)
-          pos = (M_colind[ec] + base) * _TILE + M_hinit_i[ec] + base
-          wp.tile_scatter_add(m_tile, pos, wp.where(enable, M_in[worldid, ec], 0.0), enable)
-        c += tree_dofnum[tree]
-      for it in range((_TILE + lanes - 1) // lanes):
-        i = it * lanes + lane
-        enable = i >= ndof and i < _TILE
-        wp.tile_scatter_add(m_tile, wp.where(enable, i * _TILE + i, 0), 1.0, enable)
-      h = wp.tile_reshape(m_tile, (_TILE, _TILE))
-      # lanes per row of a chunk
-      lpr = lanes // K
-      for k in range(0, nrow, K):
-        _sync()
-        for i in range(lane, wp.static(K * _TILE), lanes):
-          _tile_setf(jflat, i, 0.0)
-        _sync()
-        r = lane // lpr
-        row = rowadr + k + r
-        if r < K and k + r < nrow:
-          adr = efc_J_rowadr_in[worldid, row]
-          for q in range(lane % lpr, efc_J_rownnz_in[worldid, row], lpr):
-            col = dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr + q]] - vbase
-            _tile_setf(jflat, r * _TILE + col, efc_J_in[worldid, 0, adr + q])
-        _sync()
-        J_k = wp.tile_reshape(jflat, (K, _TILE))
-        D_k = wp.tile_map(
-          _quad_weight,
-          wp.tile_load(D, shape=K, offset=rowadr + k, bounds_check=True),
-          wp.tile_load(state, shape=K, offset=rowadr + k, bounds_check=True),
-        )
-        JD = wp.tile_map(wp.mul, wp.tile_transpose(J_k), wp.tile_broadcast(D_k, shape=(_TILE, K)))
-        h += wp.tile_matmul(JD, J_k)
-      wp.tile_store(H_out[worldid], h, offset=(row0, 0))
-      if wp.static(ELLIPTIC):
-        _sync()
-        # the cone curvature of the contacts in the cone (_update_gradient_JTCJ_sparse): a
-        # contact's rows share their columns; entries of different contacts can coincide
-        for r in range(nrow):
-          efcid0 = rowadr + r
-          if efc_type_in[worldid, efcid0] != types.ConstraintType.CONTACT_ELLIPTIC:
-            continue
-          if efc_state_in[worldid, efcid0] != types.ConstraintState.CONE:
-            continue
-          conid = efc_id_in[worldid, efcid0]
-          if contact_efc_address_in[conid, 0] != efcid0:
-            continue
-          condim = contact_dim_in[conid]
-          fri = contact_friction_in[conid]
-          mu = fri[0] * opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
-          mu2 = mu * mu
-          dm = math.safe_div(efc_D_in[worldid, efcid0], mu2 * (1.0 + mu2))
-          n = row_jaref_in[worldid, efcid0] * mu
-          tt = float(0.0)
-          for dim in range(1, condim):
-            u = row_jaref_in[worldid, contact_efc_address_in[conid, dim]] * fri[dim - 1]
-            tt += u * u
-          inv_t = math.safe_div(1.0, wp.max(wp.sqrt(tt), types.MJ_MINVAL))
-          mu_n_over_t = mu * n * inv_t
-          adr0 = efc_J_rowadr_in[worldid, efcid0]
-          support = efc_J_rownnz_in[worldid, efcid0]
-          for entry in range(lane, support * support, lanes):
-            p1 = entry // support
-            p2 = entry % support
-            projection1 = float(0.0)
-            projection2 = float(0.0)
-            tangent_dot = float(0.0)
-            for dim in range(1, condim):
-              efcid = contact_efc_address_in[conid, dim]
-              adr = efc_J_rowadr_in[worldid, efcid]
-              scale = fri[dim - 1]
-              u = row_jaref_in[worldid, efcid] * scale
-              z1 = scale * efc_J_in[worldid, 0, adr + p1]
-              z2 = scale * efc_J_in[worldid, 0, adr + p2]
-              projection1 += u * z1
-              projection2 += u * z2
-              tangent_dot += z1 * z2
-            a = dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr0 + p1]] - vbase
-            b = dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr0 + p2]] - vbase
-            hval = _elliptic_hessian_entry_from_projections(
-              dm,
-              mu,
-              mu_n_over_t,
-              mu2 - mu_n_over_t,
-              mu * efc_J_in[worldid, 0, adr0 + p1],
-              mu * efc_J_in[worldid, 0, adr0 + p2],
-              projection1 * inv_t,
-              projection2 * inv_t,
-              tangent_dot,
-            )
-            wp.atomic_add(H_out[worldid, row0 + a], b, hval)
 
   return kernel
 
@@ -2405,7 +2222,6 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
         _jtdaj_groups_per_world(d.nworld, d.njmax),
         g.efc_group,
         ctx.done,
-        ctx.ntile,
       ],
       outputs=[ctx.H],
       # elliptic: one block per constraint group (the cone terms are shared per block)
@@ -2453,49 +2269,6 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       block_dim=_ISLAND_THREADS,
     )
 
-  def tile_h():
-    wp.launch_tiled(
-      _sparse_rows_h(elliptic),
-      dim=_nblock(),
-      inputs=[
-        m.ntree,
-        m.opt.impratio_invsqrt,
-        m.dof_treeid,
-        m.tree_dofadr,
-        m.tree_dofnum,
-        m.M_rownnz,
-        m.M_rowadr,
-        m.M_colind,
-        m.M_hinit_i,
-        d.M,
-        d.contact.friction,
-        d.contact.dim,
-        d.contact.efc_address,
-        d.efc.type,
-        d.efc.id,
-        d.efc.J_rownnz,
-        d.efc.J_rowadr,
-        d.efc.J_colind,
-        d.efc.J,
-        d.efc.D,
-        d.efc.state,
-        ctx.group_count,
-        ctx.group_list,
-        _nblock(),
-        initial,
-        g.group_slot,
-        g.group_nv,
-        ctx.tilebase,
-        ctx.vbase,
-        ctx.row2dof,
-        ctx.dof2row,
-        ctx.done,
-        ctx.row_jaref,
-      ],
-      outputs=[ctx.H],
-      block_dim=_ISLAND_THREADS,
-    )
-
   def h():
     # elliptic cones: H at every point (the cone curvature depends on jaref)
     if not initial and elliptic:
@@ -2503,7 +2276,6 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
     if initial or elliptic:
       sparse_h()
       dense_h()
-      tile_h()
 
   # H is assembled initially and, with elliptic cones, at every point; else _rows updates it
   if initial or elliptic:
