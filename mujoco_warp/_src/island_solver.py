@@ -285,6 +285,62 @@ def _init_rows(width: int):
   return kernel
 
 
+@cache_kernel
+def _jv(width: int):
+  """J search of a row for the linesearch, a thread per row as _linesearch_jv_fused_kernel.
+
+  Groups whose rows kept their states keep it (the search direction is unchanged). The loop over a
+  dense row unrolls, as in _init_rows.
+  """
+
+  @wp.kernel(module="unique", enable_backward=False, module_options={"max_unroll": width})
+  def kernel(
+    # Data in:
+    nefc_in: wp.array[int],
+    efc_J_rownnz_in: wp.array2d[int],
+    efc_J_rowadr_in: wp.array2d[int],
+    efc_J_colind_in: wp.array3d[int],
+    efc_J_in: wp.array3d[float],
+    efc_island_in: wp.array2d[int],
+    # In:
+    island_slot_in: wp.array2d[wp.vec4i],
+    ntile_in: wp.array2d[int],
+    vbase_in: wp.array2d[int],
+    dof2row_in: wp.array2d[int],
+    iJ_in: wp.array3d[float],
+    search_in: wp.array2d[float],
+    done_in: wp.array2d[bool],
+    niter_in: wp.array2d[int],
+    state_changed_in: wp.array2d[bool],
+    # Out:
+    row_jv_out: wp.array2d[float],
+  ):
+    worldid, row = wp.tid()
+    if row >= wp.min(nefc_in[worldid], row_jv_out.shape[1]):
+      return
+    g = efc_island_in[worldid, row]
+    if g < 0:
+      return
+    # the island solver's own groups only
+    if ntile_in[worldid, g] == 0:
+      return
+    if done_in[worldid, g] or _stable(niter_in[worldid, g], state_changed_in[worldid, g]):
+      return
+    jv = float(0.0)
+    if island_slot_in[worldid, g][0] > 0:
+      vbase = vbase_in[worldid, g]
+      for c in range(wp.static(width)):
+        jv += iJ_in[worldid, row, c] * search_in[worldid, vbase + c]
+    else:
+      rowadr = efc_J_rowadr_in[worldid, row]
+      for k in range(efc_J_rownnz_in[worldid, row]):
+        adr = rowadr + k
+        jv += efc_J_in[worldid, 0, adr] * search_in[worldid, dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
+    row_jv_out[worldid, row] = jv
+
+  return kernel
+
+
 @wp.func
 def _block_matvec(
   # In:
@@ -1283,28 +1339,17 @@ def _cone_pt(
 
 
 @cache_kernel
-def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: int):
+def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool):
   LS_ITERATIONS = ls_iterations
   ELLIPTIC = elliptic
-  WIDTH = width
 
   @wp.func
   def step(
     # Model:
     opt_tolerance: wp.array[float],
     opt_ls_tolerance: wp.array[float],
-    opt_iterations: int,
-    M_mulm_rowadr: wp.array[int],
-    M_mulm_col: wp.array[int],
-    M_mulm_madr: wp.array[int],
     # Data in:
-    nisland_in: wp.array[int],
-    M_in: wp.array2d[float],
     efc_type_in: wp.array2d[int],
-    efc_J_rownnz_in: wp.array2d[int],
-    efc_J_rowadr_in: wp.array2d[int],
-    efc_J_colind_in: wp.array3d[int],
-    efc_J_in: wp.array3d[float],
     efc_D_in: wp.array2d[float],
     efc_frictionloss_in: wp.array2d[float],
     island_nv_in: wp.array2d[int],
@@ -1314,26 +1359,16 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
     worldid: int,
     islandid: int,
     lane: int,
-    tilebase_in: wp.array2d[int],
-    ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     scale_in: wp.array2d[float],
     iqfrc_smooth_in: wp.array2d[float],
-    row2dof_in: wp.array2d[int],
     search_in: wp.array2d[float],
     island_slot_in: wp.array2d[wp.vec4i],
-    dof2row_in: wp.array2d[int],
-    iJ_in: wp.array3d[float],
-    grad_in: wp.array2d[float],
     search_dot_in: wp.array2d[float],
-    newton_decrement_in: wp.array2d[float],
-    state_changed_in: wp.array2d[bool],
     cones: _ConeData,
     # Data out:
-    solver_niter_out: wp.array[int],
     overflow_out: wp.array[int],
     # Out:
-    done_out: wp.array2d[bool],
     niter_out: wp.array2d[int],
     alpha_out: wp.array2d[float],
     improvement_out: wp.array2d[float],
@@ -1343,7 +1378,6 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
     mv_out: wp.array2d[float],
     row_jaref_out: wp.array2d[float],
     row_jv_out: wp.array2d[float],
-    nsolving_out: wp.array[int],
     grad_scale_out: wp.array2d[float],
     changed_out: wp.array2d[bool],
     state_changed_out: wp.array2d[bool],
@@ -1356,8 +1390,6 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
     ndof = island_nv_in[worldid, islandid]
     nrow = island_nefc_in[worldid, islandid]
     rowadr0 = island_iefcadr_in[worldid, islandid]
-    tilebase = tilebase_in[worldid, islandid]
-    ntile = ntile_in[worldid, islandid]
     vbase = vbase_in[worldid, islandid]
     scale = scale_in[worldid, islandid]
     block = island_slot_in[worldid, islandid]
@@ -1366,7 +1398,6 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
     niter = niter_out[worldid, islandid]
 
     # the gradient is grad_scale * the stored one while the states hold (see _done)
-    stable = _stable(niter, state_changed_in[worldid, islandid])
     grad_scale = grad_scale_out[worldid, islandid]
 
     # --- linesearch along search ---
@@ -1382,21 +1413,8 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
     local_p0 = wp.vec3(0.0)
     for r in range(lane, nrow, nthread):
       row = rowadr0 + r
-      jv = float(0.0)
-      if stable:
-        jv = row_jv_out[worldid, row]
-      else:
-        if block[0] > 0:
-          # rows are zero past a group's columns. A dynamic loop (beyond max_unroll): unrolled, it
-          # was slower
-          for c in range(wp.static(WIDTH)):
-            jv += iJ_in[worldid, row, c] * search[vbase + c]
-        else:
-          rowadr = efc_J_rowadr_in[worldid, row]
-          for k in range(efc_J_rownnz_in[worldid, row]):
-            adr = rowadr + k
-            jv += efc_J_in[worldid, 0, adr] * search[dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
-        row_jv_out[worldid, row] = jv
+      # J search: _jv
+      jv = row_jv_out[worldid, row]
       category = _row_category(efc_type_in[worldid, row])
       D = efc_D_in[worldid, row]
       jaref = row_jaref_out[worldid, row]
@@ -1588,8 +1606,8 @@ def _newton_step(ls_iterations: int, warn_overflow: int, elliptic: bool, width: 
 
 
 @cache_kernel
-def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: int):
-  step = _newton_step(ls_iterations, warn_overflow, elliptic, width)
+def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool):
+  step = _newton_step(ls_iterations, warn_overflow, elliptic)
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1597,18 +1615,9 @@ def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: i
     ntree: int,
     opt_tolerance: wp.array[float],
     opt_ls_tolerance: wp.array[float],
-    opt_iterations: int,
-    M_mulm_rowadr: wp.array[int],
-    M_mulm_col: wp.array[int],
-    M_mulm_madr: wp.array[int],
     # Data in:
     nisland_in: wp.array[int],
-    M_in: wp.array2d[float],
     efc_type_in: wp.array2d[int],
-    efc_J_rownnz_in: wp.array2d[int],
-    efc_J_rowadr_in: wp.array2d[int],
-    efc_J_colind_in: wp.array3d[int],
-    efc_J_in: wp.array3d[float],
     efc_D_in: wp.array2d[float],
     efc_frictionloss_in: wp.array2d[float],
     island_nv_in: wp.array2d[int],
@@ -1619,23 +1628,14 @@ def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: i
     group_list_in: wp.array2d[int],
     cls: int,
     nblock: int,
-    tilebase_in: wp.array2d[int],
-    ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     scale_in: wp.array2d[float],
     iqfrc_smooth_in: wp.array2d[float],
-    row2dof_in: wp.array2d[int],
     search_in: wp.array2d[float],
     island_slot_in: wp.array2d[wp.vec4i],
-    dof2row_in: wp.array2d[int],
-    iJ_in: wp.array3d[float],
-    grad_in: wp.array2d[float],
     search_dot_in: wp.array2d[float],
-    newton_decrement_in: wp.array2d[float],
-    state_changed_in: wp.array2d[bool],
     cones: _ConeData,
     # Data out:
-    solver_niter_out: wp.array[int],
     overflow_out: wp.array[int],
     # Out:
     done_out: wp.array2d[bool],
@@ -1648,7 +1648,6 @@ def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: i
     mv_out: wp.array2d[float],
     row_jaref_out: wp.array2d[float],
     row_jv_out: wp.array2d[float],
-    nsolving_out: wp.array[int],
     grad_scale_out: wp.array2d[float],
     changed_out: wp.array2d[bool],
     state_changed_out: wp.array2d[bool],
@@ -1665,17 +1664,7 @@ def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: i
       step(
         opt_tolerance,
         opt_ls_tolerance,
-        opt_iterations,
-        M_mulm_rowadr,
-        M_mulm_col,
-        M_mulm_madr,
-        nisland_in,
-        M_in,
         efc_type_in,
-        efc_J_rownnz_in,
-        efc_J_rowadr_in,
-        efc_J_colind_in,
-        efc_J_in,
         efc_D_in,
         efc_frictionloss_in,
         island_nv_in,
@@ -1684,24 +1673,14 @@ def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: i
         worldid,
         islandid,
         lane,
-        tilebase_in,
-        ntile_in,
         vbase_in,
         scale_in,
         iqfrc_smooth_in,
-        row2dof_in,
         search_in,
         island_slot_in,
-        dof2row_in,
-        iJ_in,
-        grad_in,
         search_dot_in,
-        newton_decrement_in,
-        state_changed_in,
         cones,
-        solver_niter_out,
         overflow_out,
-        done_out,
         niter_out,
         alpha_out,
         improvement_out,
@@ -1711,7 +1690,6 @@ def _linesearch(ls_iterations: int, warn_overflow: int, elliptic: bool, width: i
         mv_out,
         row_jaref_out,
         row_jv_out,
-        nsolving_out,
         grad_scale_out,
         changed_out,
         state_changed_out,
@@ -2421,24 +2399,37 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
     ],
     outputs=[ctx.mv],
   )
+  wp.launch(
+    _jv(g.J.shape[2]),
+    dim=(d.nworld, d.njmax),
+    inputs=[
+      d.nefc,
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.efc.J_colind,
+      d.efc.J,
+      g.efc_group,
+      g.group_slot,
+      ctx.ntile,
+      ctx.vbase,
+      ctx.dof2row,
+      g.J,
+      ctx.search.reshape((d.nworld, nrow)),
+      ctx.done,
+      ctx.niter,
+      ctx.state_changed,
+    ],
+    outputs=[ctx.row_jv],
+  )
   wp.launch_tiled(
-    _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow), m.opt.cone == types.ConeType.ELLIPTIC, g.J.shape[2]),
+    _linesearch(m.opt.ls_iterations, int(m.opt.warn_overflow), m.opt.cone == types.ConeType.ELLIPTIC),
     dim=_nblock(2),
     inputs=[
       m.ntree,
       m.opt.tolerance,
       m.opt.ls_tolerance,
-      m.opt.iterations,
-      m.M_mulm_rowadr,
-      m.M_mulm_col,
-      m.M_mulm_madr,
       g.ngroup,
-      d.M,
       d.efc.type,
-      d.efc.J_rownnz,
-      d.efc.J_rowadr,
-      d.efc.J_colind,
-      d.efc.J,
       d.efc.D,
       d.efc.frictionloss,
       g.group_nv,
@@ -2448,24 +2439,15 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.group_list,
       0,
       _nblock(2),
-      ctx.tilebase,
-      ctx.ntile,
       ctx.vbase,
       ctx.scale,
       ctx.qfrc_smooth,
-      ctx.row2dof,
       ctx.search.reshape((d.nworld, nrow)),
       g.group_slot,
-      ctx.dof2row,
-      g.J,
-      ctx.grad.reshape((d.nworld, nrow)),
       ctx.search_dot,
-      ctx.newton_decrement,
-      ctx.state_changed,
       _cone_data(m, d, ctx),
     ],
     outputs=[
-      d.solver_niter,
       d.overflow,
       ctx.done,
       ctx.niter,
@@ -2477,7 +2459,6 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.mv,
       ctx.row_jaref,
       ctx.row_jv,
-      ctx.nsolving,
       ctx.grad_scale,
       ctx.changed,
       ctx.state_changed,
