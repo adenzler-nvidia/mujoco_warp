@@ -3708,10 +3708,14 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int, po
     groups_per_world: int,
     efc_group_in: wp.array2d[int],
     group_done_in: wp.array2d[bool],
+    group_ntile_in: wp.array2d[int],
     # Out:
     h_out: wp.array3d[float],
   ):
-    """J'DJ and cone curvature of sparse constraint blocks; skips done island groups (optional)."""
+    """J'DJ and cone curvature of sparse constraint blocks.
+
+    Optionally skips done island groups and one-tile groups (the island solver's _sparse_rows_h).
+    """
     worldid, slot, lane = wp.tid()
     if wp.static(ELLIPTIC):
       lanes = wp.block_dim()
@@ -3728,6 +3732,9 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int, po
           continue
         if group_done_in[worldid, group]:
           continue
+        if group_ntile_in:
+          if group_ntile_in[worldid, group] == 1:
+            continue
       block_rows = efc_jtdaj_nrow_in[worldid, groupid]
       head_adr = efc_J_rowadr_in[worldid, head_row]
       support = efc_J_rownnz_in[worldid, head_row]
@@ -3920,6 +3927,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         ctx.Jaref,
         ctx.done,
         groups_per_world,
+        None,
         None,
         None,
       ]
