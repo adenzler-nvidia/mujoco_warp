@@ -220,7 +220,8 @@ def _group_lists(
 ):
   """Compacted lists of the groups that exist, by solve path, and the tiles of the own groups.
 
-  Lists 0-3: the island solver's groups (all, and by tiles per side: 1, 2, >= 3). List 6: groups
+  Lists 0-3: the island solver's groups (all, and by tiles per side: 1, 2, >= 3); count 4: groups
+  of several tiles. List 6: groups
   with dense rows on the dense world solver (island.DENSE_SOLVER, see _solve_dense), problem index
   in group_problem; done for the island solver.
   """
@@ -246,6 +247,8 @@ def _group_lists(
   ntile_out[worldid, g] = ntile
   c = wp.min(ntile, 3)
   group_list_out[c, wp.atomic_add(group_count_out, c, 1)] = packed
+  if ntile > 1:
+    wp.atomic_add(group_count_out, 4, 1)
 
 
 @wp.kernel
@@ -993,6 +996,7 @@ def _grad(final: bool):
     # Out:
     frc_out: wp.array2d[float],
     grad_out: wp.array2d[float],
+    nsolving_out: wp.array[int],
   ):
     """J'force (dense rows) and the gradient of a group, a warp per group and a lane per column.
 
@@ -1002,6 +1006,10 @@ def _grad(final: bool):
     hold, the gradient is grad_scale times the stored one.
     """
     slot, lane = wp.tid()
+    if wp.static(not FINAL):
+      # _done counts the groups still iterating (a memset node costs more)
+      if slot == 0 and lane == 0:
+        nsolving_out[0] = 0
     for e in range(slot, group_count_in[0], nblock):
       worldid = group_list_in[0, e] // ntree
       g = group_list_in[0, e] % ntree
@@ -2278,11 +2286,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       dense_h()
 
   # H is assembled initially and, with elliptic cones, at every point; else _rows updates it
-  if initial or elliptic:
-    if m.opt.graph_conditional:
-      wp.capture_if(ctx.group_count[0:1], on_true=h)
-    else:
-      h()
+  h()
 
 
 def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final: bool):
@@ -2309,7 +2313,7 @@ def _launch_grad(d: types.Data, ctx: IslandContext, g: island.SlotBuffers, final
       ctx.qfrc_smooth,
       ctx.grad_scale,
     ],
-    outputs=[ctx.frc, ctx.grad.reshape((d.nworld, nrow))],
+    outputs=[ctx.frc, ctx.grad.reshape((d.nworld, nrow)), ctx.nsolving],
     block_dim=4 * _TILE,
   )
 
@@ -2369,17 +2373,20 @@ def _direction(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       block_dim=_ISLAND_THREADS,
     )
 
-  # each size class only when some group has it (one-tile groups nearly always: no conditional)
+  def multi_tile():
+    dense_factor(2)
+    blocked_factor()
+
+  # groups of several tiles only when some group has them (one-tile groups nearly always)
   dense_factor(1)
-  for cls, launch in ((2, lambda: dense_factor(2)), (3, blocked_factor)):
-    if m.opt.graph_conditional:
-      wp.capture_if(ctx.group_count[cls : cls + 1], on_true=launch)
-    else:
-      launch()
+  if m.opt.graph_conditional:
+    wp.capture_if(ctx.group_count[4:5], on_true=multi_tile)
+  else:
+    multi_tile()
 
 
 def _launch_done(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
-  ctx.nsolving.zero_()
+  # ctx.nsolving is zeroed by _grad
   nrow = ctx.qacc.shape[1]
   wp.launch(
     _done(int(m.opt.warn_overflow)),
@@ -2610,10 +2617,8 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     inputs=[m.ntree, g.ngroup, g.group_nv, g.group_slot, g.group_asleep, island.DENSE_SOLVER],
     outputs=[ctx.group_count, ctx.group_list, ctx.group_problem, ctx.done, ctx.ntile, ctx.scale],
   )
-  if m.opt.graph_conditional:
-    wp.capture_if(ctx.group_count[0:1], on_true=lambda: _solve_own(m, d, ctx, g))
-  else:
-    _solve_own(m, d, ctx, g)
+  # unconditional: entering a conditional body costs more than kernels without groups
+  _solve_own(m, d, ctx, g)
 
   # groups with dense rows on the dense world solver (island.DENSE_SOLVER); it scatters last
   if dense is not None:
