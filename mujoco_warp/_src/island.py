@@ -977,8 +977,8 @@ ROW_CONTACT = 3
 # lower it).
 DENSE_NV = 32  # read at each make_constraint
 # Groups are runs of consecutive islands up to MERGE_NV DOFs (e.g. resting boxes), filling the
-# block path's tiles; islands after a group's first add only limit and contact rows (rows stay in
-# class order). MERGE = False keeps one island per group.
+# block path's tiles. A group's rows are its islands' rows in turn (each island's in class order):
+# the island solver classifies rows by type. MERGE = False keeps one island per group.
 MERGE = True  # read at each make_constraint
 MERGE_NV = 32  # read at each make_constraint
 # groups of several trees also get dense rows; False: sparse (rows touch few of their columns)
@@ -1290,9 +1290,8 @@ def _island_world(ntree: int):
           tree_iofs_out[worldid, t] = free
           free += n
 
-      # groups: runs of consecutive islands up to merge_nv DOFs; islands after a group's first add
-      # only limit and contact rows, so the group's rows stay in class order, and sleep with it (an
-      # island's trees sleep together: constraints to sleeping trees wake them)
+      # groups: runs of consecutive islands up to merge_nv DOFs that sleep together (an island's
+      # trees sleep together: constraints to sleeping trees wake them)
       g = int(-1)
       gasleep = bool(False)
       gnv = int(0)
@@ -1317,7 +1316,7 @@ def _island_world(ntree: int):
         asleep = bool(False)
         if tree_awake_in:
           asleep = tree_awake_in[worldid, island_root_out[worldid, i]] == 0
-        if g >= 0 and merge and ne == 0 and nf == 0 and gnv + n <= merge_nv and asleep == gasleep:
+        if g >= 0 and merge and gnv + n <= merge_nv and asleep == gasleep:
           gnv += n
           gnefc += nefc
           gnisland += 1

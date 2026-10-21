@@ -222,8 +222,10 @@ class IslandSolverTest(absltest.TestCase):
       xml=_ROWS_XML, keyframe=0, overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
     )
     widths = set()
-    for _, _, m, d in (rows_fixture, _fixture()):
+    default = island.MERGE
+    for merge, (_, _, m, d) in itertools.product((True, False), (rows_fixture, _fixture())):
       m.opt.island_solve = True
+      island.MERGE = merge
 
       def rows():
         nefc = d.nefc.numpy()[0]
@@ -254,7 +256,8 @@ class IslandSolverTest(absltest.TestCase):
         if width:
           np.testing.assert_array_equal(rownnz[rowadr : rowadr + nrow], 0)
           np.testing.assert_array_equal(J[rowadr : rowadr + nrow, nv[i] : width], 0.0)
-    # dense rows (the chain) and sparse rows (the stacks, merged groups)
+    island.MERGE = default
+    # dense rows (the chain, unmerged) and sparse rows (the stacks, merged groups)
     self.assertIn(0, widths)
     self.assertGreater(max(widths), 0)
 
@@ -326,6 +329,7 @@ class IslandSolverTest(absltest.TestCase):
       (32, False, ConeType.PYRAMIDAL),
       (0, True, ConeType.PYRAMIDAL),
       (32, True, ConeType.ELLIPTIC),
+      (32, False, ConeType.ELLIPTIC),
       (0, True, ConeType.ELLIPTIC),
     ):
       with self.subTest(dense_nv=dense_nv, merge=merge, cone=cone.name):
@@ -376,7 +380,8 @@ class IslandSolverTest(absltest.TestCase):
           np.testing.assert_allclose(entry, Hi[a, b], rtol=1e-4, atol=1e-4, err_msg=f"group {i} ({a}, {b})")
     # a block over one tile per side
     self.assertGreater(max(ntiles), 1)
-    if dense_nv == 32:
+    # merging joins the single trees with their neighbours
+    if dense_nv == 32 and not merge:
       self.assertGreater(ndense, 0)
     return ctx.niter.numpy()[0, : g.ngroup.numpy()[0]].max()
 
@@ -502,6 +507,10 @@ class IslandSolverTest(absltest.TestCase):
       self.assertEqual(members.sum(), group_nv[k])
       if len(members) > 1:
         self.assertLessEqual(group_nv[k], island.MERGE_NV)
+    # islands with equality or friction rows join groups too (the arm, the welded pair)
+    ne_nf = d.island_ne.numpy()[0, :nisland] + d.island_nf.numpy()[0, :nisland]
+    first = np.r_[True, group[1:nisland] != group[: nisland - 1]]
+    self.assertTrue(np.any((ne_nf > 0) & ~first))
     island_solver.solve(m, d)
     np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
 
