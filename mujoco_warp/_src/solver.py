@@ -875,6 +875,19 @@ def _compute_efc_eval_pt_3alphas_elliptic(
 # =============================================================================
 
 
+@wp.func
+def _row_bounds(row: int, constraint_type: int) -> wp.vec2i:
+  """(ne, nf) that classify a row by its type for the linesearch's index-based helpers.
+
+  ne < 0: an equality row (in quad_gauss, not evaluated per row).
+  """
+  if constraint_type == types.ConstraintType.EQUALITY:
+    return wp.vec2i(-1, 0)
+  if constraint_type == types.ConstraintType.FRICTION_DOF or constraint_type == types.ConstraintType.FRICTION_TENDON:
+    return wp.vec2i(row, 1)
+  return wp.vec2i(0, 0)
+
+
 @cache_kernel
 def _linesearch_iterative_kernel(
   ls_iterations: int,
@@ -884,6 +897,7 @@ def _linesearch_iterative_kernel(
   incremental: bool,
   warn_overflow: int,
   ragged: bool = False,
+  island: bool = False,
 ):
   """Factory for iterative linesearch kernel.
 
@@ -895,6 +909,9 @@ def _linesearch_iterative_kernel(
     incremental: Use incremental linesearch updates.
     warn_overflow: Overflow warning bitmask.
     ragged: Rows of problem p start at a per-problem offset in a world's rows (SolverContext).
+    island: Problems are the island solver's groups (problem id world * ntree + group, listed in
+      ctx_problem_list): a group's rows, classified by type (merged groups are not in class order),
+      and its DOFs, a range of a world's island-ordered rows.
   """
   LS_ITERATIONS = ls_iterations
   IS_ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
@@ -903,6 +920,7 @@ def _linesearch_iterative_kernel(
   IS_SPARSE = is_sparse
   # problem p's rows are rows [efc_rowoff[p], + nefc) of world efc_world[p] (see SolverContext)
   RAGGED = ragged
+  ISLAND = island
 
   # Native snippet for CUDA __syncthreads()
   @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -923,6 +941,7 @@ def _linesearch_iterative_kernel(
   def kernel(
     # Model:
     nv: int,
+    ntree: int,
     opt_tolerance: wp.array[float],
     opt_ls_tolerance: wp.array[float],
     opt_impratio_invsqrt: wp.array[float],
@@ -956,6 +975,11 @@ def _linesearch_iterative_kernel(
     ctx_done_in: wp.array[bool],
     ctx_efc_world_in: wp.array[int],
     ctx_efc_rowoff_in: wp.array[int],
+    ctx_problem_count_in: wp.array[int],
+    ctx_problem_list_in: wp.array[int],
+    ctx_dofadr_in: wp.array[int],
+    ctx_ndof_in: wp.array[int],
+    ctx_scale_in: wp.array[float],
     # Data out:
     qacc_out: wp.array2d[float],
     efc_Ma_out: wp.array2d[float],
@@ -967,8 +991,17 @@ def _linesearch_iterative_kernel(
     ctx_improvement_out: wp.array[float],
     ctx_alpha_out: wp.array[float],
     ctx_ls_exhausted_out: wp.array[bool],
+    ctx_frc_out: wp.array2d[float],
+    ctx_niter_out: wp.array[int],
+    ctx_grad_scale_out: wp.array[float],
+    ctx_changed_out: wp.array[bool],
+    ctx_state_changed_out: wp.array[bool],
   ):
     worldid, tid = wp.tid()
+    if wp.static(ISLAND):
+      if worldid >= ctx_problem_count_in[0]:
+        return
+      worldid = ctx_problem_list_in[worldid]
 
     if ctx_done_in[worldid]:
       return
@@ -978,10 +1011,23 @@ def _linesearch_iterative_kernel(
     nefc = wp.min(njmax_in, nefc_in[worldid])
     rw = worldid
     ro = int(0)
-    if wp.static(RAGGED):
-      rw = ctx_efc_world_in[worldid]
+    # dw: the world of the problem's DOFs [dofadr, dofend) and options
+    dw = worldid
+    dofadr = int(0)
+    dofend = nv
+    if wp.static(RAGGED or ISLAND):
       ro = ctx_efc_rowoff_in[worldid]
     if wp.static(RAGGED):
+      rw = ctx_efc_world_in[worldid]
+    if wp.static(ISLAND):
+      dw = worldid // ntree
+      rw = dw
+      dofadr = ctx_dofadr_in[worldid]
+      dofend = dofadr + ctx_ndof_in[worldid]
+      # rows are classified by type (_row_bounds)
+      ne = 0
+      nf = 0
+    if wp.static(RAGGED or ISLAND):
       ne += ro
       nefc += ro
 
@@ -1013,7 +1059,7 @@ def _linesearch_iterative_kernel(
     # evaluation from (Jaref, jv, efc_D), avoiding quad reads entirely.
     if wp.static(IS_ELLIPTIC):
       # elliptic-only config values
-      impratio_invsqrt = opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
+      impratio_invsqrt = opt_impratio_invsqrt[dw % opt_impratio_invsqrt.shape[0]]
       nacon = nacon_in[0]
 
       for efcid in range(ro + tid, nefc, wp.block_dim()):
@@ -1072,23 +1118,32 @@ def _linesearch_iterative_kernel(
       _syncthreads()  # ensure all quads are written before reading
 
     # gtol (tolerance values loaded here, deferred from kernel start)
-    tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
-    ls_tolerance = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
+    tolerance = opt_tolerance[dw % opt_tolerance.shape[0]]
+    ls_tolerance = opt_ls_tolerance[dw % opt_ls_tolerance.shape[0]]
     snorm = wp.sqrt(ctx_search_dot_in[worldid])
-    meaninertia = stat_meaninertia[worldid % stat_meaninertia.shape[0]]
+    meaninertia = stat_meaninertia[dw % stat_meaninertia.shape[0]]
     scale = meaninertia * wp.float(nv)
+    if wp.static(ISLAND):
+      # an island's inertia trace, as MuJoCo
+      scale = ctx_scale_in[worldid]
     gtol = wp.max(tolerance * ls_tolerance * snorm * scale, 1e-6)
 
     # quad_gauss = [0, search.T @ Ma - search.T @ qfrc_smooth, 0.5 * search.T @ mv] + equality
     local_gauss = wp.vec2(0.0)
-    for dofid in range(tid, nv, wp.block_dim()):
-      search = ctx_search_in[worldid, dofid]
+    for dofid in range(dofadr + tid, dofend, wp.block_dim()):
+      search = ctx_search_in[dw, dofid]
       local_gauss += wp.vec2(
-        search * (efc_Ma_out[worldid, dofid] - qfrc_smooth_in[worldid, dofid]),
-        0.5 * search * ctx_mv_in[worldid, dofid],
+        search * (efc_Ma_out[dw, dofid] - qfrc_smooth_in[dw, dofid]),
+        0.5 * search * ctx_mv_in[dw, dofid],
       )
 
-    for efcid in range(ro + tid, ne, wp.block_dim()):
+    eq_end = ne
+    if wp.static(ISLAND):
+      eq_end = nefc
+    for efcid in range(ro + tid, eq_end, wp.block_dim()):
+      if wp.static(ISLAND):
+        if efc_type_in[rw, efcid] != types.ConstraintType.EQUALITY:
+          continue
       jv = ctx_jv_in[rw, efcid]
       jvD = jv * efc_D_in[rw, efcid]
       local_gauss += wp.vec2(
@@ -1104,6 +1159,14 @@ def _linesearch_iterative_kernel(
     # p0 via parallel reduction over non-equality constraints
     local_p0 = wp.vec3(0.0)
     for efcid in range(ne + tid, nefc, wp.block_dim()):
+      rne = ne
+      rnf = nf
+      if wp.static(ISLAND):
+        bounds = _row_bounds(efcid, efc_type_in[rw, efcid])
+        if bounds[0] < 0:
+          continue
+        rne = bounds[0]
+        rnf = bounds[1]
       if wp.static(IS_ELLIPTIC):
         efc_type = efc_type_in[rw, efcid]
         efc_id = 0
@@ -1125,8 +1188,8 @@ def _linesearch_iterative_kernel(
 
         local_p0 += _compute_efc_eval_pt_alpha_zero(
           efcid,
-          ne,
-          nf,
+          rne,
+          rnf,
           impratio_invsqrt,
           efc_type,
           efc_D_in[rw],
@@ -1143,8 +1206,8 @@ def _linesearch_iterative_kernel(
         # direct evaluation for pyramidal cones (no intermediate quad)
         local_p0 += _compute_efc_eval_pt_alpha_zero(
           efcid,
-          ne,
-          nf,
+          rne,
+          rnf,
           efc_D_in[rw, efcid],
           efc_frictionloss_in[rw],
           ctx_Jaref_in[rw, efcid],
@@ -1184,6 +1247,14 @@ def _linesearch_iterative_kernel(
 
     local_lo_in = wp.vec3(0.0)
     for efcid in range(ne + tid, nefc, wp.block_dim()):
+      rne = ne
+      rnf = nf
+      if wp.static(ISLAND):
+        bounds = _row_bounds(efcid, efc_type_in[rw, efcid])
+        if bounds[0] < 0:
+          continue
+        rne = bounds[0]
+        rnf = bounds[1]
       if wp.static(IS_ELLIPTIC):
         efc_type = efc_type_in[rw, efcid]
         efc_id = 0
@@ -1206,8 +1277,8 @@ def _linesearch_iterative_kernel(
         local_lo_in += _compute_efc_eval_pt(
           efcid,
           lo_alpha_in,
-          ne,
-          nf,
+          rne,
+          rnf,
           impratio_invsqrt,
           efc_type,
           efc_D_in[rw],
@@ -1225,8 +1296,8 @@ def _linesearch_iterative_kernel(
         local_lo_in += _compute_efc_eval_pt(
           efcid,
           lo_alpha_in,
-          ne,
-          nf,
+          rne,
+          rnf,
           efc_D_in[rw, efcid],
           efc_frictionloss_in[rw],
           ctx_Jaref_in[rw, efcid],
@@ -1266,6 +1337,14 @@ def _linesearch_iterative_kernel(
         local_mid = wp.vec3(0.0)
 
         for efcid in range(ne + tid, nefc, wp.block_dim()):
+          rne = ne
+          rnf = nf
+          if wp.static(ISLAND):
+            bounds = _row_bounds(efcid, efc_type_in[rw, efcid])
+            if bounds[0] < 0:
+              continue
+            rne = bounds[0]
+            rnf = bounds[1]
           if wp.static(IS_ELLIPTIC):
             efc_type = efc_type_in[rw, efcid]
             efc_id = 0
@@ -1290,8 +1369,8 @@ def _linesearch_iterative_kernel(
               lo_next_alpha,
               hi_next_alpha,
               mid_alpha,
-              ne,
-              nf,
+              rne,
+              rnf,
               impratio_invsqrt,
               efc_type,
               efc_D_in[rw],
@@ -1311,8 +1390,8 @@ def _linesearch_iterative_kernel(
               lo_next_alpha,
               hi_next_alpha,
               mid_alpha,
-              ne,
-              nf,
+              rne,
+              rnf,
               efc_D_in[rw, efcid],
               efc_frictionloss_in[rw],
               ctx_Jaref_in[rw, efcid],
@@ -1425,9 +1504,12 @@ def _linesearch_iterative_kernel(
       improvement = -lo_in[0]
 
     # qacc and Ma update
-    for dofid in range(tid, nv, wp.block_dim()):
-      qacc_out[worldid, dofid] += alpha * ctx_search_in[worldid, dofid]
-      efc_Ma_out[worldid, dofid] += alpha * ctx_mv_in[worldid, dofid]
+    for dofid in range(dofadr + tid, dofend, wp.block_dim()):
+      qacc_out[dw, dofid] += alpha * ctx_search_in[dw, dofid]
+      efc_Ma_out[dw, dofid] += alpha * ctx_mv_in[dw, dofid]
+      if wp.static(ISLAND):
+        # J'force at the new point: _rows accumulates sparse rows' (_grad overwrites dense ones')
+        ctx_frc_out[dw, dofid] = 0.0
 
     # Jaref update
     for efcid in range(ro + tid, nefc, wp.block_dim()):
@@ -1436,6 +1518,13 @@ def _linesearch_iterative_kernel(
     if tid == 0:
       ctx_improvement_out[worldid] = improvement
       ctx_alpha_out[worldid] = alpha
+      if wp.static(ISLAND):
+        # an iteration; the change flags are read by now, for _rows to set at the new point; the
+        # gradient is grad_scale times the stored one while the states hold (see _done)
+        ctx_niter_out[worldid] += 1
+        ctx_changed_out[worldid] = False
+        ctx_state_changed_out[worldid] = False
+        ctx_grad_scale_out[worldid] -= alpha
       if wp.static(INCREMENTAL):
         ctx_ls_exhausted_out[worldid] = wp.abs(alpha) < noise_floor
       if not ls_converged:
@@ -1445,7 +1534,7 @@ def _linesearch_iterative_kernel(
             "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.LS_ITERATIONS (or = 0 for all)\n",
             wp.static(LS_ITERATIONS),
           )
-        wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.LS_ITERATIONS))
+        wp.atomic_or(overflow_out, dw, wp.static(OverflowType.LS_ITERATIONS))
 
   return kernel
 
@@ -1472,6 +1561,7 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
     dim=d.nworld,
     inputs=[
       m.nv,
+      m.ntree,
       m.opt.tolerance,
       m.opt.ls_tolerance,
       m.opt.impratio_invsqrt,
@@ -1503,6 +1593,11 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
       ctx.done,
       ctx.efc_world,
       ctx.efc_rowoff,
+      None,
+      None,
+      None,
+      None,
+      None,
     ],
     outputs=[
       d.qacc,
@@ -1514,6 +1609,11 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
       ctx.improvement,
       ctx.alpha,
       ctx.ls_exhausted,
+      None,
+      None,
+      None,
+      None,
+      None,
     ],
     block_dim=m.block_dim.linesearch_iterative,
   )
