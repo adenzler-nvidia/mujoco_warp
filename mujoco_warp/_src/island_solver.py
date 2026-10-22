@@ -356,7 +356,7 @@ def _sync():
   pass
 
 
-@wp.kernel
+@wp.kernel(module="unique", enable_backward=False)
 def _pool_seed(
   # Model:
   ntree: int,
@@ -1706,10 +1706,16 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
   elliptic = m.opt.cone == types.ConeType.ELLIPTIC
 
   def sparse_h():
-    # dense rows have no constraint groups
+    # dense rows have no constraint groups; elliptic: one block per constraint group (the cone
+    # terms are shared per block)
+    block_dim = (
+      (1 if wp.get_device().is_cpu else _JTDAJ_THREADS_PER_GROUP) if elliptic else m.block_dim.update_gradient_JTDAJ_sparse
+    )
+    kernel = _JTDACJ_sparse(False, m.opt.cone, max(3, int(m.nmaxcondim)) if elliptic else 3, block_dim, _TILE)
+    groups_per_world = _jtdaj_groups_per_world(d.nworld, d.njmax, kernel)
     wp.launch(
-      _JTDACJ_sparse(False, m.opt.cone, max(3, int(m.nmaxcondim)) if elliptic else 3, _TILE),
-      dim=(d.nworld, _jtdaj_groups_per_world(d.nworld, d.njmax), _JTDAJ_THREADS_PER_GROUP),
+      kernel,
+      dim=(d.nworld, groups_per_world, _JTDAJ_THREADS_PER_GROUP),
       inputs=[
         m.opt.impratio_invsqrt,
         d.contact.friction,
@@ -1728,15 +1734,12 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
         ctx.dof_local,
         ctx.row_jaref,
         ctx.world_done,
-        _jtdaj_groups_per_world(d.nworld, d.njmax),
+        groups_per_world,
         g.efc_group,
         ctx.done,
       ],
       outputs=[ctx.H],
-      # elliptic: one block per constraint group (the cone terms are shared per block)
-      block_dim=(1 if wp.get_device().is_cpu else _JTDAJ_THREADS_PER_GROUP)
-      if elliptic
-      else m.block_dim.update_gradient_JTDAJ_sparse,
+      block_dim=block_dim,
     )
 
   def dense_h():

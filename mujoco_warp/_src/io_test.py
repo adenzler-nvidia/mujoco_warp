@@ -1256,9 +1256,12 @@ class IOTest(parameterized.TestCase):
     m = mjwarp.put_model(mjm)
     d = mjwarp.put_data(mjm, mjd, nconmax=16, njmax=16)
 
+    with wp.ScopedCapture() as capture:
+      mjwarp.step(m, d)
+
     # let the box fall and settle on the ground
     for _ in range(30):
-      mjwarp.step(m, d)
+      wp.capture_launch(capture.graph)
 
     # check that box is above ground
     # box center should be at z ≈ 0.5 when resting on ground
@@ -1552,11 +1555,43 @@ class IOTest(parameterized.TestCase):
     with self.assertRaises(NotImplementedError):
       test_data.fixture(
         xml="""
+        <mujoco>
+          <option noslip_iterations="1" integrator="discrete"/>
+        </mujoco>
+        """
+      )
+
+  def test_noslip_options(self):
+    _, _, m, _ = test_data.fixture(
+      xml="""
       <mujoco>
-        <option noslip_iterations="1"/>
+        <option noslip_iterations="3" noslip_tolerance="1e-3"/>
       </mujoco>
       """
-      )
+    )
+    self.assertEqual(m.opt.noslip_iterations, 3)
+    np.testing.assert_allclose(m.opt.noslip_tolerance.numpy(), [1e-3])
+
+  @parameterized.parameters(7, 8)
+  def test_contact_sensor_vel_unsupported(self, bit):
+    """Contact sensor with linvel (bit 7) or angvel (bit 8) raises NotImplementedError."""
+    mjm = mujoco.MjModel.from_xml_string("""
+      <mujoco>
+        <worldbody>
+          <geom type="plane" size="1 1 1"/>
+          <body>
+            <freejoint/>
+            <geom size="0.1"/>
+          </body>
+        </worldbody>
+        <sensor>
+          <contact data="found"/>
+        </sensor>
+      </mujoco>
+    """)
+    mjm.sensor_intprm[0, 0] |= 1 << bit
+    with self.assertRaises(NotImplementedError):
+      put_model(mjm)
 
   @parameterized.parameters(*_IO_TEST_MODELS)
   def test_reset_data(self, xml):
@@ -2562,9 +2597,11 @@ class IOTest(parameterized.TestCase):
     geom_pos = m.geom_pos.numpy()
     self.assertEqual(geom_pos.shape[0], nworld)
 
-  def test_margin_multiccd_box_box(self):
-    """MULTICCD + box-box with margin raises NotImplementedError."""
-    mjm = mujoco.MjModel.from_xml_string("""
+  @parameterized.parameters(0, mujoco.mjtDisableBit.mjDSBL_MULTICCD)
+  def test_margin_box_box(self, disableflags):
+    """Box-box with margin uses the primitive collider (as in MuJoCo), with or without MULTICCD."""
+    _, _, m, _ = test_data.fixture(
+      xml="""
       <mujoco>
         <worldbody>
           <body>
@@ -2577,9 +2614,30 @@ class IOTest(parameterized.TestCase):
           </body>
         </worldbody>
       </mujoco>
-    """)
-    with self.assertRaises(NotImplementedError):
-      mjwarp.put_model(mjm)
+      """,
+      overrides={"opt.disableflags": disableflags},
+    )
+    self.assertTrue(m.has_boxbox_margin)
+
+  def test_no_margin_box_box(self):
+    """Box-box without margin keeps using the convex collider."""
+    _, _, m, _ = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <body>
+            <freejoint/>
+            <geom type="box" size=".1 .1 .1"/>
+          </body>
+          <body pos="0 0 .5">
+            <freejoint/>
+            <geom type="box" size=".1 .1 .1"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    self.assertFalse(m.has_boxbox_margin)
 
   def test_margin_multiccd_box_mesh(self):
     """MULTICCD + box-mesh with margin raises NotImplementedError."""
@@ -2646,27 +2704,27 @@ class IOTest(parameterized.TestCase):
     mjwarp.put_model(mjm)
 
   def test_margin_pair_box_box(self):
-    """Pair with margin on box-box raises NotImplementedError."""
-    with self.assertRaises(NotImplementedError):
-      mjwarp.put_model(
-        mujoco.MjModel.from_xml_string("""
-        <mujoco>
-          <worldbody>
-            <body>
-              <freejoint/>
-              <geom name="b1" type="box" size=".1 .1 .1"/>
-            </body>
-            <body pos="0 0 .5">
-              <freejoint/>
-              <geom name="b2" type="box" size=".1 .1 .1"/>
-            </body>
-          </worldbody>
-          <contact>
-            <pair geom1="b1" geom2="b2" margin="0.01"/>
-          </contact>
-        </mujoco>
-      """)
-      )
+    """Pair with margin on box-box uses the primitive collider (as in MuJoCo)."""
+    _, _, m, _ = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <body>
+            <freejoint/>
+            <geom name="b1" type="box" size=".1 .1 .1"/>
+          </body>
+          <body pos="0 0 .5">
+            <freejoint/>
+            <geom name="b2" type="box" size=".1 .1 .1"/>
+          </body>
+        </worldbody>
+        <contact>
+          <pair geom1="b1" geom2="b2" margin="0.01"/>
+        </contact>
+      </mujoco>
+      """
+    )
+    self.assertTrue(m.has_boxbox_margin)
 
   @parameterized.parameters(*_IO_TEST_MODELS)
   def test_kernel_recompilation(self, xml):
@@ -2867,59 +2925,15 @@ class IOTest(parameterized.TestCase):
     self.assertEqual(m.has_2d_flex, False)
     self.assertEqual(m.has_3d_flex, True)
 
-  # TODO(team): remove after implementing multicontact support for CCD pairs.
-  @parameterized.parameters(
-    ("capsule", "cylinder"),
-    ("capsule", "mesh"),
-  )
-  def test_unsupported_multiccd_warning(self, geom1_type, geom2_type):
-    """Tests warning for unsupported multicontact CCD pairs when MULTICCD is enabled."""
-
-    def _make_geom_xml(gtype: str) -> str:
-      if gtype == "mesh":
-        return '<geom type="mesh" mesh="m"/>'
-      elif gtype in ("cylinder", "capsule"):
-        return f'<geom type="{gtype}" size=".1 .1"/>'
-      elif gtype == "sphere":
-        return '<geom type="sphere" size=".1"/>'
-      else:
-        return f'<geom type="{gtype}" size=".1 .1 .1"/>'
-
-    mesh_asset = '<mesh name="m" vertex="0 0 0 1 0 0 0 1 0 0 0 1"/>' if "mesh" in (geom1_type, geom2_type) else ""
-    xml = f"""
-      <mujoco>
-        <asset>
-          {mesh_asset}
-        </asset>
-        <worldbody>
-          <body>
-            <freejoint/>
-            {_make_geom_xml(geom1_type)}
-          </body>
-          <body pos="0 0 .5">
-            <freejoint/>
-            {_make_geom_xml(geom2_type)}
-          </body>
-        </worldbody>
-      </mujoco>
-    """
-    mjm = mujoco.MjModel.from_xml_string(xml)
-
-    with self.assertWarns(UserWarning):
-      mjwarp.put_model(mjm)
-
-    mjm.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_MULTICCD
-    with warnings.catch_warnings():
-      warnings.simplefilter("error")
-      mjwarp.put_model(mjm)
-
   @parameterized.parameters(
     ("cylinder", "box"),
     ("cylinder", "cylinder"),
     ("cylinder", "mesh"),
+    ("capsule", "cylinder"),
+    ("capsule", "mesh"),
   )
   def test_supported_cylinder_multiccd_no_warning(self, geom1_type, geom2_type):
-    """Tests that supported cylinder MultiCCD pairs emit no warning."""
+    """Tests that supported cylinder and capsule MultiCCD pairs emit no warning."""
 
     def _make_geom_xml(gtype: str) -> str:
       if gtype == "mesh":

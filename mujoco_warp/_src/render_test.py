@@ -140,7 +140,6 @@ class RenderTest(parameterized.TestCase):
 
     self.assertNotEqual(np.unique(rgb).shape[0], 1)
 
-  @absltest.skipIf(not wp.get_device().is_cuda, "Skipping test that requires CUDA.")
   def test_render_graph_capture(self):
     mjm, mjd, m, d = test_data.fixture("humanoid/humanoid.xml")
     rc = mjw.create_render_context(
@@ -343,6 +342,55 @@ class RenderTest(parameterized.TestCase):
     rgb = _unpack_rgb(rc.rgb_data.numpy()[0])[geom_mask]
     self.assertTrue(np.all(rgb[:, 0] > rgb[:, 1]), "mesh should read as red from its texture")
     self.assertTrue(np.all(rgb[:, 0] > rgb[:, 2]), "mesh should read as red from its texture")
+
+  @parameterized.product(corner=(0, 1, 2), preceding_uv=(False, True))
+  def test_render_mesh_missing_face_texcoord(self, corner, preceding_uv):
+    """Incomplete face UVs use mesh projection without reading adjacent UV data."""
+    prefix = (
+      '<mesh name="prefix" vertex="1 1 1  1 -1 -1  -1 1 -1  -1 -1 1" texcoord="0.75 0.75  0.75 0.75  0.75 0.75  0.75 0.75"/>'
+      if preceding_uv
+      else ""
+    )
+    mjm, _, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <asset>
+          <texture name="checker" type="2d" builtin="checker" rgb1="1 0 0" rgb2="0 1 0" width="16" height="16"/>
+          <material name="mat" texture="checker"/>
+          {prefix}
+          <mesh name="mesh" vertex="1 1 1  1 -1 -1  -1 1 -1  -1 -1 1" texcoord="0.125 0.125  0.125 0.125  0.125 0.125  0.75 0.75"/>
+        </asset>
+        <worldbody>
+          <camera pos="0 -4 0" xyaxes="1 0 0 0 0 1"/>
+          <geom type="mesh" mesh="mesh" material="mat"/>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    mesh_id = mjm.mesh("mesh").id
+    face_adr = mjm.mesh_faceadr[mesh_id]
+    texcoord_adr = 4 if preceding_uv else 0
+
+    def render(texcoordadr, facetexcoord):
+      mjm.mesh_texcoordadr[mesh_id] = texcoordadr
+      mjm.mesh_facetexcoord[face_adr:] = facetexcoord
+      rc = mjw.create_render_context(mjm, cam_res=(32, 32), render_rgb=True, render_seg=True)
+      mjw.render(m, d, rc)
+      mask = rc.seg_data.numpy()[0, :, 1] == int(mjw.ObjType.GEOM)
+      self.assertTrue(np.any(mask), "Expected the mesh to be hit")
+      return _unpack_rgb(rc.rgb_data.numpy()[0])[mask]
+
+    projected = render(-1, 0)
+    self.assertTrue(np.any(projected[:, 0] > projected[:, 1]))
+    self.assertTrue(np.any(projected[:, 1] > projected[:, 0]))
+
+    missing_coords = np.zeros((4, 3), dtype=np.int32)
+    missing_coords[:, corner] = -1
+    np.testing.assert_array_equal(render(texcoord_adr, missing_coords), projected)
+
+    valid = render(texcoord_adr, 0)
+    self.assertFalse(np.array_equal(valid, projected))
+    self.assertNotEqual(np.any(valid[:, 0] > valid[:, 1]), np.any(valid[:, 1] > valid[:, 0]))
 
   def test_disable_ambient_lighting(self):
     xml = """
