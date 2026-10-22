@@ -131,7 +131,6 @@ def _create_solver_context(
     quad_changed_ids=wp.empty((nworld, njmax), dtype=int) if alloc_incremental else wp.empty((nworld, 0), dtype=int),
     quad_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
     state_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
-    cholesky_top=wp.zeros((1, nv_pad // types.TILE_SIZE_JTDAJ_DENSE if alloc_hfactor else 0), dtype=int),
   )
 
 
@@ -2748,7 +2747,7 @@ def _init_h_entry(
 
 
 @wp.kernel
-def _update_gradient_init_h_envelope(
+def _update_gradient_init_h_active(
   # Model:
   M_elemid: wp.array2d[int],
   # Data in:
@@ -2756,32 +2755,19 @@ def _update_gradient_init_h_envelope(
   cdof_dof_in: wp.array2d[int],
   # In:
   nrow_in: wp.array[int],
-  ctx_cholesky_top_in: wp.array2d[int],
   ctx_done_in: wp.array[bool],
   # Out:
   ctx_h_out: wp.array3d[float],
 ):
-  """Initialize the upper triangle of mapped h with M, only where the blocked Cholesky reads it.
-
-  That is the active rows and, within them, the tile envelope plus the last tile column (it carries
-  the right-hand side). The envelope of a row is contiguous since top is nondecreasing.
-  """
+  """Initialize the upper triangle of mapped h with M over the rows the blocked Cholesky factors."""
   worldid, i = wp.tid()
   if ctx_done_in[worldid]:
     return
 
-  TILE = wp.static(types.TILE_SIZE_JTDAJ_DENSE)
-  size = _blocked_size(nrow_in, worldid, TILE, ctx_h_out.shape[1])
+  size = _blocked_size(nrow_in, worldid, wp.static(types.TILE_SIZE_JTDAJ_DENSE), ctx_h_out.shape[1])
   if i >= size:
     return
-
-  topid = worldid % ctx_cholesky_top_in.shape[0]
-  jstop = (i // TILE + 1) * TILE
-  while jstop < size and ctx_cholesky_top_in[topid, jstop // TILE] <= i:
-    jstop += TILE
-  for j in range(i, jstop):
-    ctx_h_out[worldid, i, j] = _init_h_entry(M_elemid, M_in, cdof_dof_in, worldid, i, j)
-  for j in range(wp.max(jstop, size - TILE), size):
+  for j in range(i, size):
     ctx_h_out[worldid, i, j] = _init_h_entry(M_elemid, M_in, cdof_dof_in, worldid, i, j)
 
 
@@ -3424,7 +3410,10 @@ def _blocked_size(nrow_in: wp.array[int], worldid: int, tile_size: int, matrix_s
 
 
 @cache_kernel
-def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_size: int):
+def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_size: int, bounded: bool = False):
+  # bounded: factor only a world's leading active rows (nrow_in, compacted DOFs)
+  BOUNDED = bounded
+
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
     # In:
@@ -3432,7 +3421,6 @@ def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_s
     ctx_done_in: wp.array[bool],
     ctx_grad_in: wp.array3d[float],
     ctx_h_in: wp.array3d[float],
-    ctx_cholesky_top_in: wp.array2d[int],
     ctx_hfactor: wp.array3d[float],
     # Out:
     ctx_search_out: wp.array3d[float],
@@ -3445,6 +3433,10 @@ def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_s
     if ctx_done_in[worldid]:
       return
 
+    size = matrix_size
+    if wp.static(BOUNDED):
+      size = _blocked_size(nrow_in, worldid, TILE_SIZE, matrix_size)
+
     # We need matrix size both as a runtime input as well as a static input:
     # static input is needed to specify the tile sizes for the compiler
     # runtime input is needed for the loop bounds, otherwise warp will unroll
@@ -3453,8 +3445,7 @@ def _update_gradient_cholesky_blocked(tile_size: int, matrix_size: int, vector_s
     sums = wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
       ctx_h_in[worldid],
       ctx_grad_in[worldid],
-      ctx_cholesky_top_in[worldid % ctx_cholesky_top_in.shape[0]],
-      _blocked_size(nrow_in, worldid, TILE_SIZE, matrix_size),
+      size,
       ctx_hfactor[worldid],
       ctx_search_out[worldid],
     )
@@ -3491,10 +3482,14 @@ def _cholesky_factorize_solve_blocked(tile_size: int, matrix_size: int):
 
 @cache_kernel
 def _update_gradient_cholesky_blocked_skip_unchanged(
-  tile_size: int, matrix_size: int, vector_size: int, skip_noflip: bool = False
+  tile_size: int, matrix_size: int, vector_size: int, skip_noflip: bool = False, bounded: bool = False
 ):
-  """Blocked Cholesky that skips factorization when no constraints changed."""
+  """Blocked Cholesky that skips factorization when no constraints changed.
+
+  bounded: factor only a world's leading active rows (nrow_in, compacted DOFs).
+  """
   SKIP_NOFLIP = skip_noflip
+  BOUNDED = bounded
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
   def kernel(
@@ -3505,7 +3500,6 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
     ctx_h_in: wp.array3d[float],
     quad_changed_count_in: wp.array[int],
     state_changed_count_in: wp.array[int],
-    ctx_cholesky_top_in: wp.array2d[int],
     ctx_hfactor: wp.array3d[float],
     # Out:
     ctx_search_out: wp.array3d[float],
@@ -3524,13 +3518,13 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
       if state_changed_count_in[worldid] == 0:
         return
 
-    size = _blocked_size(nrow_in, worldid, TILE_SIZE, matrix_size)
-    top = ctx_cholesky_top_in[worldid % ctx_cholesky_top_in.shape[0]]
+    size = matrix_size
+    if wp.static(BOUNDED):
+      size = _blocked_size(nrow_in, worldid, TILE_SIZE, matrix_size)
     if quad_changed_count_in[worldid] > 0:
       sums = wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
         ctx_h_in[worldid],
         ctx_grad_in[worldid],
-        top,
         size,
         ctx_hfactor[worldid],
         ctx_search_out[worldid],
@@ -3539,7 +3533,6 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
       sums = wp.static(create_blocked_cholesky_solve_newton_func(TILE_SIZE, matrix_size, vector_size))(
         ctx_hfactor[worldid],
         ctx_grad_in[worldid],
-        top,
         size,
         ctx_search_out[worldid],
       )
@@ -3561,12 +3554,11 @@ def _padding_h(nv: int, ctx_done_in: wp.array[bool], ctx_h_out: wp.array3d[float
   ctx_h_out[worldid, dofid, dofid] = 1.0
 
 
-def _blocked_bounds(m: types.Model, d: types.Data, ctx: SolverContext) -> tuple:
-  """Active rows and tile envelope the blocked Cholesky reads (None, dense: the whole matrix)."""
+def _blocked_bounds(m: types.Model, d: types.Data, ctx: SolverContext):
+  """Active rows the blocked Cholesky factors (None: the whole matrix)."""
   if m.nv <= _BLOCK_CHOLESKY_DIM:
-    return None, ctx.cholesky_top
-  nrow = d.ncdof if ctx.compact_d_full is not None else None
-  return nrow, ctx.cholesky_top
+    return None
+  return d.ncdof if ctx.compact_d_full is not None else None
 
 
 def _cholesky_factorize_solve(
@@ -3593,11 +3585,13 @@ def _cholesky_factorize_solve(
   else:
     # padded rows: the H init writes their identity (compacted worlds factor only their DOFs)
     # compacted or island-ordered DOFs are packed in front, so each world factors only that block
-    nrow, _ = _blocked_bounds(m, d, ctx)
+    nrow = _blocked_bounds(m, d, ctx)
 
     if skip_unchanged:
       wp.launch_tiled(
-        _update_gradient_cholesky_blocked_skip_unchanged(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv, skip_noflip),
+        _update_gradient_cholesky_blocked_skip_unchanged(
+          types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv, skip_noflip, nrow is not None
+        ),
         dim=d.nworld,
         inputs=[
           nrow,
@@ -3606,7 +3600,6 @@ def _cholesky_factorize_solve(
           ctx.h,
           ctx.quad_changed_count,
           ctx.state_changed_count if skip_noflip else ctx.quad_changed_count,
-          ctx.cholesky_top,
           ctx.hfactor,
         ],
         outputs=[
@@ -3618,9 +3611,9 @@ def _cholesky_factorize_solve(
       )
     else:
       wp.launch_tiled(
-        _update_gradient_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv),
+        _update_gradient_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv, nrow is not None),
         dim=d.nworld,
-        inputs=[nrow, ctx.done, grad.reshape(shape=(d.nworld, grad.shape[1], 1)), ctx.h, ctx.cholesky_top, ctx.hfactor],
+        inputs=[nrow, ctx.done, grad.reshape(shape=(d.nworld, grad.shape[1], 1)), ctx.h, ctx.hfactor],
         outputs=[
           search.reshape(shape=(d.nworld, m.nv, 1)),
           ctx.search_dot,
@@ -3994,15 +3987,15 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
           ],
           outputs=[ctx.h],
         )
-      nrow, top = _blocked_bounds(m, d, ctx)
+      nrow = _blocked_bounds(m, d, ctx)
       if island:
         pass
       elif mapped and nrow is not None:
         # one thread per row, writing only what the blocked Cholesky reads
         wp.launch(
-          _update_gradient_init_h_envelope,
+          _update_gradient_init_h_active,
           dim=(d.nworld, m.nv_pad),
-          inputs=[mj.M_elemid, m_mat, row2dof, nrow, top, ctx.done],
+          inputs=[mj.M_elemid, m_mat, row2dof, nrow, ctx.done],
           outputs=[ctx.h],
         )
       else:

@@ -26,6 +26,7 @@ from mujoco_warp import test_data
 from mujoco_warp._src import forward
 from mujoco_warp._src import island
 from mujoco_warp._src import sleep
+from mujoco_warp._src import solver
 from mujoco_warp._src import types
 from mujoco_warp._src.types import SleepState
 
@@ -63,6 +64,37 @@ class SleepTest(parameterized.TestCase):
       wp.empty = empty
     mjwarp.step(m, d)
     self.assertTrue(np.isfinite(d.qacc.numpy()).all())
+
+  def test_compact_blocked_cholesky(self):
+    """Compacted worlds above the blocked Cholesky size factor only their awake DOFs."""
+    boxes = "".join(f'<body pos="{i} 0 .099"><freejoint/><geom type="box" size=".1 .1 .1"/></body>' for i in range(8))
+    mjm = mujoco.MjModel.from_xml_string(f"""
+      <mujoco>
+        <option jacobian="sparse"><flag sleep="enable"/></option>
+        <worldbody><geom type="plane" size="10 10 .1"/>{boxes}</worldbody>
+      </mujoco>
+    """)
+    self.assertGreater(mjm.nv, solver._BLOCK_CHOLESKY_DIM)
+    mjd = mujoco.MjData(mjm)
+    # the first half of the boxes sleep (a tree pointing at itself)
+    mjd.tree_asleep[:4] = np.arange(4)
+    mujoco.mj_forward(mjm, mjd)
+    m = mjwarp.put_model(mjm)
+    empty = wp.empty
+
+    def nan_empty(*args, **kwargs):
+      arr = empty(*args, **kwargs)
+      if arr.size and arr.dtype == wp.float32:
+        arr.fill_(float("nan"))
+      return arr
+
+    wp.empty = nan_empty
+    try:
+      d = mjwarp.put_data(mjm, mjd, nconmax=64, njmax=256)
+      mjwarp.forward(m, d)
+    finally:
+      wp.empty = empty
+    np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-3)
 
   @parameterized.parameters(1, 2)
   def test_sleep_initiation(self, nworld):

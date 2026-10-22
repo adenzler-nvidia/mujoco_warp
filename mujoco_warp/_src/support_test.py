@@ -349,7 +349,6 @@ class SupportTest(parameterized.TestCase):
       grad_in: wp.array3d[float],
       h_in: wp.array3d[float],
       done_in: wp.array[bool],
-      top_in: wp.array[int],
       hfactor_in: wp.array3d[float],
       search_out: wp.array3d[float],
       sums_out: wp.array[wp.vec2],
@@ -363,7 +362,6 @@ class SupportTest(parameterized.TestCase):
       sums = wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(TILE_SIZE, nv_pad, nv))(
         h_in[worldid],
         grad_in[worldid],
-        top_in,
         nv_pad,
         hfactor_in[worldid],
         search_out[worldid],
@@ -374,7 +372,6 @@ class SupportTest(parameterized.TestCase):
     def cholesky_solve_kernel(
       grad_in: wp.array3d[float],
       hfactor_in: wp.array3d[float],
-      top_in: wp.array[int],
       search_out: wp.array3d[float],
       sums_out: wp.array[wp.vec2],
     ):
@@ -384,7 +381,6 @@ class SupportTest(parameterized.TestCase):
       sums = wp.static(create_blocked_cholesky_solve_newton_func(TILE_SIZE, nv_pad, nv))(
         hfactor_in[worldid],
         grad_in[worldid],
-        top_in,
         nv_pad,
         search_out[worldid],
       )
@@ -394,7 +390,6 @@ class SupportTest(parameterized.TestCase):
     def augmented_cholesky_kernel(
       grad_in: wp.array3d[float],
       h_in: wp.array3d[float],
-      top_in: wp.array[int],
       hfactor_in: wp.array3d[float],
       Mgrad_out: wp.array3d[float],
     ):
@@ -402,21 +397,20 @@ class SupportTest(parameterized.TestCase):
       TILE_SIZE = wp.static(16)
 
       wp.static(create_blocked_cholesky_augmented_factorize_solve_func(TILE_SIZE, nv_pad))(
-        h_in[worldid], grad_in[worldid], top_in, nv_pad, hfactor_in[worldid], Mgrad_out[worldid]
+        h_in[worldid], grad_in[worldid], nv_pad, hfactor_in[worldid], Mgrad_out[worldid]
       )
 
     @wp.kernel(module="unique", enable_backward=False)
     def augmented_solve_kernel(
       grad_in: wp.array3d[float],
       hfactor_in: wp.array3d[float],
-      top_in: wp.array[int],
       Mgrad_out: wp.array3d[float],
     ):
       worldid = wp.tid()
       TILE_SIZE = wp.static(16)
 
       wp.static(create_blocked_cholesky_solve_func(TILE_SIZE, nv_pad))(
-        hfactor_in[worldid], grad_in[worldid], top_in, nv_pad, Mgrad_out[worldid]
+        hfactor_in[worldid], grad_in[worldid], nv_pad, Mgrad_out[worldid]
       )
 
     # Create test vector and fill the built-in arrays
@@ -457,7 +451,6 @@ class SupportTest(parameterized.TestCase):
 
     # Ensure done is False so kernel executes
     done = wp.zeros((nworld,), dtype=bool)
-    top = wp.zeros(nv_pad // 16, dtype=int)  # dense envelope
 
     wp.launch_tiled(
       cholesky_kernel,
@@ -469,7 +462,7 @@ class SupportTest(parameterized.TestCase):
     wp.launch_tiled(
       fused_cholesky_kernel,
       dim=nworld,
-      inputs=[grad.reshape(shape=(nworld, nv_pad, 1)), h, done, top, hfactor_fused],
+      inputs=[grad.reshape(shape=(nworld, nv_pad, 1)), h, done, hfactor_fused],
       outputs=[
         search_fused.reshape(shape=(nworld, nv, 1)),
         sums_fused,
@@ -479,7 +472,7 @@ class SupportTest(parameterized.TestCase):
     wp.launch_tiled(
       cholesky_solve_kernel,
       dim=nworld,
-      inputs=[grad.reshape(shape=(nworld, nv_pad, 1)), hfactor_fused, top],
+      inputs=[grad.reshape(shape=(nworld, nv_pad, 1)), hfactor_fused],
       outputs=[
         search_solve.reshape(shape=(nworld, nv, 1)),
         sums_solve,
@@ -554,7 +547,7 @@ class SupportTest(parameterized.TestCase):
     wp.launch_tiled(
       augmented_cholesky_kernel,
       dim=nworld,
-      inputs=[grad.reshape(shape=(nworld, nv_pad, 1)), h, top, hfactor_augmented],
+      inputs=[grad.reshape(shape=(nworld, nv_pad, 1)), h, hfactor_augmented],
       outputs=[Mgrad_augmented.reshape(shape=(nworld, nv_pad, 1))],
       block_dim=m.block_dim.update_gradient_cholesky,
     )
@@ -567,94 +560,13 @@ class SupportTest(parameterized.TestCase):
     wp.launch_tiled(
       augmented_solve_kernel,
       dim=nworld,
-      inputs=[solve_grad.reshape(shape=(nworld, nv_pad, 1)), hfactor_augmented, top],
+      inputs=[solve_grad.reshape(shape=(nworld, nv_pad, 1)), hfactor_augmented],
       outputs=[Mgrad_solve.reshape(shape=(nworld, nv_pad, 1))],
       block_dim=m.block_dim.update_gradient_cholesky,
     )
     np.testing.assert_allclose(hfactor_augmented.numpy()[0, :nv, :nv], U_numpy, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(Mgrad_augmented.numpy()[0, :nv], x_numpy, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(Mgrad_solve.numpy()[0, :nv], np.linalg.solve(SPD_active_hessian, solve_b), rtol=1e-3, atol=1e-3)
-
-  def test_block_cholesky_skyline(self):
-    """Blocked Cholesky restricted to a tile envelope matches a dense solve."""
-    tile = 16
-    # dense blocks straddling tile boundaries, like islands in DOF order
-    blocks = [6, 6, 20, 3, 6, 12, 6, 30]
-    nv = sum(blocks)
-    nv_pad = -(-(nv + 1) // tile) * tile
-    ntile = nv_pad // tile
-
-    rng = np.random.default_rng(0)
-    H = np.zeros((nv, nv))
-    first = np.arange(nv_pad)
-    adr = 0
-    for n in blocks:
-      A = rng.standard_normal((n, n))
-      H[adr : adr + n, adr : adr + n] = A @ A.T + n * np.eye(n)
-      first[adr : adr + n] = adr
-      adr += n
-    top = np.minimum.accumulate([first[k * tile : (k + 1) * tile].min() // tile for k in range(ntile)][::-1])[::-1]
-    self.assertGreater(top.max(), 0)
-
-    # poison tiles outside the envelope (except the border column, which is always read)
-    h_np = np.zeros((1, nv_pad, nv_pad))
-    h_np[0, :nv, :nv] = H
-    h_np[0, nv:, nv:] = np.eye(nv_pad - nv)
-    for r in range(ntile - 1):
-      for c in range(ntile - 1):
-        if r != c and min(r, c) < top[max(r, c)]:
-          h_np[0, r * tile : (r + 1) * tile, c * tile : (c + 1) * tile] = np.nan
-          h_np[0, c * tile : (c + 1) * tile, r * tile : (r + 1) * tile] = np.nan
-
-    b = rng.standard_normal(nv)
-    grad_np = np.zeros((1, nv_pad, 1))
-    grad_np[0, :nv, 0] = b
-    b2 = rng.standard_normal(nv)
-    grad2_np = np.zeros((1, nv_pad, 1))
-    grad2_np[0, :nv, 0] = b2
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def factor_kernel(
-      grad_in: wp.array3d[float],
-      h_in: wp.array3d[float],
-      top_in: wp.array[int],
-      hfactor_out: wp.array3d[float],
-      search_out: wp.array3d[float],
-    ):
-      worldid = wp.tid()
-      wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(tile, nv_pad, nv))(
-        h_in[worldid], grad_in[worldid], top_in, nv_pad, hfactor_out[worldid], search_out[worldid]
-      )
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def solve_kernel(
-      grad_in: wp.array3d[float],
-      hfactor_in: wp.array3d[float],
-      top_in: wp.array[int],
-      search_out: wp.array3d[float],
-    ):
-      worldid = wp.tid()
-      wp.static(create_blocked_cholesky_solve_newton_func(tile, nv_pad, nv))(
-        hfactor_in[worldid], grad_in[worldid], top_in, nv_pad, search_out[worldid]
-      )
-
-    top_wp = wp.array(top * tile, dtype=int)
-    hfactor = wp.full((1, nv_pad, nv_pad), np.nan, dtype=float)
-    search = wp.zeros((1, nv, 1), dtype=float)
-    search2 = wp.zeros((1, nv, 1), dtype=float)
-    wp.launch_tiled(
-      factor_kernel,
-      dim=1,
-      inputs=[wp.array(grad_np, dtype=float), wp.array(h_np, dtype=float), top_wp],
-      outputs=[hfactor, search],
-      block_dim=128,
-    )
-    wp.launch_tiled(
-      solve_kernel, dim=1, inputs=[wp.array(grad2_np, dtype=float), hfactor, top_wp], outputs=[search2], block_dim=128
-    )
-
-    np.testing.assert_allclose(search.numpy()[0, :, 0], -np.linalg.solve(H, b), rtol=1e-3, atol=1e-4)
-    np.testing.assert_allclose(search2.numpy()[0, :, 0], -np.linalg.solve(H, b2), rtol=1e-3, atol=1e-4)
 
   def test_pool_cholesky(self):
     """Per-island blocked Cholesky in a tile pool matches a dense solve for each island."""
