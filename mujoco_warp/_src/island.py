@@ -1009,12 +1009,12 @@ def rows_slot(
   worldid: int,
   tree: int,
   efcid: int,
-  island_slot_in: wp.array2d[wp.vec4i],
+  island_width_in: wp.array2d[int],
 ) -> wp.vec3i:
   """Dense row and width of a constraint's first row (width 0, row -1: the row is sparse)."""
   if tree < 0:
     return wp.vec3i(-1, 0, 0)
-  width = island_slot_in[worldid, tree_island_in[worldid, tree]][0]
+  width = island_width_in[worldid, tree_island_in[worldid, tree]]
   if width == 0:
     return wp.vec3i(-1, 0, 0)
   return wp.vec3i(efcid, width, 0)
@@ -1077,9 +1077,10 @@ class SlotBuffers:
     self.group_nf = wp.empty(shape, dtype=int)
     self.group_island0 = wp.empty(shape, dtype=int)
     self.group_nisland = wp.empty(shape, dtype=int)
-    self.group_slot = wp.empty(shape, dtype=wp.vec4i)
+    # the width of a group's dense rows (0: sparse rows)
+    self.group_width = wp.empty(shape, dtype=int)
     self.group_asleep = wp.empty(shape, dtype=bool)
-    self.island_slot = wp.empty(shape, dtype=wp.vec4i)
+    self.island_width = wp.empty(shape, dtype=int)
     # the island solver's layout: tiles per side of its groups (0 for sleeping groups and those on
     # the dense world solver), first pool tile, first aligned DOF row, the DOF rows a world uses
     self.group_ntile = wp.empty(shape, dtype=int)
@@ -1202,8 +1203,8 @@ def _island_world(ntree: int):
     group_nf_out: wp.array2d[int],
     group_island0_out: wp.array2d[int],
     group_nisland_out: wp.array2d[int],
-    group_slot_out: wp.array2d[wp.vec4i],
-    island_slot_out: wp.array2d[wp.vec4i],
+    group_width_out: wp.array2d[int],
+    island_width_out: wp.array2d[int],
     group_asleep_out: wp.array2d[bool],
     group_ntile_out: wp.array2d[int],
     group_tilebase_out: wp.array2d[int],
@@ -1373,26 +1374,25 @@ def _island_world(ntree: int):
     # dense rows: (unless dense_trees, single) trees up to wide DOFs
     ngroup = ngroup_out[worldid]
     for i in range(lane, ntree, lanes):
-      block = wp.vec4i(0)
+      width = int(0)
       if i < ngroup:
         width = _dense_width(group_nv_out[worldid, i], wide)
         if width > 0 and not dense_trees:
           if tree_dofnum[island_root_out[worldid, group_island0_out[worldid, i]]] != group_nv_out[worldid, i]:
             width = 0
-        block = wp.vec4i(width, 0, group_nefc_out[worldid, i], group_iefcadr_out[worldid, i])
-      group_slot_out[worldid, i] = block
+      group_width_out[worldid, i] = width
     _block_sync()
     for i in range(lane, ntree, lanes):
       g = island_group_out[worldid, i]
       if g >= 0:
-        island_slot_out[worldid, i] = group_slot_out[worldid, g]
+        island_width_out[worldid, i] = group_width_out[worldid, g]
 
     # the island solver's layout: its groups' DOFs in whole tiles of rows, their Hessians in
     # ntile x ntile pool tiles
     for i in range(lane, ntree, lanes):
       ntile = int(0)
       if i < ngroup and not group_asleep_out[worldid, i]:
-        if not (dense_solver and group_slot_out[worldid, i][0] > 0):
+        if not (dense_solver and group_width_out[worldid, i] > 0):
           ntile = (group_nv_out[worldid, i] + TILE - 1) // TILE
       group_ntile_out[worldid, i] = ntile
     _block_sync()
@@ -1561,8 +1561,8 @@ def island_layout(
       buf.group_nf,
       buf.group_island0,
       buf.group_nisland,
-      buf.group_slot,
-      buf.island_slot,
+      buf.group_width,
+      buf.island_width,
       buf.group_asleep,
       buf.group_ntile,
       buf.group_tilebase,

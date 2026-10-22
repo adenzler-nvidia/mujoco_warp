@@ -2360,11 +2360,12 @@ def put_data(
 
 def _island_slot_rows(efc_J: np.ndarray, d: types.Data, slots, worldid: int):
   """Fill the rows of island groups with dense rows (see island.DENSE_NV)."""
-  group_slot, J = slots.group_slot.numpy()[worldid], slots.J.numpy()[worldid]
+  group_width, J = slots.group_width.numpy()[worldid], slots.J.numpy()[worldid]
   group_nv, group_idofadr = slots.group_nv.numpy()[worldid], slots.group_idofadr.numpy()[worldid]
+  group_nefc, group_iefcadr = slots.group_nefc.numpy()[worldid], slots.group_iefcadr.numpy()[worldid]
   idof2dof = d.map_idof2dof.numpy()[worldid]
   for g in range(slots.ngroup.numpy()[worldid]):
-    width, _, nrow, rowadr = group_slot[g]
+    width, nrow, rowadr = group_width[g], group_nefc[g], group_iefcadr[g]
     if width == 0:
       continue
     n = group_nv[g]
