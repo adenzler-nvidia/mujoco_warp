@@ -242,18 +242,17 @@ class IslandSolverTest(absltest.TestCase):
       np.testing.assert_allclose(rows(), expect, atol=1e-6)
 
       g = island.slot_buffers(m, d)
-      group_width, J = g.group_width.numpy()[0], g.J.numpy()[0]
-      group_nefc, group_iefcadr = g.group_nefc.numpy()[0], g.group_iefcadr.numpy()[0]
+      group_slot, J = g.group_slot.numpy()[0], g.J.numpy()[0]
       nv, rownnz = g.group_nv.numpy()[0], d.efc.J_rownnz.numpy()[0]
       ngroup = g.ngroup.numpy()[0]
       # dense rows for single trees up to the dense width
       idof2dof, idofadr = d.map_idof2dof.numpy()[0], g.group_idofadr.numpy()[0]
       tree_nv = m.tree_dofnum.numpy()[m.dof_treeid.numpy()[idof2dof[idofadr[:ngroup]]]]
       wide = np.where((nv[:ngroup] <= island.dense_width(m)) & (tree_nv == nv[:ngroup]), island.dense_width(m), 0)
-      np.testing.assert_array_equal(group_width[:ngroup], wide)
-      widths.update(group_width[:ngroup])
+      np.testing.assert_array_equal(group_slot[:ngroup, 0], wide)
+      widths.update(group_slot[:ngroup, 0])
       for i in range(ngroup):
-        width, nrow, rowadr = group_width[i], group_nefc[i], group_iefcadr[i]
+        width, _, nrow, rowadr = group_slot[i]
         if width:
           np.testing.assert_array_equal(rownnz[rowadr : rowadr + nrow], 0)
           np.testing.assert_array_equal(J[rowadr : rowadr + nrow, nv[i] : width], 0.0)
@@ -294,7 +293,7 @@ class IslandSolverTest(absltest.TestCase):
     d.efc.Ma.fill_(np.nan)
     island_solver.solve(m, d)
     g = island.slot_buffers(m, d)
-    self.assertEqual(list(g.group_width.numpy()[0, : g.ngroup.numpy()[0]]), [island.dense_width(m)])
+    self.assertEqual(list(g.group_slot.numpy()[0, : g.ngroup.numpy()[0], 0]), [island.dense_width(m)])
     np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=2e-3)
     np.testing.assert_allclose(d.qfrc_constraint.numpy()[0], mjd.qfrc_constraint, rtol=1e-3, atol=1e-3)
     _assert_Ma(mjm, mjd, d)
@@ -355,7 +354,7 @@ class IslandSolverTest(absltest.TestCase):
     g = island.slot_buffers(m, d)
     island_nv, island_nefc, island_iefcadr = (a.numpy()[0] for a in (g.group_nv, g.group_nefc, g.group_iefcadr))
     ntiles = []
-    width = g.group_width.numpy()[0]
+    width = g.group_slot.numpy()[0, :, 0]
     state = d.efc.state.numpy()[0]
     ndense = 0
     for i in range(g.ngroup.numpy()[0]):

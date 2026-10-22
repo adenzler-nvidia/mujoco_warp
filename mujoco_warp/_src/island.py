@@ -986,8 +986,6 @@ DENSE_TREES = False
 # groups with dense rows are solved by the dense world solver (island_solver._solve_dense); False:
 # by the island solver like every other group
 DENSE_SOLVER = False
-# the island solver's tile: its groups' DOFs take whole tiles of rows, and their Hessians pool tiles
-TILE = 32
 _dense = [True]
 
 
@@ -1009,12 +1007,12 @@ def rows_slot(
   worldid: int,
   tree: int,
   efcid: int,
-  island_width_in: wp.array2d[int],
+  island_slot_in: wp.array2d[wp.vec4i],
 ) -> wp.vec3i:
   """Dense row and width of a constraint's first row (width 0, row -1: the row is sparse)."""
   if tree < 0:
     return wp.vec3i(-1, 0, 0)
-  width = island_width_in[worldid, tree_island_in[worldid, tree]]
+  width = island_slot_in[worldid, tree_island_in[worldid, tree]][0]
   if width == 0:
     return wp.vec3i(-1, 0, 0)
   return wp.vec3i(efcid, width, 0)
@@ -1077,21 +1075,12 @@ class SlotBuffers:
     self.group_nf = wp.empty(shape, dtype=int)
     self.group_island0 = wp.empty(shape, dtype=int)
     self.group_nisland = wp.empty(shape, dtype=int)
-    # the width of a group's dense rows (0: sparse rows)
-    self.group_width = wp.empty(shape, dtype=int)
+    self.group_slot = wp.empty(shape, dtype=wp.vec4i)
     self.group_asleep = wp.empty(shape, dtype=bool)
-    self.island_width = wp.empty(shape, dtype=int)
-    # the island solver's layout: tiles per side of its groups (0 for sleeping groups and those on
-    # the dense world solver), first pool tile, first aligned DOF row, the DOF rows a world uses
-    self.group_ntile = wp.empty(shape, dtype=int)
-    self.group_tilebase = wp.empty(shape, dtype=int)
-    self.group_vbase = wp.empty(shape, dtype=int)
-    self.nrow_used = wp.empty(d.nworld, dtype=int)
+    self.island_slot = wp.empty(shape, dtype=wp.vec4i)
     self.dof_group = wp.empty((d.nworld, m.nv), dtype=int)
     self.dof_slotcol = wp.empty((d.nworld, m.nv), dtype=int)
     self.efc_group = wp.empty((d.nworld, d.njmax), dtype=int)
-    # sparse rows' columns as the island solver's DOF rows (efc.J_colind keeps MuJoCo's DOFs)
-    self.J_col = wp.empty((d.nworld, d.efc.J_colind.shape[2]), dtype=int)
     # per world scratch of _island_world
     self.tree_iofs = wp.empty(shape, dtype=int)
     self.island_root = wp.empty(shape, dtype=int)
@@ -1174,7 +1163,6 @@ def _island_world(ntree: int):
     merge_nv: int,
     wide: int,
     dense_trees: bool,
-    dense_solver: bool,
     # Data out:
     nisland_out: wp.array[int],
     nidof_out: wp.array[int],
@@ -1203,13 +1191,9 @@ def _island_world(ntree: int):
     group_nf_out: wp.array2d[int],
     group_island0_out: wp.array2d[int],
     group_nisland_out: wp.array2d[int],
-    group_width_out: wp.array2d[int],
-    island_width_out: wp.array2d[int],
+    group_slot_out: wp.array2d[wp.vec4i],
+    island_slot_out: wp.array2d[wp.vec4i],
     group_asleep_out: wp.array2d[bool],
-    group_ntile_out: wp.array2d[int],
-    group_tilebase_out: wp.array2d[int],
-    group_vbase_out: wp.array2d[int],
-    nrow_used_out: wp.array[int],
   ):
     """A world's islands, their rows, DOFs and groups, after the constraints merged their trees.
 
@@ -1374,34 +1358,19 @@ def _island_world(ntree: int):
     # dense rows: (unless dense_trees, single) trees up to wide DOFs
     ngroup = ngroup_out[worldid]
     for i in range(lane, ntree, lanes):
-      width = int(0)
+      block = wp.vec4i(0)
       if i < ngroup:
         width = _dense_width(group_nv_out[worldid, i], wide)
         if width > 0 and not dense_trees:
           if tree_dofnum[island_root_out[worldid, group_island0_out[worldid, i]]] != group_nv_out[worldid, i]:
             width = 0
-      group_width_out[worldid, i] = width
+        block = wp.vec4i(width, 0, group_nefc_out[worldid, i], group_iefcadr_out[worldid, i])
+      group_slot_out[worldid, i] = block
     _block_sync()
     for i in range(lane, ntree, lanes):
       g = island_group_out[worldid, i]
       if g >= 0:
-        island_width_out[worldid, i] = group_width_out[worldid, g]
-
-    # the island solver's layout: its groups' DOFs in whole tiles of rows, their Hessians in
-    # ntile x ntile pool tiles
-    for i in range(lane, ntree, lanes):
-      ntile = int(0)
-      if i < ngroup and not group_asleep_out[worldid, i]:
-        if not (dense_solver and group_width_out[worldid, i] > 0):
-          ntile = (group_nv_out[worldid, i] + TILE - 1) // TILE
-      group_ntile_out[worldid, i] = ntile
-    _block_sync()
-    tiles = wp.tile_load(group_ntile_out[worldid], shape=ntree)
-    wp.tile_store(group_tilebase_out[worldid], wp.tile_scan_exclusive(wp.tile_map(wp.mul, tiles, tiles)))
-    wp.tile_store(group_vbase_out[worldid], wp.tile_scan_exclusive(tiles) * TILE)
-    nrow = wp.tile_sum(tiles)[0] * TILE
-    if lane == 0:
-      nrow_used_out[worldid] = nrow
+        island_slot_out[worldid, i] = group_slot_out[worldid, g]
 
   return kernel
 
@@ -1457,15 +1426,10 @@ def _island_rows(
   # Data in:
   nefc_in: wp.array[int],
   nisland_in: wp.array[int],
-  efc_J_rownnz_in: wp.array2d[int],
-  efc_J_rowadr_in: wp.array2d[int],
-  efc_J_colind_in: wp.array3d[int],
   island_iefcadr_in: wp.array2d[int],
   # In:
   island_group_in: wp.array2d[int],
   group_asleep_in: wp.array2d[bool],
-  dof_slotcol_in: wp.array2d[int],
-  group_vbase_in: wp.array2d[int],
   # Data out:
   efc_force_out: wp.array2d[float],
   efc_state_out: wp.array2d[int],
@@ -1474,12 +1438,10 @@ def _island_rows(
   map_iefc2efc_out: wp.array2d[int],
   # Out:
   efc_group_out: wp.array2d[int],
-  J_col_out: wp.array2d[int],
 ):
-  """Rows are in island order: identity maps, and each row's island, group and solver columns.
+  """Rows are in island order: identity maps, and each row's island and group.
 
-  A sparse row's columns as the island solver's DOF rows: the group's first row plus the column's
-  place in the group. Rows of sleeping groups are not solved: no force.
+  Rows of sleeping groups are not solved: no force.
   """
   worldid, efcid = wp.tid()
   if efcid >= nefc_in[worldid]:
@@ -1502,11 +1464,6 @@ def _island_rows(
   if group_asleep_in[worldid, g]:
     efc_force_out[worldid, efcid] = 0.0
     efc_state_out[worldid, efcid] = types.ConstraintState.SATISFIED
-    return
-  vbase = group_vbase_in[worldid, g]
-  rowadr = efc_J_rowadr_in[worldid, efcid]
-  for k in range(efc_J_rownnz_in[worldid, efcid]):
-    J_col_out[worldid, rowadr + k] = vbase + dof_slotcol_in[worldid, efc_J_colind_in[worldid, 0, rowadr + k]]
 
 
 def island_layout(
@@ -1532,7 +1489,6 @@ def island_layout(
       MERGE_NV,
       dense_width(m) if _dense[0] and DENSE_NV >= 32 else 0,
       DENSE_TREES,
-      DENSE_SOLVER,
     ],
     outputs=[
       d.nisland,
@@ -1561,13 +1517,9 @@ def island_layout(
       buf.group_nf,
       buf.group_island0,
       buf.group_nisland,
-      buf.group_width,
-      buf.island_width,
+      buf.group_slot,
+      buf.island_slot,
       buf.group_asleep,
-      buf.group_ntile,
-      buf.group_tilebase,
-      buf.group_vbase,
-      buf.nrow_used,
     ],
     block_dim=types.BlockDim.island_scan_sizes,
   )
@@ -1595,19 +1547,8 @@ def island_rows_done(m: types.Model, d: types.Data):
   wp.launch(
     _island_rows,
     dim=(d.nworld, d.njmax),
-    inputs=[
-      d.nefc,
-      d.nisland,
-      d.efc.J_rownnz,
-      d.efc.J_rowadr,
-      d.efc.J_colind,
-      d.island_iefcadr,
-      buf.island_group,
-      buf.group_asleep,
-      buf.dof_slotcol,
-      buf.group_vbase,
-    ],
-    outputs=[d.efc.force, d.efc.state, d.efc.island, d.map_efc2iefc, d.map_iefc2efc, buf.efc_group, buf.J_col],
+    inputs=[d.nefc, d.nisland, d.island_iefcadr, buf.island_group, buf.group_asleep],
+    outputs=[d.efc.force, d.efc.state, d.efc.island, d.map_efc2iefc, d.map_iefc2efc, buf.efc_group],
   )
 
 

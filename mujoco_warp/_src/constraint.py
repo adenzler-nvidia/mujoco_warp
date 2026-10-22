@@ -288,7 +288,7 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     ne_out: wp.array[int],
@@ -358,7 +358,7 @@ def _equality_connect(is_sparse: bool, newton: bool, is_discrete: bool = False, 
         island_rowadr_in,
         island_cursor_out,
       )
-      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
       srow = srow_nv[0]
       snv = srow_nv[1]
       sstr = srow_nv[2]
@@ -677,7 +677,7 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     ne_out: wp.array[int],
@@ -738,7 +738,7 @@ def _equality_joint(is_sparse: bool, newton: bool, is_discrete: bool = False, ro
         island_rowadr_in,
         island_cursor_out,
       )
-      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
       srow = srow_nv[0]
       snv = srow_nv[1]
       sstr = srow_nv[2]
@@ -875,7 +875,7 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     ne_out: wp.array[int],
@@ -956,7 +956,7 @@ def _equality_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
         island_rowadr_in,
         island_cursor_out,
       )
-      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
       srow = srow_nv[0]
       snv = srow_nv[1]
       sstr = srow_nv[2]
@@ -1294,7 +1294,7 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     ne_out: wp.array[int],
@@ -1363,7 +1363,7 @@ def _equality_weld(is_sparse: bool, newton: bool, is_discrete: bool = False, row
         island_rowadr_in,
         island_cursor_out,
       )
-      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
       srow = srow_nv[0]
       snv = srow_nv[1]
       sstr = srow_nv[2]
@@ -2140,7 +2140,7 @@ def _friction_dof(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     nf_out: wp.array[int],
@@ -2198,7 +2198,7 @@ def _friction_dof(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
         island_rowadr_in,
         island_cursor_out,
       )
-      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
       srow = srow_nv[0]
       snv = srow_nv[1]
       sstr = srow_nv[2]
@@ -2292,7 +2292,7 @@ def _friction_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     nf_out: wp.array[int],
@@ -2362,7 +2362,7 @@ def _friction_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, r
         island_rowadr_in,
         island_cursor_out,
       )
-      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+      srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
       srow = srow_nv[0]
       snv = srow_nv[1]
       sstr = srow_nv[2]
@@ -2475,7 +2475,7 @@ def _limit_slide_hinge(is_sparse: bool, newton: bool, is_discrete: bool = False,
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     nl_out: wp.array[int],
@@ -2539,7 +2539,7 @@ def _limit_slide_hinge(is_sparse: bool, newton: bool, is_discrete: bool = False,
           island_rowadr_in,
           island_cursor_out,
         )
-        srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+        srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
         srow = srow_nv[0]
         snv = srow_nv[1]
         sstr = srow_nv[2]
@@ -2638,7 +2638,7 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     nl_out: wp.array[int],
@@ -2707,7 +2707,7 @@ def _limit_ball(is_sparse: bool, newton: bool, is_discrete: bool = False, rows: 
           island_rowadr_in,
           island_cursor_out,
         )
-        srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+        srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
         srow = srow_nv[0]
         snv = srow_nv[1]
         sstr = srow_nv[2]
@@ -2829,7 +2829,7 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     nl_out: wp.array[int],
@@ -2904,7 +2904,7 @@ def _limit_tendon(is_sparse: bool, newton: bool, is_discrete: bool = False, rows
           island_rowadr_in,
           island_cursor_out,
         )
-        srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_width_in)
+        srow_nv = rows_slot(tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), efcid, island_slot_in)
         srow = srow_nv[0]
         snv = srow_nv[1]
         sstr = srow_nv[2]
@@ -3313,7 +3313,7 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
     island_body_treeid_in: wp.array[int],
     island_dof_treeid_in: wp.array[int],
     island_rowadr_in: wp.array2d[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     nefc_out: wp.array[int],
@@ -3390,7 +3390,7 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
         island_cursor_out,
       )
       srow_nv = rows_slot(
-        tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), base_efcid, island_width_in
+        tree_island_out, worldid, wp.where(rows_tree0 >= 0, rows_tree0, rows_tree1), base_efcid, island_slot_in
       )
       srow = srow_nv[0]
       snv = srow_nv[1]
@@ -3821,7 +3821,7 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType, slots: bool = False):
     friction_in: wp.array2d[float],
     worldid_in: wp.array[int],
     island_body_treeid_in: wp.array[int],
-    island_width_in: wp.array2d[int],
+    island_slot_in: wp.array2d[wp.vec4i],
     dof_slotcol_in: wp.array2d[int],
     # Data out:
     efc_J_colind_out: wp.array3d[int],
@@ -3869,7 +3869,7 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType, slots: bool = False):
       tree = island_body_treeid_in[geom_bodyid[geom[0]]]
       if tree < 0:
         tree = island_body_treeid_in[geom_bodyid[geom[1]]]
-      srow_nv = rows_slot(tree_island_in, worldid, tree, efcid, island_width_in)
+      srow_nv = rows_slot(tree_island_in, worldid, tree, efcid, island_slot_in)
       srow = srow_nv[0]
       snv = srow_nv[1]
       sstr = srow_nv[2]
@@ -3990,7 +3990,7 @@ def _efc_contact_jac_groups(
   frame_in: wp.array2d[wp.vec3],
   friction_in: wp.array2d[float],
   island_rowadr_in: wp.array2d[int],
-  group_width_in: wp.array2d[int],
+  group_slot_in: wp.array2d[wp.vec4i],
   group_idofadr_in: wp.array2d[int],
   group_nv_in: wp.array2d[int],
   group_island0_in: wp.array2d[int],
@@ -4007,7 +4007,7 @@ def _efc_contact_jac_groups(
   class of each of its islands. Rows are written whole (zero where a DOF does not move the contact).
   """
   worldid, groupid, lane = wp.tid()
-  width = group_width_in[worldid, groupid]
+  width = group_slot_in[worldid, groupid][0]
   if width == 0:
     return
   dofid = int(-1)
@@ -5779,7 +5779,7 @@ def make_constraint(m: types.Model, d: types.Data):
 
   rows = island.ROWS_WORLD
   island_parent = island_rowadr = tree_nrow = island_cursor = tree_island = None
-  island_width = dof_slotcol = slot_J = None
+  island_slot = dof_slotcol = slot_J = None
   if island.island_rows(m):
     island_parent = wp.empty((d.nworld, m.ntree), dtype=int)
     tree_nrow = wp.empty((d.nworld, m.ntree * island.ROW_CLASSES), dtype=int)
@@ -5833,7 +5833,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -5907,7 +5907,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -5961,7 +5961,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -6017,7 +6017,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -6181,7 +6181,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -6232,7 +6232,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -6286,7 +6286,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -6338,7 +6338,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -6392,7 +6392,7 @@ def make_constraint(m: types.Model, d: types.Data):
             m.body_treeid,
             m.dof_treeid,
             island_rowadr,
-            island_width,
+            island_slot,
             dof_slotcol,
           ],
           outputs=[
@@ -6517,7 +6517,7 @@ def make_constraint(m: types.Model, d: types.Data):
               m.body_treeid,
               m.dof_treeid,
               island_rowadr,
-              island_width,
+              island_slot,
               dof_slotcol,
             ],
             outputs=[
@@ -6592,7 +6592,7 @@ def make_constraint(m: types.Model, d: types.Data):
               )
             else:
               wp.launch(
-                _efc_contact_jac_sparse(m.opt.cone, island_width is not None),
+                _efc_contact_jac_sparse(m.opt.cone, island_slot is not None),
                 dim=(d.naconmax, nmaxdim),
                 inputs=[
                   m.body_parentid,
@@ -6619,7 +6619,7 @@ def make_constraint(m: types.Model, d: types.Data):
                   contact_friction_2d,
                   d.contact.worldid,
                   m.body_treeid,
-                  island_width,
+                  island_slot,
                   dof_slotcol,
                 ],
                 outputs=[
@@ -6629,7 +6629,7 @@ def make_constraint(m: types.Model, d: types.Data):
                   slot_J,
                 ],
               )
-              if island_width is not None:
+              if island_slot is not None:
                 g = island.slot_buffers(m, d)
                 wp.launch_tiled(
                   _efc_contact_jac_groups,
@@ -6653,7 +6653,7 @@ def make_constraint(m: types.Model, d: types.Data):
                     contact_frame_2d,
                     contact_friction_2d,
                     island_rowadr,
-                    g.group_width,
+                    g.group_slot,
                     g.group_idofadr,
                     g.group_nv,
                     g.group_island0,
@@ -6866,7 +6866,7 @@ def make_constraint(m: types.Model, d: types.Data):
     slots = island.island_layout(m, d, island_parent, tree_nrow, island_rowadr, island_cursor)
     # rows that overflow the Jacobian storage return before setting their rownnz: keep them empty
     d.efc.J_rownnz.zero_()
-    island_width, dof_slotcol, slot_J = slots.island_width, slots.dof_slotcol, slots.J
+    island_slot, dof_slotcol, slot_J = slots.island_slot, slots.dof_slotcol, slots.J
     build(island.ROWS_WRITE)
     island.island_rows_done(m, d)
   else:
