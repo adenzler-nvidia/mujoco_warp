@@ -67,7 +67,6 @@ class IslandContext:
   nrow_used: wp.array[int]
   vbase: wp.array2d[int]
   row2dof: wp.array2d[int]
-  dof2row: wp.array2d[int]
   dof_poolrow: wp.array2d[int]
   dof_local: wp.array2d[int]
   # DOFs in tile-aligned island rows (padding is zero)
@@ -229,14 +228,13 @@ def _init_rows(width: int):
     nefc_in: wp.array[int],
     efc_J_rownnz_in: wp.array2d[int],
     efc_J_rowadr_in: wp.array2d[int],
-    efc_J_colind_in: wp.array3d[int],
     efc_J_in: wp.array3d[float],
     efc_aref_in: wp.array2d[float],
     efc_island_in: wp.array2d[int],
     # In:
     island_slot_in: wp.array2d[wp.vec4i],
     vbase_in: wp.array2d[int],
-    dof2row_in: wp.array2d[int],
+    J_col_in: wp.array2d[int],
     iJ_in: wp.array3d[float],
     iqacc_in: wp.array2d[float],
     dense_solver: bool,
@@ -260,7 +258,7 @@ def _init_rows(width: int):
         rowadr = efc_J_rowadr_in[worldid, row]
         for k in range(efc_J_rownnz_in[worldid, row]):
           adr = rowadr + k
-          jaref += efc_J_in[worldid, 0, adr] * iqacc_in[worldid, dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
+          jaref += efc_J_in[worldid, 0, adr] * iqacc_in[worldid, J_col_in[worldid, adr]]
       row_jaref_out[worldid, row] = jaref
 
   return kernel
@@ -280,13 +278,12 @@ def _jv(width: int):
     nefc_in: wp.array[int],
     efc_J_rownnz_in: wp.array2d[int],
     efc_J_rowadr_in: wp.array2d[int],
-    efc_J_colind_in: wp.array3d[int],
     efc_J_in: wp.array3d[float],
     efc_island_in: wp.array2d[int],
     # In:
     island_slot_in: wp.array2d[wp.vec4i],
     vbase_in: wp.array2d[int],
-    dof2row_in: wp.array2d[int],
+    J_col_in: wp.array2d[int],
     iJ_in: wp.array3d[float],
     search_in: wp.array2d[float],
     search_unchanged_in: wp.array2d[bool],
@@ -310,7 +307,7 @@ def _jv(width: int):
       rowadr = efc_J_rowadr_in[worldid, row]
       for k in range(efc_J_rownnz_in[worldid, row]):
         adr = rowadr + k
-        jv += efc_J_in[worldid, 0, adr] * search_in[worldid, dof2row_in[worldid, efc_J_colind_in[worldid, 0, adr]]]
+        jv += efc_J_in[worldid, 0, adr] * search_in[worldid, J_col_in[worldid, adr]]
     row_jv_out[worldid, row] = jv
 
   return kernel
@@ -576,7 +573,6 @@ def _rows(initial: bool, elliptic: bool):
     efc_id_in: wp.array2d[int],
     efc_J_rownnz_in: wp.array2d[int],
     efc_J_rowadr_in: wp.array2d[int],
-    efc_J_colind_in: wp.array3d[int],
     efc_J_in: wp.array3d[float],
     efc_D_in: wp.array2d[float],
     efc_frictionloss_in: wp.array2d[float],
@@ -587,7 +583,7 @@ def _rows(initial: bool, elliptic: bool):
     ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     done_in: wp.array2d[bool],
-    dof2row_in: wp.array2d[int],
+    J_col_in: wp.array2d[int],
     row_jaref_in: wp.array2d[float],
     iJ_in: wp.array3d[float],
     lanes: int,
@@ -689,20 +685,19 @@ def _rows(initial: bool, elliptic: bool):
         w = 0.0
       rowadr = efc_J_rowadr_in[worldid, row]
       rownnz = efc_J_rownnz_in[worldid, row]
-      dof2row = dof2row_in[worldid]
-      colind = efc_J_colind_in[worldid, 0]
+      col = J_col_in[worldid]
       tilebase = tilebase_in[worldid, islandid]
       ntile = ntile_in[worldid, islandid]
       vbase = vbase_in[worldid, islandid]
       for k in range(rownnz):
-        cola = dof2row[colind[rowadr + k]]
+        cola = col[rowadr + k]
         Ja = efc_J_in[worldid, 0, rowadr + k]
         if force != 0.0:
           wp.atomic_add(frc_out[worldid], cola, Ja * force)
         if w != 0.0:
           Jaw = Ja * w
           for kb in range(k, rownnz):
-            rc = _pool_rc(tilebase, ntile, cola - vbase, dof2row[colind[rowadr + kb]] - vbase)
+            rc = _pool_rc(tilebase, ntile, cola - vbase, col[rowadr + kb] - vbase)
             wp.atomic_add(H_out[worldid, rc[0]], rc[1], Jaw * efc_J_in[worldid, 0, rowadr + kb])
 
   return kernel
@@ -1527,7 +1522,6 @@ def _dofs(
   efc_Ma_out: wp.array2d[float],
   # Out:
   row2dof_out: wp.array2d[int],
-  dof2row_out: wp.array2d[int],
   dof_poolrow_out: wp.array2d[int],
   dof_local_out: wp.array2d[int],
   iqacc_out: wp.array2d[float],
@@ -1553,7 +1547,6 @@ def _dofs(
       iqacc_out[worldid, row] = wp.where(warmstart, qacc_warmstart_in[worldid, dofid], qacc_smooth_in[worldid, dofid])
       iqfrc_smooth_out[worldid, row] = qfrc_smooth_in[worldid, dofid]
       ifrc_out[worldid, row] = 0.0
-  dof2row_out[worldid, dofid] = row
   dof_poolrow_out[worldid, dofid] = poolrow
   dof_local_out[worldid, dofid] = local
   if tree_awake_in:
@@ -1579,7 +1572,6 @@ def _create_context(m: types.Model, d: types.Data, g: island.SlotBuffers) -> Isl
     nrow_used=g.nrow_used,
     vbase=g.group_vbase,
     row2dof=wp.empty((nworld, nrow), dtype=int),
-    dof2row=wp.empty((nworld, m.nv), dtype=int),
     dof_poolrow=wp.empty((nworld, m.nv), dtype=int),
     dof_local=wp.empty((nworld, m.nv), dtype=int),
     qacc=wp.empty((nworld, nrow), dtype=float),
@@ -1672,7 +1664,6 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       d.efc.id,
       d.efc.J_rownnz,
       d.efc.J_rowadr,
-      d.efc.J_colind,
       d.efc.J,
       d.efc.D,
       d.efc.frictionloss,
@@ -1682,7 +1673,7 @@ def _evaluate(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotB
       ctx.ntile,
       ctx.vbase,
       ctx.done,
-      ctx.dof2row,
+      g.J_col,
       ctx.row_jaref,
       g.J,
       _lanes(d.nworld, d.njmax),
@@ -1929,12 +1920,11 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       d.nefc,
       d.efc.J_rownnz,
       d.efc.J_rowadr,
-      d.efc.J_colind,
       d.efc.J,
       g.efc_group,
       g.group_slot,
       ctx.vbase,
-      ctx.dof2row,
+      g.J_col,
       g.J,
       ctx.search.reshape((d.nworld, nrow)),
       ctx.search_unchanged,
@@ -2020,13 +2010,12 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       d.nefc,
       d.efc.J_rownnz,
       d.efc.J_rowadr,
-      d.efc.J_colind,
       d.efc.J,
       d.efc.aref,
       g.efc_group,
       g.group_slot,
       ctx.vbase,
-      ctx.dof2row,
+      g.J_col,
       g.J,
       ctx.qacc,
       island.DENSE_SOLVER,
@@ -2124,7 +2113,6 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
       d.qfrc_constraint,
       d.efc.Ma,
       ctx.row2dof,
-      ctx.dof2row,
       ctx.dof_poolrow,
       ctx.dof_local,
       ctx.qacc,

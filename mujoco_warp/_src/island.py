@@ -1089,6 +1089,8 @@ class SlotBuffers:
     self.dof_group = wp.empty((d.nworld, m.nv), dtype=int)
     self.dof_slotcol = wp.empty((d.nworld, m.nv), dtype=int)
     self.efc_group = wp.empty((d.nworld, d.njmax), dtype=int)
+    # sparse rows' columns as the island solver's DOF rows (efc.J_colind keeps MuJoCo's DOFs)
+    self.J_col = wp.empty((d.nworld, d.efc.J_colind.shape[2]), dtype=int)
     # per world scratch of _island_world
     self.tree_iofs = wp.empty(shape, dtype=int)
     self.island_root = wp.empty(shape, dtype=int)
@@ -1455,10 +1457,15 @@ def _island_rows(
   # Data in:
   nefc_in: wp.array[int],
   nisland_in: wp.array[int],
+  efc_J_rownnz_in: wp.array2d[int],
+  efc_J_rowadr_in: wp.array2d[int],
+  efc_J_colind_in: wp.array3d[int],
   island_iefcadr_in: wp.array2d[int],
   # In:
   island_group_in: wp.array2d[int],
   group_asleep_in: wp.array2d[bool],
+  dof_slotcol_in: wp.array2d[int],
+  group_vbase_in: wp.array2d[int],
   # Data out:
   efc_force_out: wp.array2d[float],
   efc_state_out: wp.array2d[int],
@@ -1467,10 +1474,12 @@ def _island_rows(
   map_iefc2efc_out: wp.array2d[int],
   # Out:
   efc_group_out: wp.array2d[int],
+  J_col_out: wp.array2d[int],
 ):
-  """Rows are in island order: identity maps, and each row's island and group.
+  """Rows are in island order: identity maps, and each row's island, group and solver columns.
 
-  Rows of sleeping groups are not solved: no force.
+  A sparse row's columns as the island solver's DOF rows: the group's first row plus the column's
+  place in the group. Rows of sleeping groups are not solved: no force.
   """
   worldid, efcid = wp.tid()
   if efcid >= nefc_in[worldid]:
@@ -1493,6 +1502,11 @@ def _island_rows(
   if group_asleep_in[worldid, g]:
     efc_force_out[worldid, efcid] = 0.0
     efc_state_out[worldid, efcid] = types.ConstraintState.SATISFIED
+    return
+  vbase = group_vbase_in[worldid, g]
+  rowadr = efc_J_rowadr_in[worldid, efcid]
+  for k in range(efc_J_rownnz_in[worldid, efcid]):
+    J_col_out[worldid, rowadr + k] = vbase + dof_slotcol_in[worldid, efc_J_colind_in[worldid, 0, rowadr + k]]
 
 
 def island_layout(
@@ -1581,8 +1595,19 @@ def island_rows_done(m: types.Model, d: types.Data):
   wp.launch(
     _island_rows,
     dim=(d.nworld, d.njmax),
-    inputs=[d.nefc, d.nisland, d.island_iefcadr, buf.island_group, buf.group_asleep],
-    outputs=[d.efc.force, d.efc.state, d.efc.island, d.map_efc2iefc, d.map_iefc2efc, buf.efc_group],
+    inputs=[
+      d.nefc,
+      d.nisland,
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.efc.J_colind,
+      d.island_iefcadr,
+      buf.island_group,
+      buf.group_asleep,
+      buf.dof_slotcol,
+      buf.group_vbase,
+    ],
+    outputs=[d.efc.force, d.efc.state, d.efc.island, d.map_efc2iefc, d.map_iefc2efc, buf.efc_group, buf.J_col],
   )
 
 
