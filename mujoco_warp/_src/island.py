@@ -1783,6 +1783,7 @@ def island_rows(m: types.Model) -> bool:
     # these read the Jacobian, which islands in slots write only to their slot
     and m.nefmdof == 0
     and m.actuator_trntype_body_adr.shape[0] == 0
+    and m.opt.noslip_iterations == 0
   )
 
 

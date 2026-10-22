@@ -494,6 +494,17 @@ class IslandSolverTest(absltest.TestCase):
     self.assertEqual(asleep1[-1].sum(), mjm.ntree - 1)
     np.testing.assert_allclose(qpos1, qpos0, atol=1e-3)
 
+  def test_noslip_solves_worlds(self):
+    """Noslip reads the Jacobian rows dense groups leave empty: it keeps the world solver."""
+    results = []
+    for island_solve in (True, False):
+      mjm, mjd, m, d = test_data.fixture(xml=_ROWS_XML, keyframe=0, overrides={"opt.noslip_iterations": 5})
+      m.opt.island_solve = island_solve
+      self.assertFalse(island.island_rows(m))
+      mjw.step(m, d)
+      results.append(d.qacc.numpy()[0])
+    np.testing.assert_allclose(results[0], results[1], rtol=1e-4, atol=1e-3)
+
   def test_island_groups(self):
     """Consecutive islands share a group up to MERGE_NV DOFs; the solution is unchanged."""
     mjm, mjd, m, d = _fixture()
