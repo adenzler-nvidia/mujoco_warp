@@ -104,6 +104,8 @@ class IslandContext:
   # piece is the same, so the search direction is kept and grad = grad_scale * (stored grad), as in
   # the world solver's stable-state fast path
   state_changed: wp.array2d[bool]
+  # the search direction is unchanged: the group is done or stable (as the world solver's)
+  search_unchanged: wp.array2d[bool]
   grad_scale: wp.array2d[float]
   # compacted lists of (world * ntree + group), see _group_layout
   group_count: wp.array[int]
@@ -177,6 +179,7 @@ def _group_layout(ntree: int):
     iqacc_out: wp.array2d[float],
     iqfrc_smooth_out: wp.array2d[float],
     ifrc_out: wp.array2d[float],
+    search_unchanged_out: wp.array2d[bool],
   ):
     """A world's groups: the compacted lists by solve path, their tiles and their layout.
 
@@ -192,6 +195,8 @@ def _group_layout(ntree: int):
     for g in range(lane, ntree, lanes):
       ntile = int(0)
       scale_out[worldid, g] = 0.0
+      # _done sets the island solver's groups'
+      search_unchanged_out[worldid, g] = True
       if g < ngroup:
         packed = worldid * ntree + g
         group_problem_out[worldid, g] = -1
@@ -281,7 +286,7 @@ def _init_rows(width: int):
 def _jv(width: int):
   """J search of a row for the linesearch, a thread per row as _linesearch_jv_fused_kernel.
 
-  Groups whose rows kept their states keep it (the search direction is unchanged). The loop over a
+  Groups whose search direction is unchanged (done or stable) keep it. The loop over a
   dense row unrolls, as in _init_rows.
   """
 
@@ -296,14 +301,11 @@ def _jv(width: int):
     efc_island_in: wp.array2d[int],
     # In:
     island_slot_in: wp.array2d[wp.vec4i],
-    ntile_in: wp.array2d[int],
     vbase_in: wp.array2d[int],
     dof2row_in: wp.array2d[int],
     iJ_in: wp.array3d[float],
     search_in: wp.array2d[float],
-    done_in: wp.array2d[bool],
-    niter_in: wp.array2d[int],
-    state_changed_in: wp.array2d[bool],
+    search_unchanged_in: wp.array2d[bool],
     # Out:
     row_jv_out: wp.array2d[float],
   ):
@@ -313,10 +315,7 @@ def _jv(width: int):
     g = efc_island_in[worldid, row]
     if g < 0:
       return
-    # the island solver's own groups only
-    if ntile_in[worldid, g] == 0:
-      return
-    if done_in[worldid, g] or _stable(niter_in[worldid, g], state_changed_in[worldid, g]):
+    if search_unchanged_in[worldid, g]:
       return
     jv = float(0.0)
     if island_slot_in[worldid, g][0] > 0:
@@ -548,23 +547,21 @@ def _mul_m_search(
   group_list_in: wp.array2d[int],
   vbase_in: wp.array2d[int],
   row2dof_in: wp.array2d[int],
-  done_in: wp.array2d[bool],
-  niter_in: wp.array2d[int],
-  state_changed_in: wp.array2d[bool],
   search_in: wp.array2d[float],
+  search_unchanged_in: wp.array2d[bool],
   # Out:
   mv_out: wp.array2d[float],
 ):
   """M search of a group's DOF for the linesearch, a thread per (group, DOF), as for a world.
 
-  An unchanged search direction (stable states) keeps it.
+  An unchanged search direction (done or stable) keeps it.
   """
   e, lane = wp.tid()
   if e >= group_count_in[0]:
     return
   worldid = group_list_in[0, e] // ntree
   g = group_list_in[0, e] % ntree
-  if done_in[worldid, g] or _stable(niter_in[worldid, g], state_changed_in[worldid, g]):
+  if search_unchanged_in[worldid, g]:
     return
   vbase = vbase_in[worldid, g]
   for la in range(lane, island_nv_in[worldid, g], _TILE):
@@ -916,17 +913,20 @@ def _done(warn_overflow: int):
     grad_in: wp.array2d[float],
     grad_scale_in: wp.array2d[float],
     newton_decrement_in: wp.array2d[float],
+    state_changed_in: wp.array2d[bool],
     # Data out:
     solver_niter_out: wp.array[int],
     overflow_out: wp.array[int],
     # Out:
     done_out: wp.array2d[bool],
     nsolving_out: wp.array[int],
+    search_unchanged_out: wp.array2d[bool],
   ):
     """Convergence test of a group still iterating, a thread per group, as _solve_done per world.
 
     While a group's states hold, its gradient and Newton decrement are grad_scale times the stored
-    ones (the stable-state fast path). Counts the groups still iterating.
+    ones (the stable-state fast path). Counts the groups still iterating, and marks those whose
+    search direction stays (done or stable), as the world solver's search_unchanged.
     """
     e = wp.tid()
     if e >= group_count_in[0]:
@@ -953,6 +953,7 @@ def _done(warn_overflow: int):
         or (wp.sqrt(grad_dot) / scale < tolerance)
         or (0.5 * newton_decrement_in[worldid, g] * grad_scale * grad_scale / scale < tolerance)
       )
+    search_unchanged_out[worldid, g] = True
     if converged or niter >= opt_iterations:
       done_out[worldid, g] = True
       if not converged and opt_iterations > 0:
@@ -966,6 +967,7 @@ def _done(warn_overflow: int):
       wp.atomic_max(solver_niter_out, worldid, niter)
     else:
       wp.atomic_add(nsolving_out, 0, 1)
+      search_unchanged_out[worldid, g] = _stable(niter, state_changed_in[worldid, g])
 
   return kernel
 
@@ -1616,6 +1618,7 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     newton_decrement=wp.empty((nworld, ntree), dtype=float),
     changed=wp.zeros((nworld, ntree), dtype=bool),
     state_changed=wp.zeros((nworld, ntree), dtype=bool),
+    search_unchanged=wp.empty((nworld, ntree), dtype=bool),
     grad_scale=wp.ones((nworld, ntree), dtype=float),
     group_count=wp.zeros(8, dtype=int),
     world_done=wp.zeros(nworld, dtype=bool),
@@ -1904,8 +1907,9 @@ def _launch_done(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Sl
       ctx.grad.reshape((d.nworld, nrow)),
       ctx.grad_scale,
       ctx.newton_decrement,
+      ctx.state_changed,
     ],
-    outputs=[d.solver_niter, d.overflow, ctx.done, ctx.nsolving],
+    outputs=[d.solver_niter, d.overflow, ctx.done, ctx.nsolving, ctx.search_unchanged],
   )
 
 
@@ -1926,10 +1930,8 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.group_list,
       ctx.vbase,
       ctx.row2dof,
-      ctx.done,
-      ctx.niter,
-      ctx.state_changed,
       ctx.search.reshape((d.nworld, nrow)),
+      ctx.search_unchanged,
     ],
     outputs=[ctx.mv],
   )
@@ -1944,14 +1946,11 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       d.efc.J,
       g.efc_group,
       g.group_slot,
-      ctx.ntile,
       ctx.vbase,
       ctx.dof2row,
       g.J,
       ctx.search.reshape((d.nworld, nrow)),
-      ctx.done,
-      ctx.niter,
-      ctx.state_changed,
+      ctx.search_unchanged,
     ],
     outputs=[ctx.row_jv],
   )
@@ -2117,6 +2116,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
       ctx.qacc,
       ctx.qfrc_smooth,
       ctx.frc,
+      ctx.search_unchanged,
     ],
     block_dim=m.block_dim.island_scan_sizes,
   )
