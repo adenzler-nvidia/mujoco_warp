@@ -3591,13 +3591,7 @@ def _cholesky_factorize_solve(
       block_dim=m.block_dim.update_gradient_cholesky,
     )
   else:
-    wp.launch(
-      _padding_h,
-      dim=(d.nworld, m.nv_pad - m.nv),
-      inputs=[m.nv, ctx.done],
-      outputs=[ctx.h],
-    )
-
+    # padded rows: the H init writes their identity (compacted worlds factor only their DOFs)
     # compacted or island-ordered DOFs are packed in front, so each world factors only that block
     nrow, _ = _blocked_bounds(m, d, ctx)
 
