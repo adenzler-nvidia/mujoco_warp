@@ -986,6 +986,8 @@ DENSE_TREES = False
 # groups with dense rows are solved by the dense world solver (island_solver._solve_dense); False:
 # by the island solver like every other group
 DENSE_SOLVER = False
+# the island solver's tile: its groups' DOFs take whole tiles of rows, and their Hessians pool tiles
+TILE = 32
 _dense = [True]
 
 
@@ -1078,6 +1080,12 @@ class SlotBuffers:
     self.group_slot = wp.empty(shape, dtype=wp.vec4i)
     self.group_asleep = wp.empty(shape, dtype=bool)
     self.island_slot = wp.empty(shape, dtype=wp.vec4i)
+    # the island solver's layout: tiles per side of its groups (0 for sleeping groups and those on
+    # the dense world solver), first pool tile, first aligned DOF row, the DOF rows a world uses
+    self.group_ntile = wp.empty(shape, dtype=int)
+    self.group_tilebase = wp.empty(shape, dtype=int)
+    self.group_vbase = wp.empty(shape, dtype=int)
+    self.nrow_used = wp.empty(d.nworld, dtype=int)
     self.dof_group = wp.empty((d.nworld, m.nv), dtype=int)
     self.dof_slotcol = wp.empty((d.nworld, m.nv), dtype=int)
     self.efc_group = wp.empty((d.nworld, d.njmax), dtype=int)
@@ -1163,6 +1171,7 @@ def _island_world(ntree: int):
     merge_nv: int,
     wide: int,
     dense_trees: bool,
+    dense_solver: bool,
     # Data out:
     nisland_out: wp.array[int],
     nidof_out: wp.array[int],
@@ -1194,6 +1203,10 @@ def _island_world(ntree: int):
     group_slot_out: wp.array2d[wp.vec4i],
     island_slot_out: wp.array2d[wp.vec4i],
     group_asleep_out: wp.array2d[bool],
+    group_ntile_out: wp.array2d[int],
+    group_tilebase_out: wp.array2d[int],
+    group_vbase_out: wp.array2d[int],
+    nrow_used_out: wp.array[int],
   ):
     """A world's islands, their rows, DOFs and groups, after the constraints merged their trees.
 
@@ -1372,6 +1385,22 @@ def _island_world(ntree: int):
       if g >= 0:
         island_slot_out[worldid, i] = group_slot_out[worldid, g]
 
+    # the island solver's layout: its groups' DOFs in whole tiles of rows, their Hessians in
+    # ntile x ntile pool tiles
+    for i in range(lane, ntree, lanes):
+      ntile = int(0)
+      if i < ngroup and not group_asleep_out[worldid, i]:
+        if not (dense_solver and group_slot_out[worldid, i][0] > 0):
+          ntile = (group_nv_out[worldid, i] + TILE - 1) // TILE
+      group_ntile_out[worldid, i] = ntile
+    _block_sync()
+    tiles = wp.tile_load(group_ntile_out[worldid], shape=ntree)
+    wp.tile_store(group_tilebase_out[worldid], wp.tile_scan_exclusive(wp.tile_map(wp.mul, tiles, tiles)))
+    wp.tile_store(group_vbase_out[worldid], wp.tile_scan_exclusive(tiles) * TILE)
+    nrow = wp.tile_sum(tiles)[0] * TILE
+    if lane == 0:
+      nrow_used_out[worldid] = nrow
+
   return kernel
 
 
@@ -1489,6 +1518,7 @@ def island_layout(
       MERGE_NV,
       dense_width(m) if _dense[0] and DENSE_NV >= 32 else 0,
       DENSE_TREES,
+      DENSE_SOLVER,
     ],
     outputs=[
       d.nisland,
@@ -1520,6 +1550,10 @@ def island_layout(
       buf.group_slot,
       buf.island_slot,
       buf.group_asleep,
+      buf.group_ntile,
+      buf.group_tilebase,
+      buf.group_vbase,
+      buf.nrow_used,
     ],
     block_dim=types.BlockDim.island_scan_sizes,
   )

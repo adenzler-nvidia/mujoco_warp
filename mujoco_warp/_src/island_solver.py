@@ -48,7 +48,7 @@ from mujoco_warp._src.warp_util import cache_kernel
 wp.set_module_options({"enable_backward": False})
 
 # the island tile pool's tile size (H, its factor, aligned DOF rows)
-_TILE = 32
+_TILE = island.TILE
 # threads per island: factorization as _update_gradient_cholesky, linesearch one warp as
 # _linesearch_iterative_kernel; one block per Hessian tile pair
 _ISLAND_THREADS = 64
@@ -107,7 +107,7 @@ class IslandContext:
   # the search direction is unchanged: the group is done or stable (as the world solver's)
   search_unchanged: wp.array2d[bool]
   grad_scale: wp.array2d[float]
-  # compacted lists of (world * ntree + group), see _group_layout
+  # compacted lists of (world * ntree + group), see _group_lists
   group_count: wp.array[int]
   group_list: wp.array2d[int]
   group_problem: wp.array2d[int]
@@ -155,80 +155,64 @@ def _select(keep: float, x: float) -> float:
   return wp.where(keep != 0.0, x, 0.0)
 
 
-@cache_kernel
-def _group_layout(ntree: int):
-  @wp.kernel(module="unique", enable_backward=False)
-  def kernel(
-    # In:
-    ngroup_in: wp.array[int],
-    group_nv_in: wp.array2d[int],
-    group_slot_in: wp.array2d[wp.vec4i],
-    group_asleep_in: wp.array2d[bool],
-    dense_solver: bool,
-    # Out:
-    group_count_out: wp.array[int],
-    group_list_out: wp.array2d[int],
-    group_problem_out: wp.array2d[int],
-    done_out: wp.array2d[bool],
-    ntile_out: wp.array2d[int],
-    scale_out: wp.array2d[float],
-    tilebase_out: wp.array2d[int],
-    vbase_out: wp.array2d[int],
-    nrow_used_out: wp.array[int],
-    row2dof_out: wp.array2d[int],
-    iqacc_out: wp.array2d[float],
-    iqfrc_smooth_out: wp.array2d[float],
-    ifrc_out: wp.array2d[float],
-    search_unchanged_out: wp.array2d[bool],
-  ):
-    """A world's groups: the compacted lists by solve path, their tiles and their layout.
+@wp.kernel
+def _group_lists(
+  # Model:
+  ntree: int,
+  # In:
+  ngroup_in: wp.array[int],
+  group_slot_in: wp.array2d[wp.vec4i],
+  group_asleep_in: wp.array2d[bool],
+  dense_solver: bool,
+  ntile_in: wp.array2d[int],
+  group_nv_in: wp.array2d[int],
+  vbase_in: wp.array2d[int],
+  # Out:
+  group_count_out: wp.array[int],
+  group_list_out: wp.array2d[int],
+  group_problem_out: wp.array2d[int],
+  done_out: wp.array2d[bool],
+  scale_out: wp.array2d[float],
+  search_unchanged_out: wp.array2d[bool],
+  row2dof_out: wp.array2d[int],
+  iqacc_out: wp.array2d[float],
+  iqfrc_smooth_out: wp.array2d[float],
+  ifrc_out: wp.array2d[float],
+):
+  """The compacted lists of the groups by solve path, a thread per group; its padding rows.
 
-    Lists 0-3: the island solver's groups (all, and by tiles per side: 1, 2, >= 3); count 4: groups
-    of several tiles. List 6: groups with dense rows on the dense world solver (island.DENSE_SOLVER,
-    see _solve_dense), problem index in group_problem; done for the island solver. Per group: first
-    pool tile and first aligned DOF row. The rows a world uses start as padding (zero, unmapped);
-    _dofs fills the groups' DOFs.
-    """
-    worldid, lane = wp.tid()
-    lanes = wp.block_dim()
-    ngroup = ngroup_in[worldid]
-    for g in range(lane, ntree, lanes):
-      ntile = int(0)
-      scale_out[worldid, g] = 0.0
-      # _done sets the island solver's groups'
-      search_unchanged_out[worldid, g] = True
-      if g < ngroup:
-        packed = worldid * ntree + g
-        group_problem_out[worldid, g] = -1
-        if group_asleep_in[worldid, g]:
-          done_out[worldid, g] = True
-        elif group_slot_in[worldid, g][0] > 0 and dense_solver:
-          p = wp.atomic_add(group_count_out, 6, 1)
-          group_list_out[6, p] = packed
-          group_problem_out[worldid, g] = p
-          done_out[worldid, g] = True
-        else:
-          group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed
-          ntile = _ntile(group_nv_in[worldid, g])
-          c = wp.min(ntile, 3)
-          group_list_out[c, wp.atomic_add(group_count_out, c, 1)] = packed
-          if ntile > 1:
-            wp.atomic_add(group_count_out, 4, 1)
-      ntile_out[worldid, g] = ntile
-    _sync()
-    tiles = wp.tile_load(ntile_out[worldid], shape=ntree)
-    wp.tile_store(tilebase_out[worldid], wp.tile_scan_exclusive(wp.tile_map(wp.mul, tiles, tiles)))
-    wp.tile_store(vbase_out[worldid], wp.tile_scan_exclusive(tiles) * _TILE)
-    nrow = wp.tile_sum(tiles)[0] * _TILE
-    if lane == 0:
-      nrow_used_out[worldid] = nrow
-    for row in range(lane, nrow, lanes):
-      row2dof_out[worldid, row] = -1
-      iqacc_out[worldid, row] = 0.0
-      iqfrc_smooth_out[worldid, row] = 0.0
-      ifrc_out[worldid, row] = 0.0
-
-  return kernel
+  Lists 0-3: the island solver's groups (all, and by tiles per side: 1, 2, >= 3); count 4: groups
+  of several tiles. List 6: groups with dense rows on the dense world solver (island.DENSE_SOLVER,
+  see _solve_dense), problem index in group_problem; done for the island solver. The rows past a
+  group's DOFs in its tiles are padding (zero, unmapped); _dofs fills its DOFs' rows.
+  """
+  worldid, g = wp.tid()
+  scale_out[worldid, g] = 0.0
+  # _done sets the island solver's groups'
+  search_unchanged_out[worldid, g] = True
+  if g >= ngroup_in[worldid]:
+    return
+  packed = worldid * ntree + g
+  group_problem_out[worldid, g] = -1
+  ntile = ntile_in[worldid, g]
+  if ntile == 0:
+    done_out[worldid, g] = True
+    if not group_asleep_in[worldid, g] and group_slot_in[worldid, g][0] > 0 and dense_solver:
+      p = wp.atomic_add(group_count_out, 6, 1)
+      group_list_out[6, p] = packed
+      group_problem_out[worldid, g] = p
+    return
+  vbase = vbase_in[worldid, g]
+  for row in range(vbase + group_nv_in[worldid, g], vbase + ntile * _TILE):
+    row2dof_out[worldid, row] = -1
+    iqacc_out[worldid, row] = 0.0
+    iqfrc_smooth_out[worldid, row] = 0.0
+    ifrc_out[worldid, row] = 0.0
+  group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed
+  c = wp.min(ntile, 3)
+  group_list_out[c, wp.atomic_add(group_count_out, c, 1)] = packed
+  if ntile > 1:
+    wp.atomic_add(group_count_out, 4, 1)
 
 
 @cache_kernel
@@ -455,7 +439,7 @@ def _init_islands(
 ):
   """Start a group, a thread per (group, DOF): M qacc and the convergence scale.
 
-  The scale is the inertia trace, summed into scale (zeroed by _group_layout).
+  The scale is the inertia trace, summed into scale (zeroed by _group_lists).
   """
   e, lane = wp.tid()
   if e >= group_count_in[0]:
@@ -1548,6 +1532,7 @@ def _dofs(
   dof_local_out: wp.array2d[int],
   iqacc_out: wp.array2d[float],
   iqfrc_smooth_out: wp.array2d[float],
+  ifrc_out: wp.array2d[float],
 ):
   """A DOF's aligned row, pool row (first tile column), local index, start point and smooth force.
 
@@ -1567,6 +1552,7 @@ def _dofs(
       row2dof_out[worldid, row] = dofid
       iqacc_out[worldid, row] = wp.where(warmstart, qacc_warmstart_in[worldid, dofid], qacc_smooth_in[worldid, dofid])
       iqfrc_smooth_out[worldid, row] = qfrc_smooth_in[worldid, dofid]
+      ifrc_out[worldid, row] = 0.0
   dof2row_out[worldid, dofid] = row
   dof_poolrow_out[worldid, dofid] = poolrow
   dof_local_out[worldid, dofid] = local
@@ -1582,15 +1568,16 @@ def _dofs(
     efc_Ma_out[worldid, dofid] = qfrc_smooth_in[worldid, dofid]
 
 
-def _create_context(m: types.Model, d: types.Data) -> IslandContext:
+def _create_context(m: types.Model, d: types.Data, g: island.SlotBuffers) -> IslandContext:
   ntile_pool, nrow = _island_pool_size(m.nv, m.ntree, _TILE)
   nworld, njmax, ntree = d.nworld, d.njmax, m.ntree
   pool = (nworld, ntile_pool * _TILE, _TILE)
   return IslandContext(
-    tilebase=wp.empty((nworld, ntree), dtype=int),
-    ntile=wp.empty((nworld, ntree), dtype=int),
-    nrow_used=wp.empty(nworld, dtype=int),
-    vbase=wp.empty((nworld, ntree), dtype=int),
+    # the layout is make_constraint's (island._island_world)
+    tilebase=g.group_tilebase,
+    ntile=g.group_ntile,
+    nrow_used=g.nrow_used,
+    vbase=g.group_vbase,
     row2dof=wp.empty((nworld, nrow), dtype=int),
     dof2row=wp.empty((nworld, m.nv), dtype=int),
     dof_poolrow=wp.empty((nworld, m.nv), dtype=int),
@@ -1598,7 +1585,7 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     qacc=wp.empty((nworld, nrow), dtype=float),
     Ma=wp.zeros((nworld, nrow), dtype=float),
     qfrc_smooth=wp.empty((nworld, nrow), dtype=float),
-    frc=wp.zeros((nworld, nrow), dtype=float),
+    frc=wp.empty((nworld, nrow), dtype=float),
     grad=wp.zeros((nworld, nrow, 1), dtype=float),
     search=wp.zeros((nworld, nrow, 1), dtype=float),
     mv=wp.zeros((nworld, nrow), dtype=float),
@@ -2091,34 +2078,29 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
 def solve(m: types.Model, d: types.Data) -> IslandContext:
   """Solve every island with its own Newton iteration and scatter the results back."""
   # make_constraint found the islands and wrote the rows in island order
-  ctx = _create_context(m, d)
   # islands are solved in groups (see island.MERGE)
   g = island.slot_buffers(m, d)
+  ctx = _create_context(m, d, g)
   dense = _create_dense(m, d, ctx, g) if island.DENSE_SOLVER else None
   ctx.dense = dense
   d.solver_niter.zero_()
   nrow = ctx.qacc.shape[1]
-  wp.launch_tiled(
-    _group_layout(m.ntree),
-    dim=d.nworld,
-    inputs=[g.ngroup, g.group_nv, g.group_slot, g.group_asleep, island.DENSE_SOLVER],
+  wp.launch(
+    _group_lists,
+    dim=(d.nworld, m.ntree),
+    inputs=[m.ntree, g.ngroup, g.group_slot, g.group_asleep, island.DENSE_SOLVER, g.group_ntile, g.group_nv, g.group_vbase],
     outputs=[
       ctx.group_count,
       ctx.group_list,
       ctx.group_problem,
       ctx.done,
-      ctx.ntile,
       ctx.scale,
-      ctx.tilebase,
-      ctx.vbase,
-      ctx.nrow_used,
+      ctx.search_unchanged,
       ctx.row2dof,
       ctx.qacc,
       ctx.qfrc_smooth,
       ctx.frc,
-      ctx.search_unchanged,
     ],
-    block_dim=m.block_dim.island_scan_sizes,
   )
   wp.launch(
     _dofs,
@@ -2147,6 +2129,7 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
       ctx.dof_local,
       ctx.qacc,
       ctx.qfrc_smooth,
+      ctx.frc,
     ],
   )
   # unconditional: entering a conditional body costs more than kernels without groups
