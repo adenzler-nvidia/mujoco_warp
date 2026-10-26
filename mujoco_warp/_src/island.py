@@ -1742,7 +1742,8 @@ def island_layout(
       buf.island_slot,
       buf.group_asleep,
     ],
-    block_dim=types.BlockDim.island_scan_sizes,
+    # whole warps of trees: its passes are bound by the block's barriers
+    block_dim=min(types.BlockDim.island_scan_sizes, -(-m.ntree // 32) * 32),
   )
   wp.launch(
     _island_dof_maps,
