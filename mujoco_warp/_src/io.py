@@ -2620,7 +2620,7 @@ def get_data_into(
         d.efc.J_rowadr.numpy()[world_id, :nefc],
         d.efc.J_colind.numpy()[world_id, 0],
       )
-      # islands solved in slots keep their rows only there, dense with island-local columns
+      # groups with dense rows (see island.DENSE_NV) keep them only there, in group-local columns
       slots = d.__dict__.get("_island_slots")
       if slots is not None:
         _island_slot_rows(efc_J, d, slots, world_id)
