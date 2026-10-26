@@ -3423,7 +3423,7 @@ def _JTDACJ_sparse(
     # Out:
     h_out: wp.array3d[float],
   ):
-    """J'DJ and cone curvature of sparse constraint blocks; skips done island groups (optional)."""
+    """J'DJ and cone curvature of sparse constraint blocks (pool: island groups still iterating)."""
     worldid, slot, lane = wp.tid()
     if wp.static(ELLIPTIC):
       lanes = wp.block_dim()
@@ -3434,7 +3434,8 @@ def _JTDACJ_sparse(
     count = efc_jtdaj_nblock_in[worldid]
     for groupid in range(slot, count, groups_per_world):
       head_row = efc_jtdaj_adr_in[worldid, groupid]
-      if efc_group_in:
+      if wp.static(POOL):
+        # the island solver's groups: skip done ones
         group = efc_group_in[worldid, head_row]
         if group < 0:
           continue
