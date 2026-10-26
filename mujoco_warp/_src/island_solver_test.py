@@ -19,6 +19,7 @@ import itertools
 
 import mujoco
 import numpy as np
+import warp as wp
 from absl.testing import absltest
 
 import mujoco_warp as mjw
@@ -506,6 +507,24 @@ class IslandSolverTest(absltest.TestCase):
     np.testing.assert_array_equal(asleep1[-1], asleep0[-1])
     self.assertEqual(asleep1[-1].sum(), mjm.ntree - 1)
     np.testing.assert_allclose(qpos1, qpos0, atol=1e-3)
+
+  def test_graph_capture(self):
+    """The island solve replays from a graph capture (its iterations are a conditional loop)."""
+    mjm, mjd, m, _ = _fixture()
+    self.assertTrue(island.island_rows(m))
+    qpos = []
+    for capture in (False, True):
+      d = mjw.put_data(mjm, mjd)
+      if capture:
+        with wp.ScopedCapture() as cap:
+          mjw.step(m, d)
+        for _ in range(3):
+          wp.capture_launch(cap.graph)
+      else:
+        for _ in range(3):
+          mjw.step(m, d)
+      qpos.append(d.qpos.numpy()[0])
+    np.testing.assert_allclose(qpos[1], qpos[0], rtol=1e-4, atol=1e-4)
 
   def test_fallback(self):
     """Models the island solver does not apply to are solved by the world solver."""
