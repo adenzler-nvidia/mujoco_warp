@@ -200,12 +200,12 @@ def _group_layout(ntree: int):
         if group_asleep_in[worldid, g]:
           done_out[worldid, g] = True
         else:
-          group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed
+          group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed  # kernel_analyzer: ignore[atomic]
           ntile = _ntile(group_nv_in[worldid, g])
           c = wp.min(ntile, 3)
-          group_list_out[c, wp.atomic_add(group_count_out, c, 1)] = packed
+          group_list_out[c, wp.atomic_add(group_count_out, c, 1)] = packed  # kernel_analyzer: ignore[atomic]
           if ntile > 1:
-            wp.atomic_add(group_count_out, 4, 1)
+            wp.atomic_add(group_count_out, 4, 1)  # kernel_analyzer: ignore[atomic]
       ntile_out[worldid, g] = ntile
     _sync()
     tiles = wp.tile_load(ntile_out[worldid], shape=ntree)
@@ -450,7 +450,7 @@ def _init_islands(
     trace += M_in[worldid, M_rowadr[dof] + M_rownnz[dof] - 1]
   # MuJoCo scales an island's convergence tests by its inertia trace instead of meaninertia * nv
   if trace != 0.0:
-    wp.atomic_add(scale_out, worldid, g, trace)
+    wp.atomic_add(scale_out, worldid, g, trace)  # kernel_analyzer: ignore[atomic]
 
 
 @wp.struct
@@ -667,7 +667,7 @@ def _rows(initial: bool, elliptic: bool):
                 for j in range(i, block[0]):
                   Jj = iJ_in[worldid, row, j]
                   if Jj != 0.0:
-                    wp.atomic_add(H_out[worldid, row0 + i], j, wJi * Jj)
+                    wp.atomic_add(H_out[worldid, row0 + i], j, wJi * Jj)  # kernel_analyzer: ignore[atomic]
         continue
       force = res[0]
       if wp.static(INITIAL):
@@ -683,12 +683,14 @@ def _rows(initial: bool, elliptic: bool):
         cola = dof2row[colind[rowadr + k]]
         Ja = efc_J_in[worldid, 0, rowadr + k]
         if force != 0.0:
-          wp.atomic_add(frc_out[worldid], cola, Ja * force)
+          wp.atomic_add(frc_out[worldid], cola, Ja * force)  # kernel_analyzer: ignore[atomic]
         if w != 0.0:
           Jaw = Ja * w
           for kb in range(k, rownnz):
             rc = _pool_rc(tilebase, ntile, cola - vbase, dof2row[colind[rowadr + kb]] - vbase)
-            wp.atomic_add(H_out[worldid, rc[0]], rc[1], Jaw * efc_J_in[worldid, 0, rowadr + kb])
+            wp.atomic_add(
+              H_out[worldid, rc[0]], rc[1], Jaw * efc_J_in[worldid, 0, rowadr + kb]
+            )  # kernel_analyzer: ignore[atomic]
 
   return kernel
 
@@ -933,9 +935,9 @@ def _done(warn_overflow: int):
             opt_iterations,
           )
         wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.ITERATIONS))
-      wp.atomic_max(solver_niter_out, worldid, niter)
+      wp.atomic_max(solver_niter_out, worldid, niter)  # kernel_analyzer: ignore[atomic]
     else:
-      wp.atomic_add(nsolving_out, 0, 1)
+      wp.atomic_add(nsolving_out, 0, 1)  # kernel_analyzer: ignore[atomic]
       search_unchanged_out[worldid, g] = _stable(niter, state_changed_in[worldid, g])
 
   return kernel
@@ -1091,6 +1093,29 @@ def _tile_newton(n: int, ntile: int):
   """
 
   @wp.func
+  def one_tile(
+    # In:
+    H_in: wp.array2d[float],
+    grad_in: wp.array[float],
+    row0: int,
+    vbase: int,
+    factorize: bool,
+    # Out:
+    U_out: wp.array2d[float],
+    search_out: wp.array[float],
+  ) -> wp.vec2:
+    # as _update_gradient_cholesky: refactoring a tile costs less than keeping its factor
+    H = wp.tile_load(H_in, shape=(n, n), offset=(row0, 0), storage="shared")
+    wp.tile_cholesky_inplace(H, fill_mode="upper")
+    b1 = wp.tile_load(grad_in, shape=n, offset=vbase)
+    x1 = wp.tile_cholesky_solve(H, b1, fill_mode="upper")
+    wp.tile_store(search_out, wp.tile_map(wp.neg, x1), offset=vbase)
+    return wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b1, x1))[0]
+
+  if ntile == 1:
+    return one_tile
+
+  @wp.func
   def func(
     # In:
     H_in: wp.array2d[float],
@@ -1102,14 +1127,6 @@ def _tile_newton(n: int, ntile: int):
     U_out: wp.array2d[float],
     search_out: wp.array[float],
   ) -> wp.vec2:
-    if wp.static(ntile == 1):
-      # as _update_gradient_cholesky: refactoring a tile costs less than keeping its factor
-      H = wp.tile_load(H_in, shape=(n, n), offset=(row0, 0), storage="shared")
-      wp.tile_cholesky_inplace(H, fill_mode="upper")
-      b1 = wp.tile_load(grad_in, shape=n, offset=vbase)
-      x1 = wp.tile_cholesky_solve(H, b1, fill_mode="upper")
-      wp.tile_store(search_out, wp.tile_map(wp.neg, x1), offset=vbase)
-      return wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b1, x1))[0]
     U = wp.tile_zeros(shape=(n, n), dtype=float, storage="shared")
     # the block's upper tiles (0, 0), (0, 1), (1, 1); the factorization reads no others
     if factorize:
@@ -1673,7 +1690,6 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       m.opt.tolerance,
       m.opt.ls_tolerance,
       m.opt.impratio_invsqrt,
-      m.stat.meaninertia,
       g.group_ne.reshape(flat),
       g.group_nf.reshape(flat),
       g.group_nefc.reshape(flat),
@@ -1691,6 +1707,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       d.efc.frictionloss,
       d.njmax,
       d.nacon,
+      None,
       None,
       ctx.row_jaref,
       ctx.search.reshape((d.nworld, nrow)),

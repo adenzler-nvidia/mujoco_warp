@@ -509,7 +509,8 @@ class IslandSolverTest(absltest.TestCase):
 
   def test_fallback(self):
     """Models the island solver does not apply to are solved by the world solver."""
-    for nbox, jacobian in ((2, "sparse"), (8, "dense")):
+    # small worlds (one group), a dense Jacobian, deterministic rows
+    for nbox, jacobian, deterministic in ((2, "sparse", 0), (8, "dense", 0), (8, "sparse", 1)):
       boxes = "".join(f'<body pos="{i} 0 .099"><freejoint/><geom type="box" size=".1 .1 .1"/></body>' for i in range(nbox))
       xml = f"""
       <mujoco>
@@ -521,6 +522,9 @@ class IslandSolverTest(absltest.TestCase):
       for island_solve in (True, False):
         _, _, m, d = test_data.fixture(xml=xml)
         m.opt.island_solve = island_solve
+        if deterministic:
+          self.assertEqual(island.island_rows(m), island_solve)
+          m.opt.deterministic = int(mjw.DeterminismType.CONSTRAINT)
         self.assertFalse(island.island_rows(m))
         mjw.step(m, d)
         results.append(d.qacc.numpy()[0])

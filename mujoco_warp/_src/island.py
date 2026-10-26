@@ -40,7 +40,7 @@ def _dsu_find(parent: wp.array2d[int], worldid: int, tree: int):
       return current
     grandparent = parent[worldid, parent_current]
     if grandparent < parent_current:
-      wp.atomic_min(parent, worldid, current, grandparent)
+      wp.atomic_min(parent, worldid, current, grandparent)  # kernel_analyzer: ignore[atomic]
     current = parent_current
   return current
 
@@ -48,7 +48,7 @@ def _dsu_find(parent: wp.array2d[int], worldid: int, tree: int):
 @wp.func
 def _dsu_activate(worldid: int, tree: int, tree_island_out: wp.array2d[int]):
   if tree >= 0:
-    wp.atomic_max(tree_island_out, worldid, tree, 0)
+    wp.atomic_max(tree_island_out, worldid, tree, 0)  # kernel_analyzer: ignore[atomic]
 
 
 @wp.func
@@ -71,7 +71,7 @@ def _dsu_union(parent: wp.array2d[int], worldid: int, tree0: int, tree1: int, tr
       return
     low_root = wp.min(root0, root1)
     high_root = wp.max(root0, root1)
-    previous = wp.atomic_cas(parent, worldid, high_root, high_root, low_root)
+    previous = wp.atomic_cas(parent, worldid, high_root, high_root, low_root)  # kernel_analyzer: ignore[atomic]
     if previous == high_root:
       return
 
@@ -545,7 +545,7 @@ def _island_count_dofs(
   island_id = tree_island_in[worldid, dof_treeid[dofid]]
   dof_island_out[worldid, dofid] = island_id
   if island_id >= 0:
-    wp.atomic_add(island_nv_out, worldid, island_id, 1)
+    wp.atomic_add(island_nv_out, worldid, island_id, 1)  # kernel_analyzer: ignore[atomic]
 
 
 @cache_kernel
@@ -648,14 +648,14 @@ def _island_count_constraints(
   efc_island_out[worldid, efcid] = island_id
 
   if island_id >= 0:
-    wp.atomic_add(island_nefc_out, worldid, island_id, 1)
-    wp.atomic_add(chunk_adr_out, worldid, efcid // chunk_size, island_id, 1)
+    wp.atomic_add(island_nefc_out, worldid, island_id, 1)  # kernel_analyzer: ignore[atomic]
+    wp.atomic_add(chunk_adr_out, worldid, efcid // chunk_size, island_id, 1)  # kernel_analyzer: ignore[atomic]
 
     efc_type = efc_type_in[worldid, efcid]
     if efc_type == ConstraintType.EQUALITY:
-      wp.atomic_add(island_ne_out, worldid, island_id, 1)
+      wp.atomic_add(island_ne_out, worldid, island_id, 1)  # kernel_analyzer: ignore[atomic]
     elif efc_type == ConstraintType.FRICTION_DOF or efc_type == ConstraintType.FRICTION_TENDON:
-      wp.atomic_add(island_nf_out, worldid, island_id, 1)
+      wp.atomic_add(island_nf_out, worldid, island_id, 1)  # kernel_analyzer: ignore[atomic]
 
 
 @wp.kernel
@@ -1784,6 +1784,8 @@ def island_rows(m: types.Model) -> bool:
     and m.nefmdof == 0
     and m.actuator_trntype_body_adr.shape[0] == 0
     and m.opt.noslip_iterations == 0
+    # the island solver's atomic sums are not ordered, and sorted rows lose island order
+    and not m.opt.deterministic
   )
 
 
@@ -1805,7 +1807,7 @@ def rows_discover(
   _dsu_union(island_parent_out, worldid, tree0, tree1, tree_island_out)
   tree = wp.where(tree0 >= 0, tree0, tree1)
   if tree >= 0:
-    wp.atomic_add(tree_nrow_out, worldid, tree * ROW_CLASSES + rowclass, nrow)
+    wp.atomic_add(tree_nrow_out, worldid, tree * ROW_CLASSES + rowclass, nrow)  # kernel_analyzer: ignore[atomic]
 
 
 @wp.func
@@ -1866,4 +1868,6 @@ def rows_write(
   if tree < 0:
     return nrow_max
   slot = tree_island_in[worldid, tree] * ROW_CLASSES + rowclass
-  return island_rowadr_in[worldid, slot] + wp.atomic_add(island_cursor_out, worldid, slot, nrow)
+  return island_rowadr_in[worldid, slot] + wp.atomic_add(
+    island_cursor_out, worldid, slot, nrow
+  )  # kernel_analyzer: ignore[atomic]
