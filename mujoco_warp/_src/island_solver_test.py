@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tests for the island Newton solver."""
 
+import contextlib
 import itertools
 
 import mujoco
@@ -36,6 +37,17 @@ def _chain() -> str:
     axis = "0 1 0" if i % 2 else "0 0 1"
     chain += f'<body pos=".1 0 0"><joint type="hinge" axis="{axis}"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".03"/>'
   return chain + "</body>" * 13
+
+
+@contextlib.contextmanager
+def _any_size():
+  """Island-solve models of any size (island.MIN_NV)."""
+  default = island.MIN_NV
+  island.MIN_NV = 0
+  try:
+    yield
+  finally:
+    island.MIN_NV = default
 
 
 def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True, cone: int = ConeType.PYRAMIDAL):
@@ -266,6 +278,7 @@ class IslandSolverTest(absltest.TestCase):
 
     The box falls freely, so the chain is the only group: the island solver's own path is skipped.
     """
+    self.enterContext(_any_size())
     xml = f"""
     <mujoco>
       <worldbody>
@@ -436,6 +449,7 @@ class IslandSolverTest(absltest.TestCase):
 
   def test_sleep(self):
     """Sleeping islands are skipped as by the compact solve: same states, qacc = 0, no force."""
+    self.enterContext(_any_size())
     xml = """
     <mujoco>
       <option jacobian="sparse"><flag sleep="enable"/></option>
@@ -493,6 +507,26 @@ class IslandSolverTest(absltest.TestCase):
     np.testing.assert_array_equal(asleep1[-1], asleep0[-1])
     self.assertEqual(asleep1[-1].sum(), mjm.ntree - 1)
     np.testing.assert_allclose(qpos1, qpos0, atol=1e-3)
+
+  def test_fallback(self):
+    """Models the island solver does not apply to are solved by the world solver."""
+    for nbox, jacobian in ((2, "sparse"), (8, "dense")):
+      boxes = "".join(f'<body pos="{i} 0 .099"><freejoint/><geom type="box" size=".1 .1 .1"/></body>' for i in range(nbox))
+      xml = f"""
+      <mujoco>
+        <option jacobian="{jacobian}"/>
+        <worldbody><geom type="plane" size="10 10 .1"/>{boxes}</worldbody>
+      </mujoco>
+      """
+      results = []
+      for island_solve in (True, False):
+        _, _, m, d = test_data.fixture(xml=xml)
+        m.opt.island_solve = island_solve
+        self.assertFalse(island.island_rows(m))
+        mjw.step(m, d)
+        results.append(d.qacc.numpy()[0])
+      # the same solve up to the order of atomic sums
+      np.testing.assert_allclose(results[0], results[1], rtol=1e-5, atol=1e-6)
 
   def test_noslip_solves_worlds(self):
     """Noslip reads the Jacobian rows dense groups leave empty: it keeps the world solver."""

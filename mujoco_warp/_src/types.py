@@ -2649,8 +2649,10 @@ class SolverContext:
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None
   compact_d_full: Optional["Data"] = None
-  # opt.island_solve: h and hfactor are tile pools holding one dense block per large island;
-  # grad and search are gathered into island-aligned rows (DOFs outside map to -1)
+  # h and hfactor are tile pools holding one dense block per large island (the world solver's island
+  # path, solver._create_solver_context(island=True))
+  island_pool: bool = False
+  # island path: grad and search are gathered into island-aligned rows (DOFs outside map to -1)
   h_row2dof: Optional[wp.array2d[int]] = None
   h_dof2row: Optional[wp.array2d[int]] = None
   h_dof_poolrow: Optional[wp.array2d[int]] = None

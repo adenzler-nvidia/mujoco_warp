@@ -131,6 +131,7 @@ def _create_solver_context(
     quad_changed_ids=wp.empty((nworld, njmax), dtype=int) if alloc_incremental else wp.empty((nworld, 0), dtype=int),
     quad_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
     state_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
+    island_pool=island,
   )
 
 
@@ -6061,24 +6062,6 @@ def _max_niter(
   solver_niter_out[worldid] = wp.max(solver_niter_out[worldid], niter_in[worldid])
 
 
-def _use_island_solve(m: types.Model) -> bool:
-  if not m.opt.island_solve:
-    return False
-  supported = (
-    m.opt.solver == types.SolverType.NEWTON
-    and m.is_sparse
-    and m.ntree > 1
-    and not (m.opt.disableflags & types.DisableBit.ISLAND)
-    and m.opt.integrator != types.IntegratorType.DISCRETE
-  )
-  if not supported:
-    raise ValueError(
-      "opt.island_solve requires the Newton solver, a sparse Jacobian, more than one tree, islands enabled,"
-      " and a non-discrete integrator"
-    )
-  return True
-
-
 def _island_solver():
   # imported lazily: island_solver builds on this module
   from mujoco_warp._src import island_solver
@@ -6088,7 +6071,8 @@ def _island_solver():
 
 @event_scope
 def solve(m: types.Model, d: types.Data):
-  island_solve = d.njmax > 0 and m.nv > 0 and _use_island_solve(m) and _island_solver().supported(m)
+  # opt.island_solve: the island solver where it applies (see island.island_rows), else the world's
+  island_solve = d.njmax > 0 and m.nv > 0 and _island_solver().supported(m)
   if (m.opt.enableflags & types.EnableBit.SLEEP) and not island_solve:
     island.update_active_dofs(m, d)
     if m.opt.integrator != types.IntegratorType.DISCRETE:
@@ -6106,7 +6090,7 @@ def solve(m: types.Model, d: types.Data):
     # sleeping islands are skipped; make_constraint found the islands sleep() reads
     _island_solver().solve(m, d)
   else:
-    ctx = _create_solver_context(m, d, island=_use_island_solve(m))
+    ctx = _create_solver_context(m, d)
     _solve(m, d, ctx)
     if m.opt.noslip_iterations > 0:
       noslip(m, d)
@@ -6133,7 +6117,8 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     # effective-metric scratch for the solver iterations, which may run inside wp.capture_while
     ctx.efm_con, ctx.flex_scratch = derivative.eff_mul_m_scratch(m, d)
 
-  island_solve = not compact and _use_island_solve(m)
+  # contexts created with island=True solve islands in the world solver
+  island_solve = not compact and ctx.island_pool
   if island_solve:
     _island_h_order(m, d, ctx)
     # the world solve below may be skipped

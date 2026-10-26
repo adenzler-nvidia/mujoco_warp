@@ -1199,6 +1199,9 @@ DENSE_NV = 32  # read at each make_constraint
 # the island solver classifies rows by type. MERGE = False keeps one island per group.
 MERGE = True  # read at each make_constraint
 MERGE_NV = 32  # read at each make_constraint
+# opt.island_solve solves islands for models of more than MIN_NV DOFs: a world of up to MERGE_NV
+# DOFs is one group, the world solver's problem (tests lower it)
+MIN_NV = MERGE_NV
 # groups of several trees also get dense rows; False: sparse (rows touch few of their columns)
 DENSE_TREES = False
 # groups with dense rows are solved by the dense world solver (island_solver._solve_dense); False:
@@ -1771,9 +1774,13 @@ def island_rows_done(m: types.Model, d: types.Data):
 
 
 def island_rows(m: types.Model) -> bool:
-  """Whether constraint rows are built in island order."""
+  """Whether constraint rows are built in island order (the island solver solves them).
+
+  Otherwise opt.island_solve falls back to the world solver.
+  """
   return (
     m.opt.island_solve
+    and m.nv > MIN_NV
     and m.opt.solver == types.SolverType.NEWTON
     and m.is_sparse
     and m.ntree > 1
