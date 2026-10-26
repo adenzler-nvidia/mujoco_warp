@@ -1349,7 +1349,7 @@ class SolverTest(parameterized.TestCase):
 
   @parameterized.parameters(ConeType.PYRAMIDAL, ConeType.ELLIPTIC)
   def test_island_solve(self, cone):
-    """Island solve matches the monolithic solve; small islands take the fast path."""
+    """The island solver matches the world solver and MuJoCo on islands of every kind."""
     pos = {
       "fly0": "0 0 2",  # unconstrained
       "fly1": "1 0 2",
@@ -1404,70 +1404,17 @@ class SolverTest(parameterized.TestCase):
 
     qacc0, qfrc0, force0 = run(False)
     qacc1, qfrc1, force1 = run(True)
+    self.assertTrue(island.island_rows(m))
     self.assertGreater(np.abs(qacc0[-3:]).min(), 1.0)
 
     free = np.arange(2, 26)  # fly0..3
     np.testing.assert_array_equal(qacc1[free], d.qacc_smooth.numpy()[0, free])
     np.testing.assert_array_equal(qfrc1[free], 0.0)
 
-    # pyramidal: arm and single boxes are small islands, the short stack (18 DOFs) and welded pair
-    # (12) medium ones; only the tall stack (36 DOFs, 3 tiles per side) gets a tile pool block.
-    # Elliptic cones are not on the fast paths.
-    ctx = solver._create_solver_context(m, d, island=True)
-    solver._island_h_order(m, d, ctx)
-    self.assertEqual(d.nidof.numpy()[0], mjm.nv - 24)
-    nisland = d.nisland.numpy()[0]
-    ntile = ctx.island_ntile.numpy()[0, :nisland]
-    island_nv = d.island_nv.numpy()[0, :nisland]
-    if cone == ConeType.PYRAMIDAL:
-      self.assertEqual(sorted(ntile[ntile > 0]), [3])
-      self.assertEqual(sorted(island_nv[(ntile == 0) & (island_nv > 8)]), [12, 18])
-    else:
-      self.assertEqual(sorted(ntile[ntile > 0]), [1, 1, 1, 1, 1, 2, 3])
-
     np.testing.assert_allclose(qacc1, qacc0, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(qfrc1, qfrc0, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(force1, force0, rtol=1e-4, atol=1e-4)
     _assert_eq(qacc1, mjd.qacc, "qacc")
-
-    if cone == ConeType.ELLIPTIC:
-      # elliptic models take the island solver too; the world solve's island paths below are only
-      # reached for pyramidal cones
-      return
-
-    # tile pool entries outside the island blocks are neither written nor read
-    m.opt.island_solve = True
-    # the world solve's island paths read every island's rows from the sparse Jacobian
-    with island.no_slots():
-      mjw.make_constraint(m, d)
-    ctx = solver._create_solver_context(m, d, island=True)
-    ctx.h.fill_(np.nan)
-    ctx.hfactor.fill_(np.nan)
-    # a poor warm start takes several iterations, so the incremental Hessian updates are exercised
-    d.qacc_warmstart.assign(np.random.default_rng(0).uniform(-5.0, 5.0, (1, mjm.nv)))
-    solver._solve(m, d, ctx)
-    self.assertGreater(d.solver_niter.numpy()[0], 1)
-    np.testing.assert_allclose(d.qacc.numpy()[0], qacc1, rtol=1e-3, atol=1e-3)
-
-    # each pool block is M + J'DJ over the quadratic rows of its island
-    nefc = d.nefc.numpy()[0]
-    J = np.zeros((nefc, mjm.nv))
-    rownnz, rowadr = d.efc.J_rownnz.numpy()[0], d.efc.J_rowadr.numpy()[0]
-    colind, Jval = d.efc.J_colind.numpy()[0, 0], d.efc.J.numpy()[0, 0]
-    for r in range(nefc):
-      J[r, colind[rowadr[r] : rowadr[r] + rownnz[r]]] = Jval[rowadr[r] : rowadr[r] + rownnz[r]]
-    DQ = d.efc.D.numpy()[0, :nefc] * (d.efc.state.numpy()[0, :nefc] == types.ConstraintState.QUADRATIC)
-    M = np.zeros((mjm.nv, mjm.nv))
-    mujoco.mj_fullM(mjm, mjd, M)
-    pool, row2dof = ctx.h.numpy()[0], ctx.h_row2dof.numpy()[0]
-    for i in np.flatnonzero(ctx.island_ntile.numpy()[0]):
-      c, tilebase, vbase = ctx.island_ntile.numpy()[0, i], ctx.island_tilebase.numpy()[0, i], ctx.island_vbase.numpy()[0, i]
-      dofs = row2dof[vbase : vbase + d.island_nv.numpy()[0, i]]
-      H = M[np.ix_(dofs, dofs)] + J[:, dofs].T @ (DQ[:, None] * J[:, dofs])
-      for ra in range(len(dofs)):
-        for rb in range(ra, len(dofs)):
-          entry = pool[16 * (tilebase + (ra // 16) * c + rb // 16) + ra % 16, rb % 16]
-          np.testing.assert_allclose(entry, H[ra, rb], rtol=1e-4, atol=1e-4)
 
     # a short rollout stays close to the monolithic solve (the pyramidal stack alone varies by ~5e-4
     # run to run, so this only catches plumbing errors such as frozen DOFs or a stale warmstart);
@@ -1480,91 +1427,6 @@ class SolverTest(parameterized.TestCase):
         mjw.step(m, d2)
       qpos.append(np.delete(d2.qpos.numpy()[0], np.arange(72, 114)))  # b0..b5
     np.testing.assert_allclose(qpos[1], qpos[0], atol=5e-3)
-
-  def test_island_solve_without_large_islands(self):
-    """Small and medium islands alone produce all solver outputs; the world solve is skipped."""
-    pos = {
-      "s0": "0 0 .049",
-      "s1": "1 0 .049",
-      **{f"k{i}": f"2 0 {0.049 + 0.099 * i:.3f}" for i in range(3)},
-      "fly": "4 0 2",
-      "w0": "3 0 1",
-      "w1": "3.2 0 1",
-    }
-    bodies = "".join(
-      f'<body name="{n}" pos="{p}"><freejoint/><geom type="box" size=".05 .05 .05"/></body>' for n, p in pos.items()
-    )
-    arm = (
-      '<body name="arm" pos="7 0 1"><joint type="hinge" axis="0 1 0" range="-.5 -.1" frictionloss=".5"/>'
-      '<geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/>'
-      '<body pos=".3 0 0"><joint type="hinge" axis="0 1 0" frictionloss=".2"/>'
-      '<geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/></body></body>'
-    )
-    qvel = np.zeros(2 + 6 * len(pos))
-    qvel[-3:] = [1.0, 2.0, 3.0]
-    xml = f"""
-    <mujoco>
-      <worldbody><geom type="plane" size="10 10 .1"/>{arm}{bodies}</worldbody>
-      <equality><weld body1="w0" body2="w1"/></equality>
-      <keyframe><key qvel="{" ".join(map(str, qvel))}"/></keyframe>
-    </mujoco>
-    """
-    overrides = {"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON}
-    mjm, mjd, m, d = test_data.fixture(xml=xml, keyframe=0, overrides=overrides)
-    self.assertTrue(m.is_sparse)
-    nefc = mjd.nefc
-
-    def run(island_solve):
-      m.opt.island_solve = island_solve
-      # island solve builds its rows in island order
-      mjw.make_constraint(m, d)
-      # start away from the solution
-      d.qacc_warmstart.zero_()
-      if island_solve:
-        # every output must be written
-        for arr in (d.qacc, d.qfrc_constraint, d.efc.force, d.efc.Ma):
-          arr.fill_(wp.inf)
-        d.efc.state.fill_(-1)
-        d.solver_niter.fill_(-1)
-      mjw.solve(m, d)
-      rows = _rows_by_constraint(d)
-      return [
-        d.qacc.numpy()[0].copy(),
-        d.qfrc_constraint.numpy()[0].copy(),
-        d.efc.force.numpy()[0, :nefc][rows],
-        d.efc.state.numpy()[0, :nefc][rows],
-        d.efc.Ma.numpy()[0].copy(),
-        d.solver_niter.numpy()[0],
-      ]
-
-    *ref, niter0 = run(False)
-    *out, niter1 = run(True)
-    ctx = solver._create_solver_context(m, d, island=True)
-    solver._island_h_order(m, d, ctx)
-    self.assertEqual(ctx.island_large.numpy()[0], 0)
-    for name, a, b in zip(("qacc", "qfrc_constraint", "efc.force", "efc.state", "efc.Ma"), out, ref):
-      np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-4, err_msg=name)
-    _assert_eq(out[0], mjd.qacc, "qacc")
-    self.assertGreater(niter1, 1)
-
-  def test_island_solve_small_cholesky(self):
-    """DOFs outside the large islands get no search direction, also for nv <= 32."""
-    bodies = "".join(f'<body pos="{x} 0 .049"><freejoint/><geom type="box" size=".05 .05 .05"/></body>' for x in (0, 1))
-    _, _, m, d = test_data.fixture(
-      xml=f'<mujoco><worldbody><geom type="plane" size="5 5 .1"/>{bodies}</worldbody></mujoco>',
-      overrides={"opt.cone": ConeType.PYRAMIDAL, "opt.solver": SolverType.NEWTON, "opt.jacobian": "sparse"},
-    )
-    self.assertLessEqual(m.nv, solver._BLOCK_CHOLESKY_DIM)
-    m.opt.island_solve = True
-    ctx = solver._create_solver_context(m, d, island=True)
-    solver._island_h_order(m, d, ctx)
-
-    # both boxes are small islands, so nothing is left for the main solve to factor
-    np.testing.assert_array_equal(ctx.island_ntile.numpy(), 0)
-    ctx.grad.fill_(1.0)
-    ctx.done.zero_()
-    solver._cholesky_factorize_solve(m, d, ctx)
-    np.testing.assert_array_equal(ctx.search.numpy(), 0.0)
 
   @parameterized.parameters(
     (ConeType.PYRAMIDAL, SolverType.CG, 25, 5),

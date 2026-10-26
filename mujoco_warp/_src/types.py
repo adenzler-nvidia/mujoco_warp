@@ -952,8 +952,8 @@ class Option:
       sensors are disabled or no sensors are present
     contact_sensor_maxmatch: max number of contacts considered by contact sensor matching criteria
                              contacts matched after this value is exceded will be ignored
-    island_solve: solve constraints per island class (experimental): unconstrained trees are
-                  excluded and constrained ones solved in compacted coordinates
+    island_solve: solve each constraint island as its own Newton problem (island_solver); models
+                  the island solver does not apply to take the world solver
     warn_overflow: overflow warning bitmask (OverflowType)
   """
 
@@ -2605,12 +2605,6 @@ class InverseContext:
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None
   compact_d_full: Optional["Data"] = None
-  # see SolverContext
-  efc_world: Optional[wp.array[int]] = None
-  efc_rowoff: Optional[wp.array[int]] = None
-  efc_problem: Optional[wp.array2d[int]] = None
-  nproblem: Optional[wp.array[int]] = None
-  problem_dof: Optional[wp.array2d[int]] = None
   # discrete integrator effective-metric scratch (see SolverContext)
   efm_con: Optional[tuple] = None
   flex_scratch: Optional[tuple] = None
@@ -2647,32 +2641,6 @@ class SolverContext:
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None
   compact_d_full: Optional["Data"] = None
-  # h and hfactor are tile pools holding one dense block per large island (the world solver's island
-  # path, solver._create_solver_context(island=True))
-  island_pool: bool = False
-  # island path: grad and search are gathered into island-aligned rows (DOFs outside map to -1)
-  h_row2dof: Optional[wp.array2d[int]] = None
-  h_dof2row: Optional[wp.array2d[int]] = None
-  h_dof_poolrow: Optional[wp.array2d[int]] = None
-  h_dof_local: Optional[wp.array2d[int]] = None
-  island_tilebase: Optional[wp.array2d[int]] = None
-  island_ntile: Optional[wp.array2d[int]] = None
-  island_vbase: Optional[wp.array2d[int]] = None
-  island_sums: Optional[wp.array2d[wp.vec2]] = None
-  island_large: Optional[wp.array[int]] = None  # 1 if any island is left for the world solve
-  pgrad: Optional[wp.array2d[float]] = None
-  psearch: Optional[wp.array2d[float]] = None
-  # islands solved as worlds: problem p's rows are rows [efc_rowoff[p], + nefc[p]) of world
-  # efc_world[p] in the efc and row workspace arrays (None: problem p is world p, from row 0)
-  efc_world: Optional[wp.array[int]] = None
-  efc_rowoff: Optional[wp.array[int]] = None
-  # row -> problem (-1: the row is not in a problem), for kernels with one thread per row
-  efc_problem: Optional[wp.array2d[int]] = None
-  # number of problems (shape (1,)); problems past it are empty (None: all nworld are problems)
-  nproblem: Optional[wp.array[int]] = None
-  # set with efc_world: world DOF of (problem, local DOF) (-1: padding); a problem's DOFs are
-  # whole trees in order, and its M is its world's sparse M
-  problem_dof: Optional[wp.array2d[int]] = None
   # discrete integrator effective-metric scratch built before the solver loop, which may run
   # inside wp.capture_while where memory cannot be allocated (None otherwise)
   efm_con: Optional[tuple] = None

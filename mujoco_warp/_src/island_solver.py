@@ -33,12 +33,8 @@ from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_pool_cholesky_newton_func
 from mujoco_warp._src.block_cholesky import solve_search_sums
 from mujoco_warp._src.solver import _JTDAJ_THREADS_PER_GROUP
-from mujoco_warp._src.solver import _ROW_EQUALITY
-from mujoco_warp._src.solver import _ROW_FRICTION
-from mujoco_warp._src.solver import _ROW_OTHER
 from mujoco_warp._src.solver import _elliptic_hessian_entry_from_projections
 from mujoco_warp._src.solver import _eval_constraint
-from mujoco_warp._src.solver import _island_pool_size
 from mujoco_warp._src.solver import _JTDACJ_sparse
 from mujoco_warp._src.solver import _jtdaj_groups_per_world
 from mujoco_warp._src.solver import _linesearch_iterative_kernel
@@ -49,11 +45,25 @@ wp.set_module_options({"enable_backward": False})
 
 # the island tile pool's tile size (H, its factor, aligned DOF rows)
 _TILE = 32
-# threads per island: factorization as _update_gradient_cholesky, linesearch one warp as
-# _linesearch_iterative_kernel; one block per Hessian tile pair
+
+_ROW_EQUALITY = 0
+_ROW_FRICTION = 1
+_ROW_OTHER = 2
+
+
+def _island_pool_size(nv: int, ntree: int, tile: int) -> tuple[int, int]:
+  """Tiles and aligned rows the tile pool needs at most.
+
+  A group of n DOFs takes ceil(n / tile) <= (n + tile - 1) / tile tiles per side; summed over at
+  most ntree groups of nv DOFs in all.
+  """
+  ntile = -(-(nv * nv + 2 * (tile - 1) * nv + (tile - 1) ** 2 * ntree) // (tile * tile))
+  nrow = -(-(nv + (tile - 1) * ntree) // tile) * tile
+  return ntile, nrow
+
+
+# threads per group of the per-group kernels (factorization as _update_gradient_cholesky)
 _ISLAND_THREADS = 64
-_LINESEARCH_THREADS = 32
-_PAIR_THREADS = 64
 
 
 @dataclasses.dataclass
@@ -145,11 +155,6 @@ def _stable(niter: int, state_changed: bool) -> bool:
 @wp.func
 def _ntile(ndof: int) -> int:
   return (ndof + _TILE - 1) // _TILE
-
-
-@wp.func
-def _select(keep: float, x: float) -> float:
-  return wp.where(keep != 0.0, x, 0.0)
 
 
 @cache_kernel
@@ -313,25 +318,6 @@ def _jv(width: int):
     row_jv_out[worldid, row] = jv
 
   return kernel
-
-
-@wp.func
-def _block_matvec(
-  # In:
-  pool: wp.array2d[float],
-  tilebase: int,
-  ntile: int,
-  vbase: int,
-  ndof: int,
-  x: wp.array[float],
-  la: int,
-) -> float:
-  """Row la of a symmetric island block times the island's part of x."""
-  acc = float(0.0)
-  for lb in range(ndof):
-    rc = _pool_rc(tilebase, ntile, la, lb)
-    acc += pool[rc[0], rc[1]] * x[vbase + lb]
-  return acc
 
 
 @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -1679,7 +1665,7 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
   # the world solver's linesearch, a block per group (_linesearch_iterative_kernel, island mode)
   flat = d.nworld * m.ntree
   wp.launch_tiled(
-    _linesearch_iterative_kernel(m.opt.ls_iterations, m.opt.cone, False, True, False, int(m.opt.warn_overflow), False, True),
+    _linesearch_iterative_kernel(m.opt.ls_iterations, m.opt.cone, False, True, False, int(m.opt.warn_overflow), True),
     dim=flat,
     inputs=[
       0,
@@ -1713,7 +1699,6 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.row_jv,
       ctx.row_cone,
       ctx.done.reshape(flat),
-      None,
       g.group_iefcadr.reshape(flat),
       ctx.group_count[0:1],
       ctx.group_list[0],
