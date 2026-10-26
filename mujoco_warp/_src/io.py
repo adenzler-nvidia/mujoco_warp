@@ -507,7 +507,6 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.stat = stat
   m.callback = types.Callback()
 
-  m.island_dense_nv = _island_dense_nv(mjm.tree_dofnum)
   m.island_tree_nv = _island_tree_nv(mjm.tree_dofnum)
   m.nv_pad = _get_padded_sizes(
     mjm.nv,
@@ -1400,16 +1399,6 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
 def _island_tree_nv(tree_dofnum) -> int:
   """Padded size of the largest tree of 17 to 32 DOFs; 16 if there is none."""
   sizes = [int(n) for n in tree_dofnum if 16 < n <= 32]
-  return (max(sizes) + 3) // 4 * 4 if sizes else 16
-
-
-def _island_dense_nv(tree_dofnum) -> int:
-  """Padded size of the largest possible island of 17 to 32 DOFs; 16 if there is none."""
-  # an island is a set of whole trees: its size is a subset sum of the trees' sizes
-  sums = 1
-  for n in tree_dofnum:
-    sums = (sums | (sums << int(n))) & ((1 << 33) - 1)
-  sizes = [n for n in range(17, 33) if (sums >> n) & 1]
   return (max(sizes) + 3) // 4 * 4 if sizes else 16
 
 

@@ -110,11 +110,8 @@ class IslandContext:
   # compacted lists of (world * ntree + group), see _group_layout
   group_count: wp.array[int]
   group_list: wp.array2d[int]
-  group_problem: wp.array2d[int]
   nsolving: wp.array[int]
-  # the dense world solver's model, data and context for two-tile groups (see _create_dense)
   world_done: wp.array[bool] = None  # all False: the initial J'DJ of every world
-  dense: object = None
 
 
 def supported(m: types.Model) -> bool:
@@ -164,11 +161,9 @@ def _group_layout(ntree: int):
     group_nv_in: wp.array2d[int],
     group_slot_in: wp.array2d[wp.vec4i],
     group_asleep_in: wp.array2d[bool],
-    dense_solver: bool,
     # Out:
     group_count_out: wp.array[int],
     group_list_out: wp.array2d[int],
-    group_problem_out: wp.array2d[int],
     done_out: wp.array2d[bool],
     ntile_out: wp.array2d[int],
     scale_out: wp.array2d[float],
@@ -181,13 +176,11 @@ def _group_layout(ntree: int):
     ifrc_out: wp.array2d[float],
     search_unchanged_out: wp.array2d[bool],
   ):
-    """A world's groups: the compacted lists by solve path, their tiles and their layout.
+    """A world's groups: the compacted lists of the awake ones, their tiles and their layout.
 
-    Lists 0-3: the island solver's groups (all, and by tiles per side: 1, 2, >= 3); count 4: groups
-    of several tiles. List 6: groups with dense rows on the dense world solver (island.DENSE_SOLVER,
-    see _solve_dense), problem index in group_problem; done for the island solver. Per group: first
-    pool tile and first aligned DOF row. The rows a world uses start as padding (zero, unmapped);
-    _dofs fills the groups' DOFs.
+    Lists 0-3: all, and by tiles per side (1, 2, >= 3); count 4: groups of several tiles. Per group:
+    first pool tile and first aligned DOF row. The rows a world uses start as padding (zero,
+    unmapped); _dofs fills the groups' DOFs.
     """
     worldid, lane = wp.tid()
     lanes = wp.block_dim()
@@ -199,13 +192,7 @@ def _group_layout(ntree: int):
       search_unchanged_out[worldid, g] = True
       if g < ngroup:
         packed = worldid * ntree + g
-        group_problem_out[worldid, g] = -1
         if group_asleep_in[worldid, g]:
-          done_out[worldid, g] = True
-        elif group_slot_in[worldid, g][0] > 0 and dense_solver:
-          p = wp.atomic_add(group_count_out, 6, 1)
-          group_list_out[6, p] = packed
-          group_problem_out[worldid, g] = p
           done_out[worldid, g] = True
         else:
           group_list_out[0, wp.atomic_add(group_count_out, 0, 1)] = packed
@@ -255,7 +242,6 @@ def _init_rows(width: int):
     dof2row_in: wp.array2d[int],
     iJ_in: wp.array3d[float],
     iqacc_in: wp.array2d[float],
-    dense_solver: bool,
     # Out:
     row_jaref_out: wp.array2d[float],
   ):
@@ -264,9 +250,6 @@ def _init_rows(width: int):
     if row < wp.min(nefc_in[worldid], efc_aref_in.shape[1]):
       islandid = efc_island_in[worldid, row]
       block = island_slot_in[worldid, islandid]
-      # groups on the dense world solver compute their own
-      if block[0] > 0 and dense_solver:
-        return
       jaref = -efc_aref_in[worldid, row]
       if block[0] > 0:
         vbase = vbase_in[worldid, islandid]
@@ -1234,269 +1217,6 @@ def _dense_factor(ntile: int):
   return kernel
 
 
-@wp.func
-def _quad_weight(state: int, D: float, active: float) -> float:
-  return wp.where(state == types.ConstraintState.QUADRATIC.value and active != 0.0, D, 0.0)
-
-
-# Groups with dense rows (see island.DENSE_NV) are solved by the dense world solver, each group
-# one problem of island.dense_width(m) DOFs: its rows are the group's rows in place
-# (SolverContext.efc_world and efc_rowoff), its Jacobian the dense rows (island.SlotBuffers.J), its
-# inertia the world's sparse M.
-
-
-@wp.kernel
-def _dense_scalars(
-  # Model:
-  ntree: int,
-  opt_tolerance: wp.array[float],
-  opt_ls_tolerance: wp.array[float],
-  # In:
-  group_count_in: wp.array[int],
-  group_list_in: wp.array2d[int],
-  group_nefc_in: wp.array2d[int],
-  group_ne_in: wp.array2d[int],
-  group_nf_in: wp.array2d[int],
-  group_iefcadr_in: wp.array2d[int],
-  # Out:
-  dense_nefc_out: wp.array[int],
-  dense_ne_out: wp.array[int],
-  dense_nf_out: wp.array[int],
-  dense_tolerance_out: wp.array[float],
-  dense_ls_tolerance_out: wp.array[float],
-  dense_efc_world_out: wp.array[int],
-  dense_efc_rowoff_out: wp.array[int],
-):
-  """Sizes, rows and tolerances of each dense problem (meaninertia: the J'DJ kernel)."""
-  p = wp.tid()
-  if p >= group_count_in[6]:
-    return
-  worldid = group_list_in[6, p] // ntree
-  g = group_list_in[6, p] % ntree
-  dense_nefc_out[p] = group_nefc_in[worldid, g]
-  dense_ne_out[p] = group_ne_in[worldid, g]
-  dense_nf_out[p] = group_nf_in[worldid, g]
-  dense_efc_world_out[p] = worldid
-  dense_efc_rowoff_out[p] = group_iefcadr_in[worldid, g]
-  dense_tolerance_out[p] = opt_tolerance[worldid % opt_tolerance.shape[0]]
-  dense_ls_tolerance_out[p] = opt_ls_tolerance[worldid % opt_ls_tolerance.shape[0]]
-
-
-@wp.kernel
-def _dense_dofs(
-  # Model:
-  island_dense_nv: int,
-  # Data in:
-  qacc_warmstart_in: wp.array2d[float],
-  qfrc_smooth_in: wp.array2d[float],
-  qacc_smooth_in: wp.array2d[float],
-  # In:
-  dof_group_in: wp.array2d[int],
-  dof_slotcol_in: wp.array2d[int],
-  group_nv_in: wp.array2d[int],
-  group_problem_in: wp.array2d[int],
-  # Out:
-  dense_qacc_warmstart_out: wp.array2d[float],
-  dense_qfrc_smooth_out: wp.array2d[float],
-  dense_qacc_smooth_out: wp.array2d[float],
-  dense_problem_dof_out: wp.array2d[int],
-):
-  """DOF vectors and maps of the dense problems, one thread per world DOF.
-
-  The thread of local DOF i also writes padding entries n + i, n + i + n, ...
-  """
-  worldid, dofid = wp.tid()
-  g = dof_group_in[worldid, dofid]
-  p = int(-1)
-  if g >= 0:
-    p = group_problem_in[worldid, g]
-  if p < 0:
-    return
-  i = dof_slotcol_in[worldid, dofid]
-  dense_qacc_warmstart_out[p, i] = qacc_warmstart_in[worldid, dofid]
-  dense_qfrc_smooth_out[p, i] = qfrc_smooth_in[worldid, dofid]
-  dense_qacc_smooth_out[p, i] = qacc_smooth_in[worldid, dofid]
-  dense_problem_dof_out[p, i] = dofid
-  n = group_nv_in[worldid, g]
-  for r in range(n + i, island_dense_nv, n):
-    dense_qacc_warmstart_out[p, r] = 0.0
-    dense_qfrc_smooth_out[p, r] = 0.0
-    dense_qacc_smooth_out[p, r] = 0.0
-    dense_problem_dof_out[p, r] = -1
-
-
-@wp.kernel
-def _dense_rowmap(
-  # Data in:
-  nefc_in: wp.array[int],
-  # In:
-  efc_group_in: wp.array2d[int],
-  group_problem_in: wp.array2d[int],
-  # Out:
-  efc_problem_out: wp.array2d[int],
-):
-  """Dense problem of each row (-1 for other rows)."""
-  worldid, efcid = wp.tid()
-  p = int(-1)
-  if efcid < nefc_in[worldid]:
-    g = efc_group_in[worldid, efcid]
-    if g >= 0:
-      p = group_problem_in[worldid, g]
-  efc_problem_out[worldid, efcid] = p
-
-
-@wp.kernel
-def _dense_scatter(
-  # In:
-  dof_group_in: wp.array2d[int],
-  dof_slotcol_in: wp.array2d[int],
-  group_problem_in: wp.array2d[int],
-  dense_qacc_in: wp.array2d[float],
-  dense_qfrc_constraint_in: wp.array2d[float],
-  dense_niter_in: wp.array[int],
-  dense_overflow_in: wp.array[int],
-  dense_Ma_in: wp.array2d[float],
-  # Data out:
-  solver_niter_out: wp.array[int],
-  qacc_out: wp.array2d[float],
-  qfrc_constraint_out: wp.array2d[float],
-  efc_Ma_out: wp.array2d[float],
-  overflow_out: wp.array[int],
-):
-  """Copy the dense problems' solution to their DOFs (rows' force and state are in place)."""
-  worldid, dofid = wp.tid()
-  g = dof_group_in[worldid, dofid]
-  if g < 0:
-    return
-  p = group_problem_in[worldid, g]
-  if p < 0:
-    return
-  i = dof_slotcol_in[worldid, dofid]
-  qacc_out[worldid, dofid] = dense_qacc_in[p, i]
-  qfrc_constraint_out[worldid, dofid] = dense_qfrc_constraint_in[p, i]
-  efc_Ma_out[worldid, dofid] = dense_Ma_in[p, i]
-  if i == 0:
-    wp.atomic_max(solver_niter_out, worldid, dense_niter_in[p])
-    wp.atomic_or(overflow_out, worldid, dense_overflow_in[p])
-
-
-@dataclasses.dataclass
-class _Dense:
-  m: types.Model
-  d: types.Data
-  ctx: object
-  nsolving: wp.array[int]
-
-
-def _create_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers) -> _Dense:
-  """Model, data and solver context of the dense problems (all arrays allocated here).
-
-  A problem's rows are its group's rows in d.efc; only DOF arrays are per problem.
-  """
-  from mujoco_warp._src import solver  # noqa: PLC0415 (solver dispatches to this module)
-
-  N = island.dense_width(m)
-  # at most one dense group per tree
-  ns = d.nworld * max(1, min(m.ntree, m.nv))
-  gc = m.opt.graph_conditional and wp.get_device().is_cuda
-  opt = dataclasses.replace(
-    m.opt, graph_conditional=gc, tolerance=wp.empty(ns, dtype=float), ls_tolerance=wp.empty(ns, dtype=float)
-  )
-  stat = dataclasses.replace(m.stat, meaninertia=wp.empty(ns, dtype=float))
-  m_dense = dataclasses.replace(m, opt=opt, stat=stat, nv=N, nv_pad=N, is_sparse=False)
-  efc = dataclasses.replace(d.efc, J=g.J, Ma=wp.zeros((ns, N), dtype=float))
-  d_dense = dataclasses.replace(
-    d,
-    nworld=ns,
-    nefc=wp.empty(ns, dtype=int),
-    ne=wp.empty(ns, dtype=int),
-    nf=wp.empty(ns, dtype=int),
-    qacc_warmstart=wp.empty((ns, N), dtype=float),
-    qfrc_smooth=wp.empty((ns, N), dtype=float),
-    qacc_smooth=wp.empty((ns, N), dtype=float),
-    qacc=wp.zeros((ns, N), dtype=float),
-    qfrc_constraint=wp.zeros((ns, N), dtype=float),
-    solver_niter=wp.zeros(ns, dtype=int),
-    overflow=wp.zeros(ns, dtype=int),
-    efc=efc,
-  )
-  # row workspace in the worlds' row layout, not per problem
-  sctx = solver._create_solver_context(m_dense, dataclasses.replace(d_dense, njmax=0))
-  sctx = dataclasses.replace(
-    sctx,
-    Jaref=wp.empty((d.nworld, d.njmax), dtype=float),
-    jv=wp.empty((d.nworld, d.njmax), dtype=float),
-    quad=wp.empty((d.nworld, d.njmax), dtype=wp.vec3),
-    quad_changed_ids=wp.empty((d.nworld, d.njmax), dtype=int),
-    efc_world=wp.empty(ns, dtype=int),
-    efc_rowoff=wp.empty(ns, dtype=int),
-    efc_problem=wp.empty((d.nworld, d.njmax), dtype=int),
-    nproblem=ctx.group_count[6:7],
-    problem_dof=wp.empty((ns, N), dtype=int),
-  )
-  return _Dense(m=m_dense, d=d_dense, ctx=sctx, nsolving=wp.empty(1, dtype=int))
-
-
-def _solve_dense(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers, dn: _Dense):
-  """Fill the dense problems, run the dense world solver on them and scatter the results back."""
-  from mujoco_warp._src import solver  # noqa: PLC0415
-
-  ms, ds, sctx = dn.m, dn.d, dn.ctx
-  wp.launch(
-    _dense_scalars,
-    dim=ds.nworld,
-    inputs=[
-      m.ntree,
-      m.opt.tolerance,
-      m.opt.ls_tolerance,
-      ctx.group_count,
-      ctx.group_list,
-      g.group_nefc,
-      g.group_ne,
-      g.group_nf,
-      g.group_iefcadr,
-    ],
-    outputs=[ds.nefc, ds.ne, ds.nf, ms.opt.tolerance, ms.opt.ls_tolerance, sctx.efc_world, sctx.efc_rowoff],
-  )
-  wp.launch(
-    _dense_dofs,
-    dim=(d.nworld, m.nv),
-    inputs=[
-      island.dense_width(m),
-      d.qacc_warmstart,
-      d.qfrc_smooth,
-      d.qacc_smooth,
-      g.dof_group,
-      g.dof_slotcol,
-      g.group_nv,
-      ctx.group_problem,
-    ],
-    outputs=[ds.qacc_warmstart, ds.qfrc_smooth, ds.qacc_smooth, sctx.problem_dof],
-  )
-  wp.launch(
-    _dense_rowmap,
-    dim=(d.nworld, d.njmax),
-    inputs=[d.nefc, g.efc_group, ctx.group_problem],
-    outputs=[sctx.efc_problem],
-  )
-  solver._solve(ms, ds, sctx, compact=True, nsolving=dn.nsolving)
-  wp.launch(
-    _dense_scatter,
-    dim=(d.nworld, m.nv),
-    inputs=[
-      g.dof_group,
-      g.dof_slotcol,
-      ctx.group_problem,
-      ds.qacc,
-      ds.qfrc_constraint,
-      ds.solver_niter,
-      ds.overflow,
-      ds.efc.Ma,
-    ],
-    outputs=[d.solver_niter, d.qacc, d.qfrc_constraint, d.efc.Ma, d.overflow],
-  )
-
-
 @wp.kernel
 def _scatter_dofs(
   # In:
@@ -1620,10 +1340,9 @@ def _create_context(m: types.Model, d: types.Data) -> IslandContext:
     state_changed=wp.zeros((nworld, ntree), dtype=bool),
     search_unchanged=wp.empty((nworld, ntree), dtype=bool),
     grad_scale=wp.ones((nworld, ntree), dtype=float),
-    group_count=wp.zeros(8, dtype=int),
+    group_count=wp.zeros(5, dtype=int),
     world_done=wp.zeros(nworld, dtype=bool),
-    group_list=wp.empty((7, nworld * ntree), dtype=int),
-    group_problem=wp.empty((nworld, ntree), dtype=int),
+    group_list=wp.empty((4, nworld * ntree), dtype=int),
     nsolving=wp.zeros(1, dtype=int),
   )
 
@@ -2025,8 +1744,8 @@ def _iteration(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
   _launch_done(m, d, ctx, g)
 
 
-def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
-  """Solve the island solver's own groups: one-tile groups whole, wider ones on the block path."""
+def _solve_groups(m: types.Model, d: types.Data, ctx: IslandContext, g: island.SlotBuffers):
+  """Solve the awake groups: one-tile groups whole, wider ones on the block path."""
   nrow = ctx.qacc.shape[1]
   _seed_pool(m, d, ctx, g)
   wp.launch(
@@ -2045,7 +1764,6 @@ def _solve_own(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       ctx.dof2row,
       g.J,
       ctx.qacc,
-      island.DENSE_SOLVER,
     ],
     outputs=[ctx.row_jaref],
   )
@@ -2097,18 +1815,15 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
   ctx = _create_context(m, d)
   # islands are solved in groups (see island.MERGE)
   g = island.slot_buffers(m, d)
-  dense = _create_dense(m, d, ctx, g) if island.DENSE_SOLVER else None
-  ctx.dense = dense
   d.solver_niter.zero_()
   nrow = ctx.qacc.shape[1]
   wp.launch_tiled(
     _group_layout(m.ntree),
     dim=d.nworld,
-    inputs=[g.ngroup, g.group_nv, g.group_slot, g.group_asleep, island.DENSE_SOLVER],
+    inputs=[g.ngroup, g.group_nv, g.group_slot, g.group_asleep],
     outputs=[
       ctx.group_count,
       ctx.group_list,
-      ctx.group_problem,
       ctx.done,
       ctx.ntile,
       ctx.scale,
@@ -2153,13 +1868,6 @@ def solve(m: types.Model, d: types.Data) -> IslandContext:
     ],
   )
   # unconditional: entering a conditional body costs more than kernels without groups
-  _solve_own(m, d, ctx, g)
-
-  # groups with dense rows on the dense world solver (island.DENSE_SOLVER); it scatters last
-  if dense is not None:
-    if m.opt.graph_conditional:
-      wp.capture_if(ctx.group_count[6:7], on_true=lambda: _solve_dense(m, d, ctx, g, dense))
-    else:
-      _solve_dense(m, d, ctx, g, dense)
+  _solve_groups(m, d, ctx, g)
 
   return ctx

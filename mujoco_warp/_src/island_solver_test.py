@@ -293,8 +293,7 @@ class IslandSolverTest(absltest.TestCase):
       "opt.jacobian": mujoco.mjtJacobian.mjJAC_SPARSE,
     }
     mjm, mjd, m, d = test_data.fixture(xml=xml, overrides=overrides)
-    # islands: the chain (18 DOFs), the box (6), or both (24); trees: the chain
-    self.assertEqual(m.island_dense_nv, 24)
+    # trees: the chain (18 DOFs, padded to 20) and the box (6)
     self.assertEqual(m.island_tree_nv, 20)
     m.opt.island_solve = True
     self.assertTrue(island.island_rows(m))
