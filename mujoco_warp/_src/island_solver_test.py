@@ -512,19 +512,22 @@ class IslandSolverTest(absltest.TestCase):
     """The island solve replays from a graph capture (its iterations are a conditional loop)."""
     mjm, mjd, m, _ = _fixture()
     self.assertTrue(island.island_rows(m))
-    qpos = []
+    # one step from a cold start, so the islands iterate (atomics make several steps drift apart)
+    mjd.qacc_warmstart[:] = 0.0
+    qacc, niter = [], []
     for capture in (False, True):
       d = mjw.put_data(mjm, mjd)
       if capture:
         with wp.ScopedCapture() as cap:
           mjw.step(m, d)
-        for _ in range(3):
-          wp.capture_launch(cap.graph)
+        wp.capture_launch(cap.graph)
       else:
-        for _ in range(3):
-          mjw.step(m, d)
-      qpos.append(d.qpos.numpy()[0])
-    np.testing.assert_allclose(qpos[1], qpos[0], rtol=1e-4, atol=1e-4)
+        mjw.step(m, d)
+      qacc.append(d.qacc.numpy()[0])
+      niter.append(d.solver_niter.numpy()[0])
+    self.assertGreater(niter[0], 1)
+    self.assertEqual(niter[1], niter[0])
+    np.testing.assert_allclose(qacc[1], qacc[0], rtol=1e-5, atol=1e-5 * np.abs(qacc[0]).max())
 
   def test_fallback(self):
     """Models the island solver does not apply to are solved by the world solver."""
