@@ -430,16 +430,22 @@ class IslandSolverTest(absltest.TestCase):
     self.assertGreaterEqual(d.solver_niter.numpy()[0], niter.max())
 
   def test_nefc_overflow(self):
-    """Islands and groups end at njmax when nefc overflows: their rows past it don't exist."""
+    """On nefc overflow the islands keep the world solver's rows (the last contacts drop)."""
     mjm, mjd, m, d = _fixture()
     nefc = int(d.nefc.numpy()[0])
     njmax = nefc // 2
-    # put_data checks njmax against mjd's rows: start from fresh data with the same state
-    d = mjw.put_data(mjm, mujoco.MjData(mjm), nconmax=d.naconmax, njmax=njmax)
-    d.qpos.assign(mjd.qpos[None])
-    d.qvel.assign(mjd.qvel[None])
-    mjw.forward(m, d)
+    kept = []
+    for island_solve in (False, True):
+      m.opt.island_solve = island_solve
+      # put_data checks njmax against mjd's rows: start from fresh data with the same state
+      d = mjw.put_data(mjm, mujoco.MjData(mjm), nconmax=d.naconmax, njmax=njmax)
+      d.qpos.assign(mjd.qpos[None])
+      d.qvel.assign(mjd.qvel[None])
+      mjw.forward(m, d)
+      kept.append(np.unique(d.efc.type.numpy()[0, :njmax], return_counts=True))
     self.assertGreater(d.nefc.numpy()[0], njmax)
+    for k1, k0 in zip(kept[1], kept[0]):
+      np.testing.assert_array_equal(k1, k0)
     g = island.slot_buffers(m, d)
     n, ng = d.nisland.numpy()[0], g.ngroup.numpy()[0]
     for adr, nrow in ((d.island_iefcadr, d.island_nefc), (g.group_iefcadr, g.group_nefc)):

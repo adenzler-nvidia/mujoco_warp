@@ -1441,6 +1441,13 @@ def _island_world(ntree: int):
         tree_island_out[worldid, t] = label
         if root == t:
           island_root_out[worldid, label] = t
+    # nefc overflow: one island, whose rows in class order lose the last contacts past njmax as the
+    # world solver's do (cutting at an island boundary drops whole islands, limits included)
+    if wp.tile_sum(wp.tile_load(tree_nrow_in[worldid], shape=NT))[0] > njmax_in and nisland > 1:
+      nisland = 1
+      for t in range(lane, ntree, lanes):
+        if tree_island_out[worldid, t] >= 0:
+          tree_island_out[worldid, t] = 0
     if lane == 0:
       nisland_out[worldid] = nisland
     _block_sync()
