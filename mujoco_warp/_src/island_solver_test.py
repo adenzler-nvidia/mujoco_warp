@@ -52,12 +52,13 @@ def _any_size():
 
 
 def _fixture(dense_nv: int = island.DENSE_NV, merge: bool = True, cone: int = ConeType.PYRAMIDAL):
-  """Islands of every kind: single boxes, stacks (2, 3 tiles per side), a weld, an arm, a chain."""
+  """Islands of every kind: single boxes, stacks (every factorization), a weld, an arm, a chain."""
   pos = {
     "s0": "0 0 .049",
     "s1": "1 0 .049",
-    **{f"k{i}": f"2 0 {0.049 + 0.099 * i:.3f}" for i in range(3)},
-    **{f"b{i}": f"5 0 {0.049 + 0.099 * i:.3f}" for i in range(6)},
+    **{f"k{i}": f"2 0 {0.049 + 0.099 * i:.3f}" for i in range(6)},
+    **{f"b{i}": f"5 0 {0.049 + 0.099 * i:.3f}" for i in range(9)},
+    **{f"t{i}": f"6 0 {0.049 + 0.099 * i:.3f}" for i in range(12)},
     "fly": "4 0 2",
     "w0": "3 0 1",
     "w1": "3.2 0 1",

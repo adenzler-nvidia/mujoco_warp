@@ -45,6 +45,9 @@ wp.set_module_options({"enable_backward": False})
 
 # the island tile pool's tile size (H, its factor, aligned DOF rows)
 _TILE = 32
+# two-tile groups up to this many DOFs are factored as one tile, larger ones blocked: a tile
+# padded to two pool tiles is slower than the blocked Cholesky
+_ONE_TILE_NV = 48
 
 _ROW_EQUALITY = 0
 _ROW_FRICTION = 1
@@ -64,6 +67,8 @@ def _island_pool_size(nv: int, ntree: int, tile: int) -> tuple[int, int]:
 
 # threads per group of the per-group kernels (factorization as _update_gradient_cholesky)
 _ISLAND_THREADS = 64
+# threads per group factored as one tile: more groups stay resident than with _ISLAND_THREADS
+_TILE_THREADS = 32
 
 
 @dataclasses.dataclass
@@ -1030,10 +1035,10 @@ def _factor(max_size: int):
     ntree: int,
     # Data in:
     nisland_in: wp.array[int],
+    island_nv_in: wp.array2d[int],
     # In:
     group_count_in: wp.array[int],
     group_list_in: wp.array2d[int],
-    cls: int,
     nblock: int,
     tilebase_in: wp.array2d[int],
     ntile_in: wp.array2d[int],
@@ -1051,17 +1056,20 @@ def _factor(max_size: int):
     newton_decrement_out: wp.array2d[float],
     grad_scale_out: wp.array2d[float],
   ):
-    """Newton search direction of an island over two tiles per side (blocked Cholesky)."""
+    """Newton search directions of the groups past _ONE_TILE_NV DOFs (blocked Cholesky)."""
     bid, lane = wp.tid()
-    for e in range(bid, group_count_in[cls], nblock):
-      worldid = group_list_in[cls, e] // ntree
-      islandid = group_list_in[cls, e] % ntree
+    # lists 2 (two tiles per side) and 3 (more)
+    n2 = group_count_in[2]
+    for e in range(bid, n2 + group_count_in[3], nblock):
+      packed = wp.where(e < n2, group_list_in[2, e], group_list_in[3, wp.max(e - n2, 0)])
+      worldid = packed // ntree
+      islandid = packed % ntree
       if islandid >= nisland_in[worldid]:
         continue
       if done_in[worldid, islandid]:
         continue
       ntile = ntile_in[worldid, islandid]
-      if ntile <= 2:
+      if ntile < 2 or island_nv_in[worldid, islandid] <= _ONE_TILE_NV:
         continue
       if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
         continue
@@ -1091,6 +1099,8 @@ def _tile_newton(n: int, ntile: int):
   One tile (n <= _TILE: the group fits n) is factored every time, as in the world solver; two keep
   their factor in U and only solve with it while no row changes.
   """
+  R = n - _TILE
+  PAD = max(ntile * _TILE - n, 1)
 
   @wp.func
   def one_tile(
@@ -1128,25 +1138,25 @@ def _tile_newton(n: int, ntile: int):
     search_out: wp.array[float],
   ) -> wp.vec2:
     U = wp.tile_zeros(shape=(n, n), dtype=float, storage="shared")
-    # the block's upper tiles (0, 0), (0, 1), (1, 1); the factorization reads no others
+    # the block's upper tiles (0, 0), (0, 1), (1, 1), cut to n; the factorization reads no others
     if factorize:
       wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, _TILE), offset=(row0, 0)))
-      if wp.static(ntile == 2):
-        wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
-        wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
+      wp.tile_assign(U, wp.tile_load(H_in, shape=(_TILE, R), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
+      wp.tile_assign(U, wp.tile_load(H_in, shape=(R, R), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
       wp.tile_cholesky_inplace(U, fill_mode="upper")
       wp.tile_store(U_out, wp.tile_view(U, offset=(0, 0), shape=(_TILE, _TILE)), offset=(row0, 0))
-      if wp.static(ntile == 2):
-        wp.tile_store(U_out, wp.tile_view(U, offset=(0, _TILE), shape=(_TILE, _TILE)), offset=(row0 + _TILE, 0))
-        wp.tile_store(U_out, wp.tile_view(U, offset=(_TILE, _TILE), shape=(_TILE, _TILE)), offset=(row0 + 3 * _TILE, 0))
+      wp.tile_store(U_out, wp.tile_view(U, offset=(0, _TILE), shape=(_TILE, R)), offset=(row0 + _TILE, 0))
+      wp.tile_store(U_out, wp.tile_view(U, offset=(_TILE, _TILE), shape=(R, R)), offset=(row0 + 3 * _TILE, 0))
     else:
       wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, _TILE), offset=(row0, 0)))
-      if wp.static(ntile == 2):
-        wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, _TILE), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
-        wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, _TILE), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
+      wp.tile_assign(U, wp.tile_load(U_out, shape=(_TILE, R), offset=(row0 + _TILE, 0)), offset=(0, _TILE))
+      wp.tile_assign(U, wp.tile_load(U_out, shape=(R, R), offset=(row0 + 3 * _TILE, 0)), offset=(_TILE, _TILE))
     b = wp.tile_load(grad_in, shape=n, offset=vbase)
     x = wp.tile_cholesky_solve(U, b, fill_mode="upper")
     wp.tile_store(search_out, wp.tile_map(wp.neg, x), offset=vbase)
+    if wp.static(n < ntile * _TILE):
+      # the group's DOF rows past n are padding
+      wp.tile_store(search_out, wp.tile_zeros(shape=PAD, dtype=float), offset=vbase + n)
     return wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, b, x))[0]
 
   return func
@@ -1159,7 +1169,7 @@ def _dense_factor(ntile: int):
   One-tile groups of at most half a tile of DOFs are factored at half the size (cuSolverDx is
   slower at sizes between).
   """
-  N = ntile * _TILE
+  N = _TILE if ntile == 1 else _ONE_TILE_NV
   HALF = _TILE // 2
   full = _tile_newton(N, ntile)
   half = _tile_newton(HALF, 1) if ntile == 1 else full
@@ -1202,13 +1212,16 @@ def _dense_factor(ntile: int):
         continue
       if ntile_in[worldid, islandid] != wp.static(ntile):
         continue
+      nv = island_nv_in[worldid, islandid]
+      if nv > N:
+        continue
       if _stable(niter_in[worldid, islandid], state_changed_in[worldid, islandid]):
         continue
       vbase = vbase_in[worldid, islandid]
       row0 = _TILE * tilebase_in[worldid, islandid]
       factorize = changed_in[worldid, islandid] or niter_in[worldid, islandid] == 0
       sums = wp.vec2(0.0)
-      if wp.static(ntile == 1) and island_nv_in[worldid, islandid] <= HALF:
+      if wp.static(ntile == 1) and nv <= HALF:
         sums = wp.static(half)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
       else:
         sums = wp.static(full)(H_in[worldid], grad_in[worldid], row0, vbase, factorize, U_out[worldid], search_out[worldid])
@@ -1572,7 +1585,7 @@ def _direction(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
         ctx.H,
       ],
       outputs=[ctx.U, ctx.search.reshape((d.nworld, nrow)), ctx.search_dot, ctx.newton_decrement, ctx.grad_scale],
-      block_dim=_ISLAND_THREADS,
+      block_dim=_TILE_THREADS,
     )
 
   def blocked_factor():
@@ -1582,9 +1595,9 @@ def _direction(m: types.Model, d: types.Data, ctx: IslandContext, g: island.Slot
       inputs=[
         m.ntree,
         g.ngroup,
+        g.group_nv,
         ctx.group_count,
         ctx.group_list,
-        3,
         _nblock(),
         ctx.tilebase,
         ctx.ntile,
