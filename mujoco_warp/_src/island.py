@@ -1227,14 +1227,13 @@ def rows_slot(
   tree: int,
   efcid: int,
   island_slot_in: wp.array2d[wp.vec4i],
-) -> wp.vec3i:
-  """Dense row and width of a constraint's first row (width 0, row -1: the row is sparse)."""
+) -> int:
+  """A constraint's first dense row: efcid in a group with dense rows, else -1 (sparse rows)."""
   if tree < 0:
-    return wp.vec3i(-1, 0, 0)
-  width = island_slot_in[worldid, tree_island_in[worldid, tree]][0]
-  if width == 0:
-    return wp.vec3i(-1, 0, 0)
-  return wp.vec3i(efcid, width, 0)
+    return -1
+  if island_slot_in[worldid, tree_island_in[worldid, tree]][0] == 0:
+    return -1
+  return efcid
 
 
 @wp.func
@@ -1242,8 +1241,6 @@ def slot_zero(
   # In:
   worldid: int,
   srow: int,
-  snv: int,
-  sstride: int,
   nrow: int,
   # Out:
   slot_J_out: wp.array3d[float],
@@ -1260,7 +1257,6 @@ def slot_set(
   # In:
   worldid: int,
   srow: int,
-  sstride: int,
   k: int,
   dofid: int,
   value: float,
@@ -1884,6 +1880,31 @@ def rows_write(
   return island_rowadr_in[worldid, slot] + wp.atomic_add(
     island_cursor_out, worldid, slot, nrow
   )  # kernel_analyzer: ignore[atomic]
+
+
+@wp.func
+def rows_island(
+  # Data in:
+  tree_island_in: wp.array2d[int],
+  # In:
+  worldid: int,
+  tree0: int,
+  tree1: int,
+  nrow: int,
+  rowclass: int,
+  nrow_max: int,
+  island_rowadr_in: wp.array2d[int],
+  island_slot_in: wp.array2d[wp.vec4i],
+  # Data out:
+  nefc_out: wp.array[int],
+  # Out:
+  island_cursor_out: wp.array2d[int],
+) -> wp.vec2i:
+  """A constraint's rows in island order (counted in nefc): its first row and first dense row."""
+  wp.atomic_add(nefc_out, worldid, nrow)  # kernel_analyzer: ignore[atomic]
+  tree = wp.where(tree0 >= 0, tree0, tree1)
+  efcid = rows_write(tree_island_in, worldid, tree, nrow, rowclass, nrow_max, island_rowadr_in, island_cursor_out)
+  return wp.vec2i(efcid, rows_slot(tree_island_in, worldid, tree, efcid, island_slot_in))
 
 
 @wp.func
