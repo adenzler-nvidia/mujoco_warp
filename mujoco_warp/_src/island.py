@@ -1793,6 +1793,8 @@ def island_rows(m: types.Model) -> bool:
     and m.opt.noslip_iterations == 0
     # the island solver's atomic sums are not ordered, and sorted rows lose island order
     and not m.opt.deterministic
+    # DOFs outside all islands take qacc_smooth, which run_qacc_smooth=False leaves stale
+    and m.opt.run_qacc_smooth
   )
 
 
@@ -1878,3 +1880,30 @@ def rows_write(
   return island_rowadr_in[worldid, slot] + wp.atomic_add(
     island_cursor_out, worldid, slot, nrow
   )  # kernel_analyzer: ignore[atomic]
+
+
+@wp.func
+def rows_reserve(
+  # In:
+  worldid: int,
+  efcid: int,
+  nrow: int,
+  rownnz: int,
+  nrow_max: int,
+  nnz_max: int,
+  # Out:
+  efc_nnz_out: wp.array[int],
+) -> int:
+  """Sparse Jacobian storage of a block of rows at efcid, as constraint._reserve_efc_nnz.
+
+  Island order places rows before their storage, so they exist either way: -1 if the storage does
+  not fit, and they are written empty.
+  """
+  nrow = wp.min(nrow, nrow_max - efcid)
+  if nrow <= 0 or rownnz == 0:
+    return 0
+  nnz = nrow * rownnz
+  rowadr = wp.atomic_add(efc_nnz_out, worldid, nnz)  # kernel_analyzer: ignore[atomic]
+  if rowadr + nnz > nnz_max:
+    return -1
+  return rowadr

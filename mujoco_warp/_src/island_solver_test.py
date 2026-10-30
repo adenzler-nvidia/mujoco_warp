@@ -538,8 +538,9 @@ class IslandSolverTest(absltest.TestCase):
 
   def test_fallback(self):
     """Models the island solver does not apply to are solved by the world solver."""
-    # small worlds (one group), a dense Jacobian, deterministic rows
-    for nbox, jacobian, deterministic in ((2, "sparse", 0), (8, "dense", 0), (8, "sparse", 1)):
+    # small worlds (one group), a dense Jacobian, deterministic rows, no qacc_smooth
+    cases = ((2, "sparse", 0, True), (8, "dense", 0, True), (8, "sparse", 1, True), (8, "sparse", 0, False))
+    for nbox, jacobian, deterministic, run_qacc_smooth in cases:
       boxes = "".join(f'<body pos="{i} 0 .099"><freejoint/><geom type="box" size=".1 .1 .1"/></body>' for i in range(nbox))
       xml = f"""
       <mujoco>
@@ -551,14 +552,60 @@ class IslandSolverTest(absltest.TestCase):
       for island_solve in (True, False):
         _, _, m, d = test_data.fixture(xml=xml)
         m.opt.island_solve = island_solve
-        if deterministic:
+        if deterministic or not run_qacc_smooth:
           self.assertEqual(island.island_rows(m), island_solve)
-          m.opt.deterministic = int(mjw.DeterminismType.CONSTRAINT)
+          m.opt.deterministic = int(mjw.DeterminismType.CONSTRAINT) if deterministic else 0
+          m.opt.run_qacc_smooth = run_qacc_smooth
         self.assertFalse(island.island_rows(m))
         mjw.step(m, d)
         results.append(d.qacc.numpy()[0])
       # the same solve up to the order of atomic sums
       np.testing.assert_allclose(results[0], results[1], rtol=1e-5, atol=1e-6)
+
+  def test_njmax_nnz_overflow(self):
+    """Island rows past their sparse storage stay empty: no stale layout, as rows in world order."""
+    self.enterContext(_any_size())
+    self.enterContext(island.no_slots())
+    bodies = "".join(f'<body pos="{i} 0 1"><freejoint/><geom size=".1"/></body>' for i in range(1, 5))
+    xml = f"""
+    <mujoco>
+      <option jacobian="sparse"/>
+      <worldbody>
+        <geom type="plane" size="10 10 .01"/>
+        <body pos="0 0 1"><joint range="-.1 .1"/><geom size=".05" contype="0" conaffinity="0"/></body>
+        {bodies}
+      </worldbody>
+      <keyframe><key qpos=".5  1 0 .09 1 0 0 0  2 0 .09 1 0 0 0  3 0 .09 1 0 0 0  4 0 .09 1 0 0 0"/></keyframe>
+    </mujoco>
+    """
+    for cone, overflow in itertools.product((ConeType.PYRAMIDAL, ConeType.ELLIPTIC), (True, False)):
+      mjm, mjd, m, d = test_data.fixture(
+        xml=xml, overrides={"opt.cone": cone, "opt.island_solve": True}, njmax_nnz=30 if overflow else None
+      )
+      self.assertTrue(island.island_rows(m))
+      mujoco.mj_resetDataKeyframe(mjm, mjd, 0)
+      d.qpos.assign(mjd.qpos[None])
+      # stale layout from a previous step: rows covering the whole storage
+      d.efc.J_rowadr.fill_(0)
+      d.efc.J_rownnz.fill_(mjm.nv)
+      d.overflow.zero_()
+      mjw.fwd_position(m, d)
+
+      nrow = min(d.nefc.numpy()[0], d.njmax)
+      adr, nnz = d.efc.J_rowadr.numpy()[0, :nrow], d.efc.J_rownnz.numpy()[0, :nrow]
+      self.assertEqual(bool(d.overflow.numpy()[0] & int(mjw.OverflowType.NJMAX_NNZ)), overflow)
+      np.testing.assert_array_less(-1, adr)
+      np.testing.assert_array_less(adr + nnz, d.njmax_nnz + 1)
+      kept = nnz > 0
+      order = np.argsort(adr[kept])
+      ends, starts = (adr + nnz)[kept][order], adr[kept][order]
+      np.testing.assert_array_less(ends[:-1], starts[1:] + 1, err_msg="overlapping rows")
+      contact = d.efc.type.numpy()[0, :nrow] >= int(mujoco.mjtConstraint.mjCNSTR_CONTACT_FRICTIONLESS)
+      # contacts keep all their rows: those without storage are empty
+      self.assertEqual(set(nnz[contact]), {0, 6} if overflow else {6})
+      colind = d.efc.J_colind.numpy()[0, 0]
+      for a, n in zip(adr, nnz):
+        self.assertTrue(np.all((colind[a : a + n] >= 0) & (colind[a : a + n] < mjm.nv)))
 
   def test_noslip_solves_worlds(self):
     """Noslip reads the Jacobian rows dense groups leave empty: it keeps the world solver."""
