@@ -519,6 +519,10 @@ def _zero_island_counts(
 @event_scope
 def island(m: types.Model, d: types.Data):
   """Discover constraint islands."""
+  if island_rows(m):
+    # make_constraint found them from the constraints' trees (dense rows have no sparse entries)
+    return
+
   if m.ntree == 0:
     wp.launch(
       _zero_island_counts,

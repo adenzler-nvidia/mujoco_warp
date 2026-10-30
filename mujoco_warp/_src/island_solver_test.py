@@ -454,6 +454,49 @@ class IslandSolverTest(absltest.TestCase):
       self.assertLessEqual((adr + nrow)[nrow > 0].max(), njmax)
     self.assertTrue(np.isfinite(d.qacc.numpy()).all())
 
+  def test_sleep_islands(self):
+    """With sleep, the islands sleep reads are those of the rows the island solver solves."""
+    self.enterContext(_any_size())
+    xml = """
+    <mujoco>
+      <option jacobian="sparse"><flag sleep="enable"/></option>
+      <worldbody>
+        <geom type="plane" size="5 5 .1"/>
+        <body pos="0 0 .09"><freejoint/><geom type="box" size=".1 .1 .1"/></body>
+        <body pos="2 0 1">
+          <joint name="j0" type="hinge" axis="0 1 0"/>
+          <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/>
+          <body pos=".3 0 0">
+            <joint name="j1" type="hinge" axis="0 1 0"/>
+            <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02"/>
+          </body>
+        </body>
+      </worldbody>
+      <equality><joint joint1="j0" joint2="j1"/></equality>
+    </mujoco>
+    """
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjd = mujoco.MjData(mjm)
+    mujoco.mj_forward(mjm, mjd)
+    # one island per group: the arm's joint equality gets dense rows, without sparse entries
+    default = island.MERGE
+    island.MERGE = False
+    try:
+      partitions = []
+      for island_solve in (False, True):
+        m = mjw.put_model(mjm)
+        m.opt.island_solve = island_solve
+        d = mjw.put_data(mjm, mjd, nconmax=16, njmax=64)
+        self.assertEqual(island.island_rows(m), island_solve)
+        mjw.forward(m, d)
+        labels = d.tree_island.numpy()[0]
+        # islands as sets of trees, independent of their numbering
+        partitions.append(sorted(tuple(np.flatnonzero(labels == i)) for i in range(d.nisland.numpy()[0])))
+    finally:
+      island.MERGE = default
+    self.assertEqual(partitions[0], [(0,), (1,)])
+    self.assertEqual(partitions[1], partitions[0])
+
   def test_sleep(self):
     """Sleeping islands are skipped as by the compact solve: same states, qacc = 0, no force."""
     self.enterContext(_any_size())
