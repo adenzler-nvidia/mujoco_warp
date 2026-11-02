@@ -2735,6 +2735,14 @@ class SolverContext:
   efm_con: Optional[tuple] = None
   flex_scratch: Optional[tuple] = None
   solve_ld_scratch: Optional[wp.array] = None
+  # dense elliptic Newton: the virtual Hessian row of each cone-state row, written by the
+  # constraint update (see solver._cone_virtual_row); None otherwise
+  # coefficients over the rows of the row's contact (nworld, njmax)
+  cone_coef: Optional[wp.array] = None
+  # Hessian weight of the virtual row (nworld, njmax)
+  cone_weight: Optional[wp.array] = None
+  # first constraint row of the row's contact (nworld, njmax)
+  cone_base: Optional[wp.array] = None
 
 
 @dataclasses.dataclass
