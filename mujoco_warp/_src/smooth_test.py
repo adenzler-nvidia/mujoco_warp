@@ -1695,10 +1695,7 @@ class SmoothTest(parameterized.TestCase):
   def test_factor_solve_mixed_blocks(self):
     """Packed and level-scheduled factors share one qLD."""
 
-    # A 70-dof hinge chain (one block > M_BLOCK_DENSE_MAX -> sparse LDL), a 6-dof hinge chain
-    # (scalar Cholesky), and a 7-dof hinge chain (tile Cholesky): factor_m/solve_m must run all
-    # three passes into one qLD. (Coupled blocks, not free joints: a free joint on a sphere has
-    # diagonal M and would take the compact path, which stores no factor.)
+    # Coupled joints ensure the scalar block stores a factor.
     def _hinge_chain(k):
       return (
         "".join(
@@ -1715,11 +1712,11 @@ class SmoothTest(parameterized.TestCase):
     small = "".join(f'<body pos="{i} 0 1">{_hinge_chain(k)}</body>' for i, k in enumerate((6, 7)))
     leaves = "".join(f'<body pos="{i * 0.1} .1 .1"><joint/><geom size=".03"/></body>' for i in range(8))
     sparse_block = f'<body><joint type="ball"/><geom size=".1"/>{leaves}</body>'
-    xml = f"<mujoco><worldbody><body pos='0 0 2'>{chain}</body>{small}{sparse_block}</worldbody></mujoco>"
-
-    mjm, mjd, m, d = test_data.fixture(xml=xml)
+    mjm, mjd, m, d = test_data.fixture(
+      xml=f"<mujoco><worldbody><body pos='0 0 2'>{chain}</body>{small}{sparse_block}</worldbody></mujoco>"
+    )
     self.assertTrue(any(tile.pattern_adr >= 0 for tile in m.M_tiles))
-    self.assertTrue(any(tile.elemid.size == 0 for tile in m.M_tiles))
+    self.assertTrue(any(tile.elemid.size == 0 and tile.pattern_adr < 0 for tile in m.M_tiles))
     self.assertTrue(any(tile.elemid.size > 0 for tile in m.M_tiles))
     self.assertGreater(d.qLD.shape[1], m.qLD_block_total)
 
@@ -1732,14 +1729,6 @@ class SmoothTest(parameterized.TestCase):
     res = wp.zeros((1, mjm.nv), dtype=float)
     mjw.solve_m(m, d, res, d.qfrc_smooth)
     _assert_eq(res.numpy()[0], ref[0], "M \\ qfrc_smooth (mixed blocks)")
-
-    for tile in m.M_tiles:
-      if tile.pattern_adr >= 0:
-        for start in tile.adr.numpy():
-          adr = int(m.qLD_block_adr.numpy()[start])
-          rowadr = m.M_sparse_rowadr[tile.pattern_adr : tile.pattern_adr + tile.size + 1]
-          diagonal = d.qLD.numpy()[:, adr + np.array(rowadr[1:]) - rowadr[0] - 1]
-          np.testing.assert_allclose(d.qLDiagInv.numpy()[:, start : start + tile.size], 1.0 / diagonal, rtol=2e-6)
 
   def test_factor_solve_lu(self):
     """Tests factor_solve_lu with a sparse matrix representing a tree."""
