@@ -87,7 +87,8 @@ M_BLOCK_DENSE_MAX = 64
 # max M block size where scalar Cholesky beats dense tile-Cholesky
 M_BLOCK_SCALAR_MAX = 6
 
-# qLD_block_adr sentinels for factorless block layouts
+# qLD_block_adr sentinels for unpacked or factorless blocks
+Q_LD_BLOCK_SECTION = -3
 Q_LD_BLOCK_COMPACT = -2
 Q_LD_BLOCK_SPARSE = -1
 
@@ -1193,6 +1194,19 @@ class Option:
 
 
 @dataclasses.dataclass
+class MassSection:
+  """A mass-factor section with ancestor rows preceding its eliminated rows."""
+
+  dofs: wp.array2d[int]
+  pattern_adr: int
+  size: int
+  ancestor: int
+  update_adr: wp.array2d[int]
+  update_ind: wp.array[int]
+  message_adr: wp.array[int]
+
+
+@dataclasses.dataclass
 class TileSet:
   """Tiling configuration for decomposable block diagonal matrix.
 
@@ -1201,21 +1215,25 @@ class TileSet:
   Attributes:
     adr: address of each tile in the set
     size: size of all the tiles in this set
-    elemid: flat CSR gather indices for tiled blocks; empty selects the native-layout scalar path
+    elemid: flat CSR gather indices for dense tiled blocks
+    pattern_adr: sparse row-pattern offset in Model.M_sparse_rowadr; -1 otherwise
   """
 
   adr: wp.array[int]
   size: int
   elemid: wp.array[int] = dataclasses.field(default_factory=lambda: wp.array([], dtype=int))
+  pattern_adr: int = -1
 
   def __eq__(self, other) -> bool:
     if self.__class__ is not other.__class__:
       return NotImplemented
-    return self.size == other.size and np.array_equal(np.asarray(self.adr.numpy()), np.asarray(other.adr.numpy()))
+    return (
+      self.size == other.size and self.pattern_adr == other.pattern_adr and np.array_equal(self.adr.numpy(), other.adr.numpy())
+    )
 
   def __hash__(self) -> int:
     adr = np.asarray(self.adr.numpy())
-    return hash((self.size, adr.dtype.str, adr.shape, adr.tobytes()))
+    return hash((self.size, self.pattern_adr, adr.dtype.str, adr.shape, adr.tobytes()))
 
 
 @dataclasses.dataclass
@@ -1664,7 +1682,7 @@ class Model:
     nflexintcell: total interp cells (non-strain) for passive forces
     is_sparse: constraint Jacobian/Hessian layout (sparse vs dense). Does not affect M, whose
       factorization is a per-block decision -- see M_tiles and m_block_layout
-    qLD_block_total: packed length of the dense region per world (also the offset of the LDL region)
+    qLD_block_total: packed block-factor length per world; offset of the LDL region
     qLD_block_adr: packed factor offset; Q_LD_BLOCK_* sentinel otherwise (nv,)
     flg_adhesion: flag indicating if model has passive adhesion
     has_fluid: True if wind, density, or viscosity are non-zero at put_model time
@@ -1762,8 +1780,13 @@ class Model:
     weld_tactile_id: weld body to tactile weld index         (nbody,)
     taxel_vertadr: tactile sensor vertex address             (nsensortaxel,)
     taxel_sensorid: address for tactile sensors
-    M_tiles: scalar and tiled block-factorization groups
-    qLD_updates: sparse factor updates grouped by tree level
+    nM_schur: scratch size for section matrix and right-hand-side updates
+    M_sections: mass-factor sections in root-to-leaf order
+    M_tiles: scalar, dense Cholesky and sparse LDL block-factorization groups
+    M_sparse_rowadr: row offsets for static sparse mass-block patterns
+    M_sparse_colind: local column indices for static sparse mass-block patterns
+    qLD_row_tiles: sparse factor rows by tree level; size is maximum row nnz
+    qLD_updates: sparse solve updates grouped by tree level
     qLD_all_updates: tuple of all levels concatenated
     qLD_level_offsets: tuple of start offsets for each level
     M_fullm_i: sparse mass matrix addressing
@@ -2309,7 +2332,12 @@ class Model:
   weld_tactile_id: array("nbody", int)
   taxel_vertadr: array("nsensortaxel", int)
   taxel_sensorid: array("nsensortaxel", int)
+  nM_schur: int
+  M_sections: tuple[MassSection, ...]
   M_tiles: tuple[TileSet, ...]
+  M_sparse_rowadr: tuple[int, ...]
+  M_sparse_colind: tuple[int, ...]
+  qLD_row_tiles: tuple[TileSet, ...]
   qLD_updates: tuple[array("nqLD_all_updates", wp.vec3i), ...]
   qLD_all_updates: array("nqLD_all_updates", wp.vec3i)
   qLD_level_offsets: array("nqLD_level_offsets", int)
@@ -2539,7 +2567,7 @@ class Data:
     actuator_moment: actuator moments                           (nworld, nJmom)
     crb: com-based composite inertia and mass                   (nworld, nbody, 10)
     M: total inertia, CSR                                       (nworld, nC)
-    qLD: per-block factor: packed dense region, then the nC     (nworld, qLD_block_total + nC)
+    qLD: per-block factor: packed block region, then the nC     (nworld, qLD_block_total + nC)
          L'*D*L region at offset qLD_block_total (nC=0 if no sparse block)
     qLDiagInv: reciprocal diagonal for compact and sparse blocks (nworld, nv)
     tree_awake: is tree awake; 0: asleep; 1: awake              (nworld, ntree)
@@ -2619,6 +2647,7 @@ class Data:
     cqfrc_constraint: compacted constraint force                (nworld, nvmax_pad)
 
   warp only fields:
+    qLD_schur: section matrix and right-hand-side scratch       (nworld, nM_schur)
     nworld: number of worlds
     naconmax: maximum number of contacts (shared across all worlds)
     naccdmax: maximum number of contacts for CCD (all worlds)
@@ -2780,6 +2809,7 @@ class Data:
   cqfrc_constraint: array("nworld", "nvmax_pad", float)
 
   # warp only fields:
+  qLD_schur: array("nworld", "nM_schur", float)
   nworld: int
   naconmax: int
   naccdmax: int
