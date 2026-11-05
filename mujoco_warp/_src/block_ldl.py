@@ -344,6 +344,21 @@ def _factor_rows(slots: int, width: int, block_dim: int):
   return kernel
 
 
+def launch_rows(m, d, matrix, factor, diagonal):
+  """Factor ancestor-pattern rows after their descendants, without atomic updates."""
+  block_dim = 32 if factor.device.is_cuda else 1
+  for tile in reversed(m.qLD_row_tiles):
+    width = min(8 if tile.size <= 32 else 32, block_dim)
+    groups = block_dim // width
+    wp.launch_tiled(
+      _factor_rows((tile.size + width - 1) // width, width, block_dim),
+      dim=((d.nworld * tile.adr.size + groups - 1) // groups,),
+      inputs=[tile.adr, d.nworld, m.M_rowadr, m.M_rownnz, m.M_mulm_rowadr, m.M_mulm_col, m.M_mulm_madr, matrix],
+      outputs=[factor, diagonal],
+      block_dim=block_dim,
+    )
+
+
 def _partition_tree(rows):
   children = [[] for _ in rows]
   for i, row in enumerate(rows):
@@ -375,7 +390,7 @@ def section_layout(rowadr, rownnz, colind, trees):
     owner = {i: s for s, ids in enumerate(parts) for i in ids}
     tree, count = [], 0
     max_scratch = 2 * sum(map(len, rows))
-    for s, ids in enumerate(parts):
+    for ids in parts:
       halo = rows[ids[0]][:-1]
       dofs = list(halo) + ids
       if len(dofs) > _FACTOR_SLOTS:
@@ -400,33 +415,26 @@ def section_layout(rowadr, rownnz, colind, trees):
           colind=tuple(cols),
           ancestor=len(halo),
           depth=depth,
-          parent=parent,
-          message=count,
+          children=[],
+          message=total + count,
         )
       )
+      if parent >= 0:
+        tree[parent]["children"].append(tree[-1])
       count = next_count
     if len(tree) != len(parts):
       continue
-    offset = len(descriptions)
-    for t in tree:
-      t["parent"] = t["parent"] + offset if t["parent"] >= 0 else -1
-      t["message"] += total
     descriptions.extend(tree)
     accepted.append((start, size))
     total += count
 
-  children = [[] for _ in descriptions]
-  for s, desc in enumerate(descriptions):
-    if desc["parent"] >= 0:
-      children[desc["parent"]].append(s)
   groups = {}
-  for s, desc in enumerate(descriptions):
+  for desc in descriptions:
     dofs, adr, cols = desc["dofs"], desc["rowadr"], desc["colind"]
     local = {v: i for i, v in enumerate(dofs)}
     indices = {(i, cols[a]): a for i in range(len(dofs)) for a in range(adr[i], adr[i + 1])}
     contributions = [[] for _ in range(adr[-1] + len(dofs))]
-    for c in children[s]:
-      child = descriptions[c]
+    for child in desc["children"]:
       halo = child["ancestor"]
       for i in range(halo):
         ri = local[child["dofs"][i]]
@@ -434,7 +442,7 @@ def section_layout(rowadr, rownnz, colind, trees):
           rj = local[child["dofs"][child["colind"][at]]]
           contributions[indices[ri, rj]].append(child["message"] + at)
         contributions[adr[-1] + ri].append(child["message"] + child["rowadr"][halo] + i)
-    key = (desc["depth"], adr, cols, desc["ancestor"], bool(children[s]))
+    key = (desc["depth"], adr, cols, desc["ancestor"], bool(desc["children"]))
     groups.setdefault(key, []).append((dofs, contributions, desc["message"]))
   result = []
   for (depth, adr, cols, ancestor, _), group in sorted(groups.items(), key=lambda item: item[0][0]):
@@ -461,7 +469,7 @@ def launch_sections(m, d, matrix, factor, diagonal, rhs=None, out=None, *, facto
     for section in sections:
       if down and section.ancestor == 0:
         continue
-      rowadr = m.M_sparse_rowadr[section.pattern_adr : section.pattern_adr + section.size + 1]
+      rowadr = m.M_sparse_rowadr[section.pattern_adr : section.pattern_adr + section.dofs.shape[1] + 1]
       colind = m.M_sparse_colind[rowadr[0] : rowadr[-1]]
       kernel, width = _kernel(
         tuple(a - rowadr[0] for a in rowadr),

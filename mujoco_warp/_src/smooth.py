@@ -1235,21 +1235,6 @@ def tendon_armature(m: Model, d: Data):
   )
 
 
-def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
-  """Factor ancestor-pattern rows after their descendants, without atomic updates."""
-  block_dim = 32 if L.device.is_cuda else 1
-  for tile in reversed(m.qLD_row_tiles):
-    width = min(8 if tile.size <= 32 else 32, block_dim)
-    groups = block_dim // width
-    wp.launch_tiled(
-      block_ldl._factor_rows((tile.size + width - 1) // width, width, block_dim),
-      dim=((d.nworld * tile.adr.size + groups - 1) // groups,),
-      inputs=[tile.adr, d.nworld, m.M_rowadr, m.M_rownnz, m.M_mulm_rowadr, m.M_mulm_col, m.M_mulm_madr, M],
-      outputs=[L, D],
-      block_dim=block_dim,
-    )
-
-
 @cache_kernel
 def _small_cholesky_factorize_block(block_size: int):
   @wp.kernel(module="unique", enable_backward=False)
@@ -1357,17 +1342,22 @@ def _factor_blocks(
       )
 
 
+def _factor_i(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
+  if m.M_tiles:
+    _factor_blocks(m, d, M, L, D)
+  if L.shape[1] > m.qLD_block_total:
+    L_ldl = L[:, m.qLD_block_total :]
+    block_ldl.launch_rows(m, d, M, L_ldl, D)
+    block_ldl.launch_sections(m, d, M, L_ldl, D)
+
+
 @event_scope
 def factor_m(m: Model, d: Data):
   """Factorization of inertia-like matrix M, assumed spd.
 
   Compact blocks use reciprocal diagonals, dense blocks use Cholesky, and sparse blocks use LDL.
   """
-  if m.M_tiles:
-    _factor_blocks(m, d, d.M, d.qLD, d.qLDiagInv)
-  if d.qLD.shape[1] > m.qLD_block_total:
-    _factor_i_sparse(m, d, d.M, d.qLD[:, m.qLD_block_total :], d.qLDiagInv)
-    block_ldl.launch_sections(m, d, d.M, d.qLD[:, m.qLD_block_total :], d.qLDiagInv)
+  _factor_i(m, d, d.M, d.qLD, d.qLDiagInv)
 
 
 @wp.kernel
@@ -4081,7 +4071,7 @@ def factor_solve_i(m, d, M, L, D, x, y):
     _factor_solve_blocks(m, d, M, L, D, x, y)
   if L.shape[1] > m.qLD_block_total:
     L_ldl = L[:, m.qLD_block_total :]
-    _factor_i_sparse(m, d, M, L_ldl, D)
+    block_ldl.launch_rows(m, d, M, L_ldl, D)
     if m.qLD_row_tiles:
       _solve_LD_sparse(m, d, L_ldl, D, x, y)
     block_ldl.launch_sections(m, d, M, L_ldl, D, y, x)

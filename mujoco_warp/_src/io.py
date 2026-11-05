@@ -1250,7 +1250,6 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       types.MassSection(
         dofs=wp.array(section["dofs"], dtype=int),
         pattern_adr=len(rowadr),
-        size=len(section["rowadr"]) - 1,
         ancestor=section["ancestor"],
         update_adr=wp.array(section["update_adr"], dtype=int),
         update_ind=wp.array(section["update_ind"], dtype=int),

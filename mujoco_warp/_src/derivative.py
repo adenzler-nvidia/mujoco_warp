@@ -3817,11 +3817,7 @@ def eff_actuation(m: Model, d: Data):
   if smooth.skip_qacc_smooth(m, d):
     return
 
-  # Factor qH into qHLD and qHDiagInv
-  if m.M_tiles:
-    smooth._factor_blocks(m, d, d.qH, d.qHLD, d.qHDiagInv)
-  if d.qHLD.shape[1] > m.qLD_block_total:
-    smooth._factor_i_sparse(m, d, d.qH, d.qHLD[:, m.qLD_block_total :], d.qHDiagInv)
+  smooth._factor_i(m, d, d.qH, d.qHLD, d.qHDiagInv)
 
 
 def eff_mul_m_scratch(m: Model, d: Data) -> tuple[Optional[tuple], Optional[tuple]]:

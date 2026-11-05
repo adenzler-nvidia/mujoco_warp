@@ -1199,7 +1199,6 @@ class MassSection:
 
   dofs: wp.array2d[int]
   pattern_adr: int
-  size: int
   ancestor: int
   update_adr: wp.array2d[int]
   update_ind: wp.array[int]
