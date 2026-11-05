@@ -849,7 +849,7 @@ def _deriv_ellipsoid_fluid(
   # Data in:
   xipos_in: wp.array2d[wp.vec3],
   geom_xpos_in: wp.array2d[wp.vec3],
-  geom_xmat_in: wp.array2d[wp.mat33],
+  geom_xquat_in: wp.array2d[wp.quat],
   subtree_com_in: wp.array2d[wp.vec3],
   cvel_in: wp.array2d[wp.spatial_vector],
   # In:
@@ -894,7 +894,7 @@ def _deriv_ellipsoid_fluid(
 
     size = geom_size[worldid % geom_size.shape[0], geomid]
     semiaxes = geom_semiaxes(size, geom_type[geomid])
-    geom_rot = geom_xmat_in[worldid, geomid]
+    geom_rot = math.quat_to_mat(geom_xquat_in[worldid, geomid])
     geom_rotT = wp.transpose(geom_rot)
     geom_pos = geom_xpos_in[worldid, geomid]
 
@@ -991,7 +991,7 @@ def _qderiv_ellipsoid_fluid(deterministic: bool = False):
     # Data in:
     xipos_in: wp.array2d[wp.vec3],
     geom_xpos_in: wp.array2d[wp.vec3],
-    geom_xmat_in: wp.array2d[wp.mat33],
+    geom_xquat_in: wp.array2d[wp.quat],
     subtree_com_in: wp.array2d[wp.vec3],
     cdof_in: wp.array2d[wp.spatial_vector],
     cvel_in: wp.array2d[wp.spatial_vector],
@@ -1046,7 +1046,7 @@ def _qderiv_ellipsoid_fluid(deterministic: bool = False):
       geom_fluid,
       xipos_in,
       geom_xpos_in,
-      geom_xmat_in,
+      geom_xquat_in,
       subtree_com_in,
       cvel_in,
       worldid,
@@ -1186,7 +1186,7 @@ def _qderiv_box_fluid(deterministic: bool = False):
     M_elemid: wp.array2d[int],
     # Data in:
     xipos_in: wp.array2d[wp.vec3],
-    ximat_in: wp.array2d[wp.mat33],
+    xiquat_in: wp.array2d[wp.quat],
     subtree_com_in: wp.array2d[wp.vec3],
     cdof_in: wp.array2d[wp.spatial_vector],
     cvel_in: wp.array2d[wp.spatial_vector],
@@ -1225,7 +1225,7 @@ def _qderiv_box_fluid(deterministic: bool = False):
 
     # Body velocity and kinematics
     b_ipos = xipos_in[worldid, bodyid]
-    b_imat = ximat_in[worldid, bodyid]
+    b_imat = math.quat_to_mat(xiquat_in[worldid, bodyid])
     subtree_root = subtree_com_in[worldid, body_rootid[bodyid]]
 
     vel_subtree = cvel_in[worldid, bodyid]
@@ -1406,7 +1406,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
         m.M_elemid,
         d.xipos,
         d.geom_xpos,
-        d.geom_xmat,
+        d.geom_xquat,
         d.subtree_com,
         d.cdof,
         d.cvel,
@@ -1433,7 +1433,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
         m.body_isdofancestor,
         m.M_elemid,
         d.xipos,
-        d.ximat,
+        d.xiquat,
         d.subtree_com,
         d.cdof,
         d.cvel,
@@ -2232,7 +2232,7 @@ def _eff_flex_stretch_stiff_vert(deterministic: bool = False):
     flex_vertflexid: wp.array[int],
     flex_simple: wp.array[bool],
     # Data in:
-    xmat_in: wp.array2d[wp.mat33],
+    xquat_in: wp.array2d[wp.quat],
     flexvert_hessian_in: wp.array2d[vec6],
     # Data out:
     efm_K_val_out: wp.array2d[float],
@@ -2263,7 +2263,7 @@ def _eff_flex_stretch_stiff_vert(deterministic: bool = False):
 
     h = flexvert_hessian_in[worldid, vertid]
     block = wp.mat33(h[0], h[1], h[2], h[1], h[3], h[4], h[2], h[4], h[5])
-    R_bi = xmat_in[worldid, bi]
+    R_bi = math.quat_to_mat(xquat_in[worldid, bi])
     blkd = scale * (wp.transpose(R_bi) * block * R_bi)
 
     for r in range(3):
@@ -2305,7 +2305,7 @@ def _eff_flex_stretch_stiff_edge(deterministic: bool = False):
     flex_edgeflexid: wp.array[int],
     flex_simple: wp.array[bool],
     # Data in:
-    xmat_in: wp.array2d[wp.mat33],
+    xquat_in: wp.array2d[wp.quat],
     flexedge_hessian_in: wp.array2d[wp.mat33],
     # Data out:
     efm_K_val_out: wp.array2d[float],
@@ -2344,7 +2344,7 @@ def _eff_flex_stretch_stiff_edge(deterministic: bool = False):
 
     h = flexedge_hessian_in[worldid, edgeid]
     block = wp.transpose(h) if side == 1 else h
-    blkd = scale * (wp.transpose(xmat_in[worldid, bi]) * block * xmat_in[worldid, bj])
+    blkd = scale * (wp.transpose(math.quat_to_mat(xquat_in[worldid, bi])) * block * math.quat_to_mat(xquat_in[worldid, bj]))
 
     for r in range(3):
       row = dof_i + r
@@ -2390,7 +2390,6 @@ def _eff_flex_bend_stiff(deterministic: bool = False):
     flex_simple: wp.array[bool],
     # Data in:
     xquat_in: wp.array2d[wp.quat],
-    xmat_in: wp.array2d[wp.mat33],
     # Data out:
     efm_K_val_out: wp.array2d[float],
   ):
@@ -2439,7 +2438,7 @@ def _eff_flex_bend_stiff(deterministic: bool = False):
       dof_i = dofs[i]
       if dof_i >= 0 and efm_K_rownnz[dof_i] > 0:
         bi = bodies[i]
-        R_bi_T = wp.transpose(xmat_in[worldid, bi])
+        R_bi_T = wp.transpose(math.quat_to_mat(xquat_in[worldid, bi]))
         qi = xquat_in[worldid, bi]
         for j in range(4):
           dof_j = dofs[j]
@@ -2454,7 +2453,7 @@ def _eff_flex_bend_stiff(deterministic: bool = False):
                   if idx >= 0:
                     wp.atomic_add(efm_K_val_out, worldid, idx + r, q)
               else:
-                blkd = q * (R_bi_T * xmat_in[worldid, bj])
+                blkd = q * (R_bi_T * math.quat_to_mat(xquat_in[worldid, bj]))
                 for r in range(3):
                   row = dof_i + r
                   idx = _find_csr_col(efm_K_rowadr[row], efm_K_rownnz[row], dof_j, efm_K_colind)
@@ -2489,7 +2488,7 @@ def _eff_flex_rod_stiff(deterministic: bool = False):
     flex_simple: wp.array[bool],
     flex_rodhinge_map: wp.array[wp.vec2i],
     # Data in:
-    xmat_in: wp.array2d[wp.mat33],
+    xquat_in: wp.array2d[wp.quat],
     flexvert_xpos_in: wp.array2d[wp.vec3],
     # Data out:
     efm_K_val_out: wp.array2d[float],
@@ -2529,11 +2528,11 @@ def _eff_flex_rod_stiff(deterministic: bool = False):
       dof_i = dofs[i]
       if dof_i >= 0 and efm_K_rownnz[dof_i] > 0:
         JiT_W = wp.transpose(rod_stencil_jacobian(J0, J1, J2, J3, i)) * W
-        R_bi_T = wp.transpose(xmat_in[worldid, bodies[i]])
+        R_bi_T = wp.transpose(math.quat_to_mat(xquat_in[worldid, bodies[i]]))
         for j in range(4):
           dof_j = dofs[j]
           if dof_j >= 0:
-            blkd = R_bi_T * (JiT_W * rod_stencil_jacobian(J0, J1, J2, J3, j)) * xmat_in[worldid, bodies[j]]
+            blkd = R_bi_T * (JiT_W * rod_stencil_jacobian(J0, J1, J2, J3, j)) * math.quat_to_mat(xquat_in[worldid, bodies[j]])
             for r in range(3):
               row = dof_i + r
               idx = _find_csr_col(efm_K_rowadr[row], efm_K_rownnz[row], dof_j, efm_K_colind)
@@ -2574,7 +2573,7 @@ def _eff_flex_interp_stiff(deterministic: bool = False):
     flex_cell_map: wp.array[wp.vec4i],
     flex_face: wp.array2d[int],
     # Data in:
-    xmat_in: wp.array2d[wp.mat33],
+    xquat_in: wp.array2d[wp.quat],
     flexnode_xpos_in: wp.array2d[wp.vec3],
     face_quat_in: wp.array2d[wp.quat],
     # Data out:
@@ -2642,7 +2641,7 @@ def _eff_flex_interp_stiff(deterministic: bool = False):
       if body_dofnum[bi] != 3:
         continue
       dof_i = body_dofadr[bi]
-      T_i_T = wp.transpose(xmat_in[worldid, bi]) * R
+      T_i_T = wp.transpose(math.quat_to_mat(xquat_in[worldid, bi])) * R
 
       for idx_j in range(npc):
         if shell_mode:
@@ -2657,7 +2656,7 @@ def _eff_flex_interp_stiff(deterministic: bool = False):
         if body_dofnum[bj] != 3:
           continue
         dof_j = body_dofadr[bj]
-        T_j = RT * xmat_in[worldid, bj]
+        T_j = RT * math.quat_to_mat(xquat_in[worldid, bj])
 
         K_ij = wp.mat33(0.0)
         for r in range(3):
@@ -2910,7 +2909,7 @@ def _eff_flex_interp_mul(check_skip: bool, is_shift: bool, nv: int, deterministi
     flex_cell_map: wp.array[wp.vec4i],
     flex_face: wp.array2d[int],
     # Data in:
-    xmat_in: wp.array2d[wp.mat33],
+    xquat_in: wp.array2d[wp.quat],
     subtree_com_in: wp.array2d[wp.vec3],
     cdof_in: wp.array2d[wp.spatial_vector],
     flexnode_xpos_in: wp.array2d[wp.vec3],
@@ -3010,7 +3009,7 @@ def _eff_flex_interp_mul(check_skip: bool, is_shift: bool, nv: int, deterministi
         if body_simple[bj] == 2 and body_dofnum[bj] == 3:
           dof_j = body_dofadr[bj]
           v_loc_j = wp.vec3(vec_in[worldid, dof_j], vec_in[worldid, dof_j + 1], vec_in[worldid, dof_j + 2])
-          v_world_j = xmat_in[worldid, bj] * v_loc_j
+          v_world_j = math.quat_to_mat(xquat_in[worldid, bj]) * v_loc_j
         else:
           pt_j = flexnode_xpos_in[worldid, node_j]
           offset_j = pt_j - subtree_com_in[worldid, body_rootid[bj]]
@@ -3037,7 +3036,7 @@ def _eff_flex_interp_mul(check_skip: bool, is_shift: bool, nv: int, deterministi
       frc_world = wp.quat_rotate(cell_quat, frc_corot)
       if body_simple[bi] == 2 and body_dofnum[bi] == 3:
         dof_i = body_dofadr[bi]
-        frc_loc = wp.transpose(xmat_in[worldid, bi]) * frc_world
+        frc_loc = wp.transpose(math.quat_to_mat(xquat_in[worldid, bi])) * frc_world
         for r in range(3):
           wp.atomic_add(res_out, worldid, dof_i + r, scale * frc_loc[r])
       else:
@@ -3375,7 +3374,7 @@ def eff_build(m: Model, d: Data):
         m.efm_K_colind,
         m.flex_vertflexid,
         m.flex_simple,
-        d.xmat,
+        d.xquat,
         d.flexvert_hessian,
       ],
       outputs=[d.efm_K_val],
@@ -3404,7 +3403,7 @@ def eff_build(m: Model, d: Data):
         m.efm_K_colind,
         m.flex_edgeflexid,
         m.flex_simple,
-        d.xmat,
+        d.xquat,
         d.flexedge_hessian,
       ],
       outputs=[d.efm_K_val],
@@ -3438,7 +3437,6 @@ def eff_build(m: Model, d: Data):
         m.flex_edgeflexid,
         m.flex_simple,
         d.xquat,
-        d.xmat,
       ],
       outputs=[d.efm_K_val],
     )
@@ -3461,7 +3459,7 @@ def eff_build(m: Model, d: Data):
         m.efm_K_colind,
         m.flex_simple,
         m.flex_rodhinge_map,
-        d.xmat,
+        d.xquat,
         d.flexvert_xpos,
       ],
       outputs=[d.efm_K_val],
@@ -3491,7 +3489,7 @@ def eff_build(m: Model, d: Data):
           m.flex_faceadr,
           m.flex_cell_map,
           m.flex_face,
-          d.xmat,
+          d.xquat,
           d.flexnode_xpos,
           d.face_quat,
         ],
@@ -3621,7 +3619,7 @@ def eff_shift(m: Model, d: Data):
         m.flex_faceadr,
         m.flex_cell_map,
         m.flex_face,
-        d.xmat,
+        d.xquat,
         d.subtree_com,
         d.cdof,
         d.flexnode_xpos,
@@ -3675,7 +3673,7 @@ def eff_shift(m: Model, d: Data):
         m.M_elemid,
         d.xipos,
         d.geom_xpos,
-        d.geom_xmat,
+        d.geom_xquat,
         d.subtree_com,
         d.cdof,
         d.cvel,
@@ -3702,7 +3700,7 @@ def eff_shift(m: Model, d: Data):
         m.body_isdofancestor,
         m.M_elemid,
         d.xipos,
-        d.ximat,
+        d.xiquat,
         d.subtree_com,
         d.cdof,
         d.cvel,
@@ -3980,7 +3978,7 @@ def eff_mul_m(
           m.flex_faceadr,
           m.flex_cell_map,
           m.flex_face,
-          d.xmat,
+          d.xquat,
           d.subtree_com,
           d.cdof,
           d.flexnode_xpos,
