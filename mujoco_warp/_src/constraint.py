@@ -3753,7 +3753,9 @@ def _efc_contact_jac_sparse_flex(cone_type: types.ConeType):
 
 
 @cache_kernel
-def _efc_contact_jac_dense(tile_size: int, cone_type: types.ConeType, njmax: int, deterministic: bool = False):
+def _efc_contact_jac_dense(
+  tile_size: int, cone_type: types.ConeType, single_block: bool, njmax: int, deterministic: bool = False
+):
   TILE_SIZE = tile_size
   IS_ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
   module_options = {"enable_backward": False}
@@ -3880,8 +3882,10 @@ def _efc_contact_jac_dense(tile_size: int, cone_type: types.ConeType, njmax: int
 
       Jqvel_tile = wp.tile_map(wp.mul, J_tile, qvel_tile)
       Jqvel_sum = wp.tile_reduce(wp.add, Jqvel_tile)
-      # Tile atomics bypass Warp's deterministic accumulation.
-      if wp.static(deterministic):
+      if wp.static(single_block):
+        wp.tile_store(efc_Jqvel_out[worldid], Jqvel_sum, offset=efcid)
+      elif wp.static(deterministic):
+        # Tile atomics bypass Warp's deterministic accumulation.
         if tid == 0:
           wp.atomic_add(efc_Jqvel_out[worldid], efcid, wp.tile_extract(Jqvel_sum, 0))
       else:
@@ -3891,7 +3895,9 @@ def _efc_contact_jac_dense(tile_size: int, cone_type: types.ConeType, njmax: int
 
 
 @cache_kernel
-def _efc_contact_jac_dense_flex(tile_size: int, cone_type: types.ConeType, njmax: int, deterministic: bool = False):
+def _efc_contact_jac_dense_flex(
+  tile_size: int, cone_type: types.ConeType, single_block: bool, njmax: int, deterministic: bool = False
+):
   TILE_SIZE = tile_size
   IS_ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
   module_options = {"enable_backward": False}
@@ -4206,8 +4212,10 @@ def _efc_contact_jac_dense_flex(tile_size: int, cone_type: types.ConeType, njmax
 
       Jqvel_tile = wp.tile_map(wp.mul, J_tile, qvel_tile)
       Jqvel_sum = wp.tile_reduce(wp.add, Jqvel_tile)
-      # Tile atomics bypass Warp's deterministic accumulation.
-      if wp.static(deterministic):
+      if wp.static(single_block):
+        wp.tile_store(efc_Jqvel_out[worldid], Jqvel_sum, offset=efcid)
+      elif wp.static(deterministic):
+        # Tile atomics bypass Warp's deterministic accumulation.
         if tid == 0:
           wp.atomic_add(efc_Jqvel_out[worldid], efcid, wp.tile_extract(Jqvel_sum, 0))
       else:
@@ -5656,7 +5664,7 @@ def make_constraint(m: types.Model, d: types.Data):
 
         if has_flex:
           wp.launch_tiled(
-            _efc_contact_jac_dense_flex(tile_size, m.opt.cone, d.njmax if det_atomics else 0, det_atomics),
+            _efc_contact_jac_dense_flex(tile_size, m.opt.cone, n_dof_blocks == 1, d.njmax if det_atomics else 0, det_atomics),
             dim=(d.nworld, n_dof_blocks),
             inputs=[
               m.body_rootid,
@@ -5702,7 +5710,7 @@ def make_constraint(m: types.Model, d: types.Data):
           )
         else:
           wp.launch_tiled(
-            _efc_contact_jac_dense(tile_size, m.opt.cone, d.njmax if det_atomics else 0, det_atomics),
+            _efc_contact_jac_dense(tile_size, m.opt.cone, n_dof_blocks == 1, d.njmax if det_atomics else 0, det_atomics),
             dim=(d.nworld, n_dof_blocks),
             inputs=[
               m.body_rootid,
