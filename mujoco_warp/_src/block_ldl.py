@@ -269,6 +269,12 @@ def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_di
                   contrib_adr[system, wp.static(rowadr[-1]) + j], contrib_adr[system, wp.static(rowadr[-1]) + j + 1]
                 ):
                   rhs_values[c] += messages_out[world, contrib_ind[u]]
+    if wp.static(not factorize and (begin == 0 or down)):
+      # Move independent reciprocals before the dependent substitutions.
+      for k in range(wp.static(begin), wp.static(nrows)):
+        if lane == wp.static(k % width):
+          slot = wp.static(layout.diagonal_slots[k])
+          matrix_values[slot] = 1.0 / matrix_values[slot]
     if wp.static(not down):
       for rev in range(wp.static(nrows - begin)):
         k = wp.static(nrows - 1 - rev)
@@ -283,13 +289,13 @@ def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_di
           rhs_values = wp.static(rhs_updates[k - begin])(matrix_values, rhs_values, value, lane)
           if wp.static(begin == 0):
             if enabled and lane == wp.static(k % width):
-              rhs_values[wp.static(k // width)] /= matrix_values[wp.static(layout.diagonal_slots[k])]
+              rhs_values[wp.static(k // width)] *= matrix_values[wp.static(layout.diagonal_slots[k])]
     if wp.static(solve and (begin == 0 or down)):
       for off in range(wp.static(nrows - begin)):
         k = wp.static(begin + off)
         if wp.static(down):
           if lane == wp.static(k % width):
-            rhs_values[wp.static(k // width)] /= matrix_values[wp.static(layout.diagonal_slots[k])]
+            rhs_values[wp.static(k // width)] *= matrix_values[wp.static(layout.diagonal_slots[k])]
         rhs_values = wp.static(substitutions[k - begin])(matrix_values, rhs_values, tid, lane)
     if wp.static(solve):
       for c in range(wp.static(rhs_chunks)):
