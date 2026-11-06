@@ -1635,8 +1635,10 @@ class SmoothTest(parameterized.TestCase):
       trees.append(f'<body><joint type="ball"/><geom size=".1"/>{leaves}</body>')
     leaves = '<body pos=".1 .2 .3"><joint/><geom size=".05"/></body>' * 65
     trees.append('<body pos="0 0 .1"><joint/><geom size=".05"/>' * 18 + leaves + "</body>" * 18)
-    limb = '<body pos="0 0 .1"><joint/><geom size=".05"/>' * 15 + "</body>" * 15
-    trees.append('<body pos="0 0 .1"><joint/><geom size=".05"/>' * 8 + limb * 5 + "</body>" * 8)
+    segment = '<body pos="0 0 .1"><joint/><geom size=".05"/>' * 8
+    finger = segment + "</body>" * 8
+    limb = segment + finger * 5 + "</body>" * 8
+    trees.append(segment + limb * 3 + "</body>" * 8)
     mjm, _, m, d = test_data.fixture(
       xml=f'<mujoco><default><joint armature="1"/></default><worldbody>{"".join(trees)}</worldbody></mujoco>', nworld=nworld
     )
@@ -1644,8 +1646,8 @@ class SmoothTest(parameterized.TestCase):
     self.assertLen(tiles, 2)
     self.assertEqual(sorted(tile.adr.size for tile in tiles), [1, 2])
     self.assertEqual(sum(tile.adr.size for tile in m.qLD_row_tiles), 83)
-    self.assertTrue(m.M_sections)
-    self.assertEqual(sum(s.dofs.shape[0] * (s.dofs.shape[1] - s.ancestor) for s in m.M_sections), 83)
+    self.assertTrue(any(s.ancestor > 0 and s.update_ind.size > 0 for s in m.M_sections))
+    self.assertEqual(sum(s.dofs.shape[0] * (s.dofs.shape[1] - s.ancestor) for s in m.M_sections), 152)
     rng = np.random.default_rng(42)
     rhs = rng.normal(size=(d.nworld, m.nv + 3)).astype(np.float32)
     b, out = wp.array(rhs), wp.empty(rhs.shape, dtype=float)
