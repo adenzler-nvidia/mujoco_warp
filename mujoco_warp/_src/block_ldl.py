@@ -22,6 +22,7 @@ The root completes its solve, then the downward pass substitutes solved ancestor
 """
 
 import functools
+from typing import NamedTuple
 
 import warp as wp
 
@@ -36,8 +37,19 @@ def _exchange(value: float, source: int):
   return wp.tile_extract(wp.tile(value), source)
 
 
-@functools.cache
-def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_dim: int, *, begin=0, down=False, children=False):
+class _RegisterLayout(NamedTuple):
+  width: int
+  row_chunks: tuple
+  slots: tuple
+  csr_indices: tuple
+  diagonal_slots: tuple
+  lower_entries: tuple
+  positions: dict
+  updates: tuple
+  lower_masks: tuple
+
+
+def _register_layout(rowadr, colind, factorize, block_dim, begin, children):
   rows = tuple(colind[rowadr[i] : rowadr[i + 1]] for i in range(len(rowadr) - 1))
   n = len(rows)
   width = min(4, block_dim)
@@ -55,7 +67,6 @@ def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_di
   mapping = tuple(tuple(indices.get((i, c * width + lane), -1) for lane in range(width)) for i, c in slots)
   diagonal_slots = tuple(pos.get((k, k // width), -1) for k in range(n))
   lower = tuple(tuple((i, pos[k, i // width]) for i in rows[k][:-1]) if begin <= k < n else () for k in range(n))
-  # Reverse elimination introduces no fill in MuJoCo's ancestor mass pattern.
   updates = tuple(
     tuple(
       tuple(
@@ -67,80 +78,125 @@ def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_di
     )
     for k in range(n)
   )
-  NSLOTS = len(slots)
-  Vec = wp.types.vector(length=NSLOTS, dtype=wp.float32)
-  NB = (n + width - 1) // width
-  Rhs = wp.types.vector(length=NB, dtype=wp.float32)
-  levels = width.bit_length() - 1
-  row_size = max(map(len, chunks[begin:n]))
-  Row = wp.types.vector(length=row_size + 1, dtype=wp.float32)
+  lower_masks = tuple(
+    tuple(sum(1 << lane for lane in range(width) if c * width + lane in row[:-1]) for c in chunks[k])
+    for k, row in enumerate(rows)
+  )
+  return _RegisterLayout(width, chunks, slots, mapping, diagonal_slots, lower, pos, updates, lower_masks)
+
+
+@functools.cache
+def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_dim: int, *, begin=0, down=False, children=False):
+  layout = _register_layout(rowadr, colind, factorize, block_dim, begin, children)
+  width = layout.width
+  nrows = len(rowadr) - 1
+  nslots = len(layout.slots)
+  rhs_chunks = (nrows + width - 1) // width
+  MatrixRegisters = wp.types.vector(length=nslots, dtype=wp.float32)
+  RhsRegisters = wp.types.vector(length=rhs_chunks, dtype=wp.float32)
+  row_size = max(map(len, layout.row_chunks[begin:nrows]))
+  PivotRegisters = wp.types.vector(length=row_size + 1, dtype=wp.float32)
+
+  def make_rhs_update(k):
+    @wp.func
+    def update_rhs(matrix_values: MatrixRegisters, rhs_in: RhsRegisters, value: float, lane: int):
+      rhs_values = rhs_in
+      for ci in range(wp.static(len(layout.row_chunks[k]))):
+        c = wp.static(layout.row_chunks[k][ci])
+        mask = wp.static(layout.lower_masks[k][ci])
+        if ((mask >> lane) & 1) != 0:
+          rhs_values[wp.static(c)] -= matrix_values[wp.static(layout.positions[k, c])] * value
+      return rhs_values
+
+    return update_rhs
+
+  rhs_updates = tuple(make_rhs_update(k) for k in range(begin, nrows)) if solve else ()
 
   # Function-local tiles let consecutive pivots reuse shared scratch.
   def make_pivot(k):
     @wp.func
-    def pivot(a_in: Vec, b_in: Rhs, tid: int, lane: int):
-      a = a_in
-      b = b_in
+    def pivot(matrix_in: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
+      matrix_values = matrix_in
+      rhs_values = rhs_in
       if wp.static(width == 1):
-        diag = a[wp.static(diagonal_slots[k])]
+        diag = matrix_values[wp.static(layout.diagonal_slots[k])]
       else:
-        row = Row()
-        for ci in range(wp.static(len(chunks[k]))):
-          c = wp.static(chunks[k][ci])
-          row[ci] = a[wp.static(pos[k, c])]
+        row = PivotRegisters()
+        for ci in range(wp.static(len(layout.row_chunks[k]))):
+          c = wp.static(layout.row_chunks[k][ci])
+          row[ci] = matrix_values[wp.static(layout.positions[k, c])]
         if wp.static(solve):
-          row[wp.static(row_size)] = b[wp.static(k // width)]
+          row[wp.static(row_size)] = rhs_values[wp.static(k // width)]
         shared_row = wp.tile(row)
-        diag = wp.tile_extract(shared_row, wp.static(chunks[k].index(k // width)), tid - lane + wp.static(k % width))
+        diag = wp.tile_extract(shared_row, wp.static(layout.row_chunks[k].index(k // width)), tid - lane + wp.static(k % width))
       inv = 1.0 / diag
       if wp.static(factorize):
-        for ii in range(wp.static(len(lower[k]))):
-          i = wp.static(lower[k][ii][0])
+        for ii in range(wp.static(len(layout.lower_entries[k]))):
+          i = wp.static(layout.lower_entries[k][ii][0])
           if wp.static(width == 1):
-            v = a[wp.static(lower[k][ii][1])] * inv
+            v = matrix_values[wp.static(layout.lower_entries[k][ii][1])] * inv
           else:
-            v = wp.tile_extract(shared_row, wp.static(chunks[k].index(i // width)), tid - lane + wp.static(i % width)) * inv
-          for jj in range(wp.static(len(updates[k][ii]))):
-            dst = wp.static(updates[k][ii][jj][0])
-            src = wp.static(updates[k][ii][jj][1])
-            if ((wp.static(updates[k][ii][jj][2]) >> lane) & 1) != 0:
-              a[dst] -= v * a[src]
-        for ci in range(wp.static(len(chunks[k]))):
-          c = wp.static(chunks[k][ci])
+            v = (
+              wp.tile_extract(shared_row, wp.static(layout.row_chunks[k].index(i // width)), tid - lane + wp.static(i % width))
+              * inv
+            )
+          for jj in range(wp.static(len(layout.updates[k][ii]))):
+            dst = wp.static(layout.updates[k][ii][jj][0])
+            src = wp.static(layout.updates[k][ii][jj][1])
+            if ((wp.static(layout.updates[k][ii][jj][2]) >> lane) & 1) != 0:
+              matrix_values[dst] -= v * matrix_values[src]
+        for ci in range(wp.static(len(layout.row_chunks[k]))):
+          c = wp.static(layout.row_chunks[k][ci])
           if lane + wp.static(c * width) < wp.static(k):
-            a[wp.static(pos[k, c])] *= inv
+            matrix_values[wp.static(layout.positions[k, c])] *= inv
       if wp.static(solve):
         if wp.static(width == 1):
-          value = b[wp.static(k // width)]
+          value = rhs_values[wp.static(k // width)]
         else:
           value = wp.tile_extract(shared_row, wp.static(row_size), tid - lane + wp.static(k % width))
-        for ci in range(wp.static(len(chunks[k]))):
-          c = wp.static(chunks[k][ci])
-          mask = wp.static(sum(1 << l for l in range(width) if c * width + l in rows[k][:-1]))
-          if ((mask >> lane) & 1) != 0:
-            b[wp.static(c)] -= a[wp.static(pos[k, c])] * value
+        rhs_values = wp.static(rhs_updates[k - begin])(matrix_values, rhs_values, value, lane)
         if wp.static(begin == 0):
           if lane == wp.static(k % width):
-            b[wp.static(k // width)] *= inv
-      return a, b, inv
+            rhs_values[wp.static(k // width)] *= inv
+      return matrix_values, rhs_values, inv
 
     return pivot
 
-  pivots = tuple(make_pivot(k) for k in range(begin, n)) if factorize else ()
+  pivots = tuple(make_pivot(k) for k in range(begin, nrows)) if factorize else ()
+
+  def make_substitution(k):
+    @wp.func
+    def substitute(matrix_values: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
+      rhs_values = rhs_in
+      value = float(0.0)
+      for ci in range(wp.static(len(layout.row_chunks[k]))):
+        c = wp.static(layout.row_chunks[k][ci])
+        mask = wp.static(layout.lower_masks[k][ci])
+        if ((mask >> lane) & 1) != 0:
+          value += matrix_values[wp.static(layout.positions[k, c])] * rhs_values[wp.static(c)]
+      for stage in range(wp.static(width.bit_length() - 1)):
+        value += _exchange(value, tid ^ wp.static(1 << stage))
+      if lane == wp.static(k % width):
+        rhs_values[wp.static(k // width)] -= value
+      return rhs_values
+
+    return substitute
+
+  substitutions = tuple(make_substitution(k) for k in range(begin, nrows)) if solve and (begin == 0 or down) else ()
 
   direct = begin == 0 and not children
 
   @wp.func
-  def dof(dofs: wp.array2d[int], system: int, local: int, vector: int):
+  def dof(dofs: wp.array2d[int], system: int, local: int, dof_base: int):
     if wp.static(direct):
-      return vector + local
+      return dof_base + local
     return dofs[system, local]
 
   @wp.func
-  def address(dofs: wp.array2d[int], system: int, ri: int, at: int, offset: int, base: int, matrix_adr: wp.array[int]):
+  def address(dofs: wp.array2d[int], system: int, ri: int, csr_index: int, offset: int, base: int, matrix_adr: wp.array[int]):
     if wp.static(direct):
-      return base + at
-    return matrix_adr[dofs[system, ri]] + at - offset
+      return base + csr_index
+    return matrix_adr[dofs[system, ri]] + csr_index - offset
 
   @wp.kernel(module="unique", module_options={"enable_backward": False, "max_unroll": 4096})
   def kernel(
@@ -165,111 +221,101 @@ def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_di
     job = block * wp.static(block_dim // width) + tid // wp.static(width)
     world = job // dofs.shape[0]
     system = job % dofs.shape[0]
-    vector = dofs[system, 0]
-    matrix_base = matrix_adr[vector]
-    factor_base = factor_adr[vector]
+    dof_base = dofs[system, 0]
+    matrix_base = matrix_adr[dof_base]
+    factor_base = factor_adr[dof_base]
     enabled = world < worlds
-    a = Vec()
-    b = Rhs()
-    for s in range(wp.static(NSLOTS)):
-      if lane + wp.static(slots[s][1] * width) == wp.static(slots[s][0]):
-        a[s] = 1.0
+    matrix_values = MatrixRegisters()
+    rhs_values = RhsRegisters()
+    for slot in range(wp.static(nslots)):
+      if lane + wp.static(layout.slots[slot][1] * width) == wp.static(layout.slots[slot][0]):
+        matrix_values[slot] = 1.0
     if enabled:
-      for s in range(wp.static(NSLOTS)):
-        at = int(-1)
+      for slot in range(wp.static(nslots)):
+        row = wp.static(layout.slots[slot][0])
+        row_offset = wp.static(rowadr[row])
+        csr_index = int(-1)
         for l in range(wp.static(width)):
           if lane == l:
-            at = wp.static(mapping[s][l])
-        if at >= 0:
+            csr_index = wp.static(layout.csr_indices[slot][l])
+        if csr_index >= 0:
           if wp.static(not factorize):
-            a[s] = factor_out[
-              world, address(dofs, system, wp.static(slots[s][0]), at, wp.static(rowadr[slots[s][0]]), factor_base, matrix_adr)
+            matrix_values[slot] = factor_out[
+              world,
+              address(dofs, system, row, csr_index, row_offset, factor_base, matrix_adr),
             ]
           else:
-            if wp.static(slots[s][0] >= begin):
-              a[s] = matrix[
+            if wp.static(row >= begin):
+              matrix_values[slot] = matrix[
                 world,
-                address(dofs, system, wp.static(slots[s][0]), at, wp.static(rowadr[slots[s][0]]), matrix_base, matrix_adr),
+                address(dofs, system, row, csr_index, row_offset, matrix_base, matrix_adr),
               ]
             else:
-              a[s] = 0.0
+              matrix_values[slot] = 0.0
             if wp.static(children):
-              for u in range(contrib_adr[system, at], contrib_adr[system, at + 1]):
-                a[s] += messages_out[world, contrib_ind[u]]
+              for u in range(contrib_adr[system, csr_index], contrib_adr[system, csr_index + 1]):
+                matrix_values[slot] += messages_out[world, contrib_ind[u]]
       if wp.static(solve):
-        for c in range(wp.static(NB)):
+        for c in range(wp.static(rhs_chunks)):
           j = wp.static(c * width) + lane
-          if j < wp.static(n):
+          if j < wp.static(nrows):
             if wp.static(down):
-              b[c] = out[world, dof(dofs, system, j, vector)]
+              rhs_values[c] = out[world, dof(dofs, system, j, dof_base)]
             else:
               if j >= wp.static(begin):
-                b[c] = rhs[world, dof(dofs, system, j, vector)]
+                rhs_values[c] = rhs[world, dof(dofs, system, j, dof_base)]
               if wp.static(children):
                 for u in range(
                   contrib_adr[system, wp.static(rowadr[-1]) + j], contrib_adr[system, wp.static(rowadr[-1]) + j + 1]
                 ):
-                  b[c] += messages_out[world, contrib_ind[u]]
+                  rhs_values[c] += messages_out[world, contrib_ind[u]]
     if wp.static(not down):
-      for rev in range(wp.static(n - begin)):
-        k = wp.static(n - 1 - rev)
+      for rev in range(wp.static(nrows - begin)):
+        k = wp.static(nrows - 1 - rev)
         if wp.static(factorize):
-          a, b, inv = wp.static(pivots[k - begin])(a, b, tid, lane)
+          matrix_values, rhs_values, inv = wp.static(pivots[k - begin])(matrix_values, rhs_values, tid, lane)
           if enabled and lane == wp.static(k % width):
-            diagonal_out[world, dof(dofs, system, wp.static(k), vector)] = inv
+            diagonal_out[world, dof(dofs, system, wp.static(k), dof_base)] = inv
         else:
-          value = b[wp.static(k // width)]
+          value = rhs_values[wp.static(k // width)]
           if wp.static(width > 1):
             value = _exchange(value, tid - lane + wp.static(k % width))
-          for ci in range(wp.static(len(chunks[k]))):
-            c = wp.static(chunks[k][ci])
-            mask = wp.static(sum(1 << l for l in range(width) if c * width + l in rows[k][:-1]))
-            if ((mask >> lane) & 1) != 0:
-              b[wp.static(c)] -= a[wp.static(pos[k, c])] * value
+          rhs_values = wp.static(rhs_updates[k - begin])(matrix_values, rhs_values, value, lane)
           if wp.static(begin == 0):
             if enabled and lane == wp.static(k % width):
-              b[wp.static(k // width)] /= a[wp.static(diagonal_slots[k])]
+              rhs_values[wp.static(k // width)] /= matrix_values[wp.static(layout.diagonal_slots[k])]
     if wp.static(solve and (begin == 0 or down)):
-      for off in range(wp.static(n - begin)):
+      for off in range(wp.static(nrows - begin)):
         k = wp.static(begin + off)
         if wp.static(down):
           if lane == wp.static(k % width):
-            b[wp.static(k // width)] /= a[wp.static(diagonal_slots[k])]
-        value = float(0.0)
-        for ci in range(wp.static(len(chunks[k]))):
-          c = wp.static(chunks[k][ci])
-          mask = wp.static(sum(1 << l for l in range(width) if c * width + l in rows[k][:-1]))
-          if ((mask >> lane) & 1) != 0:
-            x = float(0.0)
-            x = b[wp.static(c)]
-            value += a[wp.static(pos[k, c])] * x
-        for stage in range(wp.static(levels)):
-          value += _exchange(value, tid ^ wp.static(1 << stage))
-        if lane == wp.static(k % width):
-          b[wp.static(k // width)] -= value
+            rhs_values[wp.static(k // width)] /= matrix_values[wp.static(layout.diagonal_slots[k])]
+        rhs_values = wp.static(substitutions[k - begin])(matrix_values, rhs_values, tid, lane)
     if wp.static(solve):
-      for c in range(wp.static(NB)):
+      for c in range(wp.static(rhs_chunks)):
         j = wp.static(c * width) + lane
-        if enabled and j < wp.static(n):
+        if enabled and j < wp.static(nrows):
           if j >= wp.static(begin):
-            out[world, dof(dofs, system, j, vector)] = b[c]
+            out[world, dof(dofs, system, j, dof_base)] = rhs_values[c]
           elif wp.static(not down):
-            messages_out[world, message_adr[system] + wp.static(rowadr[begin]) + j] = b[c]
+            messages_out[world, message_adr[system] + wp.static(rowadr[begin]) + j] = rhs_values[c]
     if wp.static(factorize):
       if enabled:
-        for s in range(wp.static(NSLOTS)):
-          at = int(-1)
+        for slot in range(wp.static(nslots)):
+          row = wp.static(layout.slots[slot][0])
+          row_offset = wp.static(rowadr[row])
+          csr_index = int(-1)
           for l in range(wp.static(width)):
             if lane == l:
-              at = wp.static(mapping[s][l])
-          if at >= 0:
-            if wp.static(slots[s][0] >= begin):
+              csr_index = wp.static(layout.csr_indices[slot][l])
+          if csr_index >= 0:
+            if wp.static(row >= begin):
               factor_out[
                 world,
-                address(dofs, system, wp.static(slots[s][0]), at, wp.static(rowadr[slots[s][0]]), factor_base, matrix_adr),
-              ] = a[s]
+                address(dofs, system, row, csr_index, row_offset, factor_base, matrix_adr),
+              ] = matrix_values[slot]
             else:
-              messages_out[world, message_adr[system] + at] = a[s]
+              messages_out[world, message_adr[system] + csr_index] = matrix_values[slot]
 
   return kernel, width
 
