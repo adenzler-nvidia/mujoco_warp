@@ -13,7 +13,13 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Reverse LDL for MuJoCo ancestor-pattern mass matrices, without symbolic fill."""
+"""Reverse A = L.T D L for MuJoCo ancestor-pattern mass matrices.
+
+Ancestor rows are CSR prefixes of descendant rows, so reverse elimination introduces no fill.
+Sections place ancestor rows before owned rows. The upward pass eliminates owned rows and sends
+only their matrix/RHS contributions upward; original rows are loaded by their owning section.
+The root completes its solve, then the downward pass substitutes solved ancestors into each section.
+"""
 
 import functools
 
@@ -31,7 +37,7 @@ def _exchange(value: float, source: int):
 
 
 @functools.cache
-def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_dim: int, begin=0, down=False, children=False):
+def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_dim: int, *, begin=0, down=False, children=False):
   rows = tuple(colind[rowadr[i] : rowadr[i + 1]] for i in range(len(rowadr) - 1))
   n = len(rows)
   width = min(4, block_dim)
@@ -477,9 +483,9 @@ def launch_sections(m, d, matrix, factor, diagonal, rhs=None, out=None, *, facto
         factorize and not down,
         solve,
         block_dim,
-        section.ancestor,
-        down,
-        section.update_ind.size > 0,
+        begin=section.ancestor,
+        down=down,
+        children=section.update_ind.size > 0,
       )
       groups = block_dim // width
       wp.launch_tiled(
