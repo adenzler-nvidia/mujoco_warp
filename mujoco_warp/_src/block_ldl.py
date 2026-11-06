@@ -217,7 +217,7 @@ def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_di
     messages_out: wp.array2d[float],
   ):
     block, tid = wp.tid()
-    lane = tid % wp.static(width)
+    lane = tid & wp.static(width - 1)
     job = block * wp.static(block_dim // width) + tid // wp.static(width)
     world = job // dofs.shape[0]
     system = job % dofs.shape[0]
@@ -356,7 +356,7 @@ def _factor_rows(slots: int, width: int, block_dim: int):
     diagonal_out: wp.array2d[float],
   ):
     block, tid = wp.tid()
-    lane = tid % wp.static(width)
+    lane = tid & wp.static(width - 1)
     job = block * wp.static(block_dim // width) + tid // wp.static(width)
     world = job // rows.shape[0]
     i = rows[job % rows.shape[0]]
