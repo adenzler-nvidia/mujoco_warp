@@ -1626,13 +1626,78 @@ class SmoothTest(parameterized.TestCase):
     mjw.solve_m(m, d, result, rhs)
     _assert_eq(result.numpy()[0], expected, "heterogeneous factor + solve")
 
-  def test_factor_solve_mixed_blocks(self):
-    """Per-block factor/solve: sparse LDL, scalar, and tile blocks all share one qLD."""
+  @parameterized.product(mode=("loaded", "separate", "fused", "aliased", "fused_aliased"), nworld=(1, 2, 5))
+  def test_sparse_block_factor_solve(self, mode, nworld):
+    """Mix packed and large CSR trees, partial groups and aliased padded vectors."""
+    trees = []
+    for count in (8, 8, 10):
+      leaves = "".join(f'<body pos="{i * 0.1} .2 .3"><joint/><geom size=".05"/></body>' for i in range(count))
+      trees.append(f'<body><joint type="ball"/><geom size=".1"/>{leaves}</body>')
+    leaves = '<body pos=".1 .2 .3"><joint/><geom size=".05"/></body>' * 65
+    trees.append('<body pos="0 0 .1"><joint/><geom size=".05"/>' * 18 + leaves + "</body>" * 18)
+    segment = '<body pos="0 0 .1"><joint/><geom size=".05"/>' * 8
+    finger = segment + "</body>" * 8
+    limb = segment + finger * 5 + "</body>" * 8
+    trees.append(segment + limb * 3 + "</body>" * 8)
+    mjm, _, m, d = test_data.fixture(
+      xml=f'<mujoco><default><joint armature="1"/></default><worldbody>{"".join(trees)}</worldbody></mujoco>', nworld=nworld
+    )
+    tiles = [tile for tile in m.M_tiles if tile.pattern_adr >= 0]
+    self.assertLen(tiles, 2)
+    self.assertEqual(sorted(tile.adr.size for tile in tiles), [1, 2])
+    self.assertEqual(sum(tile.adr.size for tile in m.qLD_row_tiles), 83)
+    self.assertTrue(any(s.ancestor > 0 and s.update_ind.size > 0 for s in m.M_sections))
+    self.assertEqual(sum(s.dofs.shape[0] * (s.dofs.shape[1] - s.ancestor) for s in m.M_sections), 152)
+    rng = np.random.default_rng(42)
+    rhs = rng.normal(size=(d.nworld, m.nv + 3)).astype(np.float32)
+    b, out = wp.array(rhs), wp.empty(rhs.shape, dtype=float)
+    values = d.M.numpy()
+    if mode != "loaded":
+      values = rng.uniform(-0.01, 0.01, values.shape).astype(np.float32)
+      for i in range(m.nv):
+        values[:, mjm.M_rowadr[i] + mjm.M_rownnz[i] - 1] = 2.0
+      d.M.assign(values)
+      d.qLD.fill_(float("nan"))
+      d.qLDiagInv.fill_(float("nan"))
+    dense = np.zeros((d.nworld, m.nv, m.nv))
+    for i in range(m.nv):
+      for a in range(mjm.M_rowadr[i], mjm.M_rowadr[i] + mjm.M_rownnz[i]):
+        j = mjm.M_colind[a]
+        dense[:, i, j] = dense[:, j, i] = values[:, a]
+    expected = np.linalg.solve(dense, rhs[:, : m.nv, None])[..., 0]
+    out.assign(rhs)
+    if mode == "aliased":
+      mjw.factor_m(m, d)
+    with wp.ScopedCapture() as capture:
+      if mode in ("fused", "fused_aliased"):
+        mjw._src.smooth.factor_solve_i(m, d, d.M, d.qLD, d.qLDiagInv, out, out if mode == "fused_aliased" else b)
+      else:
+        if mode == "separate":
+          mjw.factor_m(m, d)
+        mjw.solve_m(m, d, out, out if mode == "aliased" else b)
+    for scale in (1.0, -2.0):
+      b.assign(rhs * scale)
+      out.assign(rhs * scale)
+      d.qLD_schur.fill_(float("nan"))
+      wp.capture_launch(capture.graph)
+      actual = out.numpy()
+      np.testing.assert_allclose(actual[:, : m.nv], expected * scale, rtol=2e-5, atol=2e-6)
+      np.testing.assert_array_equal(actual[:, m.nv :], rhs[:, m.nv :] * scale)
+      if nworld > 1:
+        self.assertFalse(np.allclose(actual[0, : m.nv], actual[1, : m.nv]))
+    if mode != "loaded":
+      for tile in tiles:
+        for start in tile.adr.numpy():
+          adr = int(m.qLD_block_adr.numpy()[start])
+          rowadr = m.M_sparse_rowadr[tile.pattern_adr : tile.pattern_adr + tile.size + 1]
+          row_ends = np.array(rowadr[1:]) - rowadr[0] - 1
+          diag = d.qLD.numpy()[:, adr + row_ends]
+          np.testing.assert_allclose(d.qLDiagInv.numpy()[:, start : start + tile.size], 1.0 / diag, rtol=2e-6)
 
-    # A 70-dof hinge chain (one block > M_BLOCK_DENSE_MAX -> sparse LDL), a 6-dof hinge chain
-    # (scalar Cholesky), and a 7-dof hinge chain (tile Cholesky): factor_m/solve_m must run all
-    # three passes into one qLD. (Coupled blocks, not free joints: a free joint on a sphere has
-    # diagonal M and would take the compact path, which stores no factor.)
+  def test_factor_solve_mixed_blocks(self):
+    """Packed and level-scheduled factors share one qLD."""
+
+    # Coupled joints ensure the scalar block stores a factor.
     def _hinge_chain(k):
       return (
         "".join(
@@ -1647,11 +1712,13 @@ class SmoothTest(parameterized.TestCase):
       + "</body>" * n
     )
     small = "".join(f'<body pos="{i} 0 1">{_hinge_chain(k)}</body>' for i, k in enumerate((6, 7)))
-    xml = f"<mujoco><worldbody><body pos='0 0 2'>{chain}</body>{small}</worldbody></mujoco>"
-
-    mjm, mjd, m, d = test_data.fixture(xml=xml)
-    # genuinely mixed: all three factor paths active in one model
-    self.assertTrue(any(tile.elemid.size == 0 for tile in m.M_tiles))
+    leaves = "".join(f'<body pos="{i * 0.1} .1 .1"><joint/><geom size=".03"/></body>' for i in range(8))
+    sparse_block = f'<body><joint type="ball"/><geom size=".1"/>{leaves}</body>'
+    mjm, mjd, m, d = test_data.fixture(
+      xml=f"<mujoco><worldbody><body pos='0 0 2'>{chain}</body>{small}{sparse_block}</worldbody></mujoco>"
+    )
+    self.assertTrue(any(tile.pattern_adr >= 0 for tile in m.M_tiles))
+    self.assertTrue(any(tile.elemid.size == 0 and tile.pattern_adr < 0 for tile in m.M_tiles))
     self.assertTrue(any(tile.elemid.size > 0 for tile in m.M_tiles))
     self.assertGreater(d.qLD.shape[1], m.qLD_block_total)
 

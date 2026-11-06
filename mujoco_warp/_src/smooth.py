@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 
 import warp as wp
 
+from mujoco_warp._src import block_ldl
 from mujoco_warp._src import math
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
@@ -1464,101 +1465,6 @@ def tendon_armature(m: Model, d: Data):
 
 
 @cache_kernel
-def _qLD_acc(nv: int, deterministic: bool = False):
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
-
-  @wp.kernel(module="unique", module_options=module_options)
-  def kernel(
-    # Model:
-    M_rownnz: wp.array[int],
-    M_rowadr: wp.array[int],
-    # In:
-    qLD_updates_: wp.array[wp.vec3i],
-    L_in: wp.array2d[float],
-    # Out:
-    L_out: wp.array2d[float],
-  ):
-    worldid, nodeid = wp.tid()
-    update = qLD_updates_[nodeid]
-    i, k, Madr_ki = update[0], update[1], update[2]
-    Madr_i = M_rowadr[i]  # Address of row being updated
-    diag_k = M_rowadr[k] + M_rownnz[k] - 1  # Address of diagonal element of k
-    # tmp = M(k,i) / M(k,k)
-    tmp = L_in[worldid, Madr_ki] / L_in[worldid, diag_k]
-    for j in range(M_rownnz[i]):
-      # M(i,j) -= M(k,j) * tmp
-      wp.atomic_sub(L_out[worldid], Madr_i + j, L_in[worldid, M_rowadr[k] + j] * tmp)
-    if wp.static(not deterministic):
-      # M(k,i) = tmp
-      L_out[worldid, Madr_ki] = tmp
-
-  return kernel
-
-
-@wp.kernel
-def _qLD_scale(
-  # Model:
-  M_rownnz: wp.array[int],
-  M_rowadr: wp.array[int],
-  # In:
-  qLD_updates_: wp.array[wp.vec3i],
-  L_in: wp.array2d[float],
-  # Out:
-  L_out: wp.array2d[float],
-):
-  worldid, nodeid = wp.tid()
-  update = qLD_updates_[nodeid]
-  k, Madr_ki = update[1], update[2]
-  diag_k = M_rowadr[k] + M_rownnz[k] - 1
-  L_out[worldid, Madr_ki] = L_in[worldid, Madr_ki] / L_in[worldid, diag_k]
-
-
-@wp.kernel
-def _qLDiag_div(
-  # Model:
-  M_rownnz: wp.array[int],
-  M_rowadr: wp.array[int],
-  # In:
-  L_in: wp.array2d[float],
-  # Out:
-  D_out: wp.array2d[float],
-):
-  worldid, dofid = wp.tid()
-  diag_i = M_rowadr[dofid] + M_rownnz[dofid] - 1  # Address of diagonal element of i
-  D_out[worldid, dofid] = 1.0 / L_in[worldid, diag_i]
-
-
-def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
-  """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd."""
-  wp.copy(L, M)
-
-  det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  L_in = wp.empty_like(L) if det_atomics else L
-  for i in reversed(range(len(m.qLD_updates))):
-    qLD_updates = m.qLD_updates[i]
-    if det_atomics:
-      wp.copy(L_in, L)
-    wp.launch(
-      _qLD_acc(m.nv if det_atomics else 0, det_atomics),
-      dim=(d.nworld, qLD_updates.size),
-      inputs=[m.M_rownnz, m.M_rowadr, qLD_updates, L_in],
-      outputs=[L],
-    )
-    if det_atomics:
-      wp.launch(
-        _qLD_scale,
-        dim=(d.nworld, qLD_updates.size),
-        inputs=[m.M_rownnz, m.M_rowadr, qLD_updates, L_in],
-        outputs=[L],
-      )
-
-  wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
-
-
-@cache_kernel
 def _small_cholesky_factorize_block(block_size: int):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1645,7 +1551,9 @@ def _factor_blocks(
   D: wp.array2d[float],
 ):
   for tile in m.M_tiles:
-    if tile.elemid.size == 0:
+    if tile.pattern_adr >= 0:
+      block_ldl.launch(m, tile, d.nworld, M, L, D)
+    elif tile.elemid.size == 0:
       wp.launch(
         _small_cholesky_factorize_block(tile.size),
         dim=(d.nworld, tile.adr.size),
@@ -1663,17 +1571,22 @@ def _factor_blocks(
       )
 
 
+def _factor_i(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
+  if m.M_tiles:
+    _factor_blocks(m, d, M, L, D)
+  if L.shape[1] > m.qLD_block_total:
+    L_ldl = L[:, m.qLD_block_total :]
+    block_ldl.launch_rows(m, d, M, L_ldl, D)
+    block_ldl.launch_sections(m, d, M, L_ldl, D)
+
+
 @event_scope
 def factor_m(m: Model, d: Data):
   """Factorization of inertia-like matrix M, assumed spd.
 
-  Compact blocks use reciprocal diagonals, full small blocks use scalar Cholesky, larger dense
-  blocks use tile Cholesky, and oversized blocks use sparse LDL.
+  Compact blocks use reciprocal diagonals, dense blocks use Cholesky, and sparse blocks use LDL.
   """
-  if m.M_tiles:
-    _factor_blocks(m, d, d.M, d.qLD, d.qLDiagInv)
-  if d.qLD.shape[1] > m.qLD_block_total:
-    _factor_i_sparse(m, d, d.M, d.qLD[:, m.qLD_block_total :], d.qLDiagInv)
+  _factor_i(m, d, d.M, d.qLD, d.qLDiagInv)
 
 
 @wp.kernel
@@ -4162,7 +4075,9 @@ def _solve_blocks(
   y: wp.array2d[float],
 ):
   for tile in m.M_tiles:
-    if tile.elemid.size == 0:
+    if tile.pattern_adr >= 0:
+      block_ldl.launch(m, tile, d.nworld, None, L, D, y, x, factorize=False)
+    elif tile.elemid.size == 0:
       wp.launch(
         _small_cholesky_solve_block(tile.size),
         dim=(d.nworld, tile.adr.size),
@@ -4194,13 +4109,12 @@ def solve_LD(
 ):
   """Computes backsubstitution for the inertia factorization.
 
-  Compact blocks use reciprocal diagonals, full small blocks use scalar Cholesky, dense blocks use
-  tile Cholesky, and sparse blocks use the LDL region.
+  Compact blocks use reciprocal diagonals; other blocks use Cholesky or LDL.
 
   Args:
     m: The model containing factorization and sparsity information.
     d: The data object containing workspace and factorization results.
-    L: The factor: packed dense region followed by the nC LDL region.
+    L: The factor: packed block factors followed by the nC LDL region.
     D: Reciprocal diagonal for compact and sparse blocks.
     x: Output array for the solution.
     y: Input right-hand side array.
@@ -4209,7 +4123,9 @@ def solve_LD(
   if m.M_tiles:
     _solve_blocks(m, d, L, D, x, y)
   if L.shape[1] > m.qLD_block_total:
-    _solve_LD_sparse(m, d, L[:, m.qLD_block_total :], D, x, y, x_scratch=x_scratch)
+    if m.qLD_row_tiles:
+      _solve_LD_sparse(m, d, L[:, m.qLD_block_total :], D, x, y, x_scratch=x_scratch)
+    block_ldl.launch_sections(m, d, None, L[:, m.qLD_block_total :], D, y, x, factorize=False)
 
 
 def skip_qacc_smooth(m: Model, d: Data) -> bool:
@@ -4345,7 +4261,9 @@ def _factor_solve_blocks(
   y: wp.array2d[float],
 ):
   for tile in m.M_tiles:
-    if tile.elemid.size == 0:
+    if tile.pattern_adr >= 0:
+      block_ldl.launch(m, tile, d.nworld, M, L, D, y, x)
+    elif tile.elemid.size == 0:
       wp.launch(
         _small_cholesky_factorize_solve_block(tile.size),
         dim=(d.nworld, tile.adr.size),
@@ -4373,7 +4291,7 @@ def factor_solve_i(m, d, M, L, D, x, y):
     m: The model containing factorization and sparsity information.
     d: The data object containing workspace and factorization results.
     M: The inertia-like matrix to factorize (CSR, length nC).
-    L: Output factor: packed dense region followed by the nC LDL region (sized like d.qLD).
+    L: Output factor: packed block factors followed by the nC LDL region (sized like d.qLD).
     D: Output reciprocal diagonal for compact and sparse blocks.
     x: Output array for the solution.
     y: Input right-hand side array.
@@ -4382,8 +4300,10 @@ def factor_solve_i(m, d, M, L, D, x, y):
     _factor_solve_blocks(m, d, M, L, D, x, y)
   if L.shape[1] > m.qLD_block_total:
     L_ldl = L[:, m.qLD_block_total :]
-    _factor_i_sparse(m, d, M, L_ldl, D)
-    _solve_LD_sparse(m, d, L_ldl, D, x, y)
+    block_ldl.launch_rows(m, d, M, L_ldl, D)
+    if m.qLD_row_tiles:
+      _solve_LD_sparse(m, d, L_ldl, D, x, y)
+    block_ldl.launch_sections(m, d, M, L_ldl, D, y, x)
 
 
 @cache_kernel

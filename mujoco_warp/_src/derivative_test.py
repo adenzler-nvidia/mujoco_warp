@@ -3060,6 +3060,41 @@ class DerivativeTest(parameterized.TestCase):
       self.assertFalse(np.allclose(d.qacc.numpy()[0], d.qacc.numpy()[1]))
 
   @parameterized.parameters(1, 2)
+  def test_eff_section_factor(self, nworld):
+    limb = '<body pos="0 0 .1"><joint/><geom size=".05"/>' * 15 + "</body>" * 15
+    trunk = '<body pos="0 0 .1"><joint/><geom size=".05"/>' * 8 + limb * 5 + "</body>" * 8
+    mjm, mjd, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <option integrator="discrete" iterations="0"><flag contact="disable"/></option>
+        <default><joint armature="1"/></default>
+        <worldbody>{trunk}</worldbody>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+    self.assertTrue(m.M_sections)
+    rng = np.random.default_rng(42)
+    shift = rng.uniform(0.1, 1.0, (nworld, m.nv)).astype(np.float32)
+    rhs = rng.normal(size=(nworld, m.nv)).astype(np.float32)
+    d.efm_diag.assign(shift)
+    d.qH.fill_(wp.inf)
+    d.qHLD.fill_(wp.inf)
+    d.qHDiagInv.fill_(wp.inf)
+    d.qLD_schur.fill_(wp.inf)
+    out = wp.full((nworld, m.nv), wp.inf, dtype=float)
+
+    derivative.eff_actuation(m, d)
+    derivative.eff_solve(m, d, out, wp.array(rhs))
+
+    dense = np.zeros((m.nv, m.nv))
+    mujoco.mju_sym2dense(dense, mjd.M, mjm.M_rownnz, mjm.M_rowadr, mjm.M_colind)
+    expected = np.linalg.solve(dense + shift[:, :, None] * np.eye(m.nv), rhs[:, :, None])[..., 0]
+    np.testing.assert_allclose(out.numpy(), expected, rtol=2e-5, atol=2e-6)
+    if nworld == 2:
+      self.assertFalse(np.allclose(out.numpy()[0], out.numpy()[1]))
+
+  @parameterized.parameters(1, 2)
   def test_discrete_direct_solve_with_motor(self, nworld):
     """Tests that eff_solve uses direct qH solve when actuators/tendons add no metric coupling."""
     mjm, mjd, m, d = test_data.fixture(
