@@ -1369,16 +1369,16 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   for section in _lay["sections"]:
     sections.append(
       types.MassSection(
-        dofs=wp.array(section["dofs"], dtype=int),
+        dofs=wp.array(section.dofs, dtype=int),
         pattern_adr=len(rowadr),
-        ancestor=section["ancestor"],
-        update_adr=wp.array(section["update_adr"], dtype=int),
-        update_ind=wp.array(section["update_ind"], dtype=int),
-        message_adr=wp.array(section["message_adr"], dtype=int),
+        ancestor=section.ancestor,
+        update_adr=wp.array(section.update_adr, dtype=int),
+        update_ind=wp.array(section.update_ind, dtype=int),
+        message_adr=wp.array(section.message_adr, dtype=int),
       )
     )
-    rowadr.extend(len(colind) + a for a in section["rowadr"])
-    colind.extend(section["colind"])
+    rowadr.extend(len(colind) + a for a in section.rowadr)
+    colind.extend(section.colind)
   m.M_sections = tuple(sections)
   m.M_sparse_rowadr, m.M_sparse_colind = tuple(rowadr), tuple(colind)
   m.M_tiles = tuple(scalar_tiles + gather_tiles + sparse_tiles)

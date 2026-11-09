@@ -21,6 +21,7 @@ only their matrix/RHS contributions upward; original rows are loaded by their ow
 The root completes its solve, then the downward pass substitutes solved ancestors into each section.
 """
 
+import dataclasses
 import functools
 from typing import NamedTuple
 
@@ -35,6 +36,17 @@ _SECTION_ROWS = 64
 @wp.func
 def _exchange(value: float, source: int):
   return wp.tile_extract(wp.tile(value), source)
+
+
+class _Update(NamedTuple):
+  destination: int
+  source: int
+  mask: int
+
+
+class _LowerEntry(NamedTuple):
+  column: int
+  slot: int
 
 
 class _RegisterLayout(NamedTuple):
@@ -66,11 +78,13 @@ def _register_layout(rowadr, colind, factorize, block_dim, begin, children):
   pos = {pair: s for s, pair in enumerate(slots)}
   mapping = tuple(tuple(indices.get((i, c * width + lane), -1) for lane in range(width)) for i, c in slots)
   diagonal_slots = tuple(pos.get((k, k // width), -1) for k in range(n))
-  lower = tuple(tuple((i, pos[k, i // width]) for i in rows[k][:-1]) if begin <= k < n else () for k in range(n))
+  lower = tuple(tuple(_LowerEntry(i, pos[k, i // width]) for i in rows[k][:-1]) if begin <= k < n else () for k in range(n))
   updates = tuple(
     tuple(
       tuple(
-        (pos[i, c], pos[k, c], sum(1 << lane for lane in range(width) if c * width + lane in rows[k] and c * width + lane <= i))
+        _Update(
+          pos[i, c], pos[k, c], sum(1 << lane for lane in range(width) if c * width + lane in rows[k] and c * width + lane <= i)
+        )
         for c in chunks[i]
         if c in chunks[k]
       )
@@ -132,18 +146,18 @@ def _kernel(rowadr: tuple, colind: tuple, factorize: bool, solve: bool, block_di
       inv = 1.0 / diag
       if wp.static(factorize):
         for ii in range(wp.static(len(layout.lower_entries[k]))):
-          i = wp.static(layout.lower_entries[k][ii][0])
+          i = wp.static(layout.lower_entries[k][ii].column)
           if wp.static(width == 1):
-            v = matrix_values[wp.static(layout.lower_entries[k][ii][1])] * inv
+            v = matrix_values[wp.static(layout.lower_entries[k][ii].slot)] * inv
           else:
             v = (
               wp.tile_extract(shared_row, wp.static(layout.row_chunks[k].index(i // width)), tid - lane + wp.static(i % width))
               * inv
             )
           for jj in range(wp.static(len(layout.updates[k][ii]))):
-            dst = wp.static(layout.updates[k][ii][jj][0])
-            src = wp.static(layout.updates[k][ii][jj][1])
-            if ((wp.static(layout.updates[k][ii][jj][2]) >> lane) & 1) != 0:
+            dst = wp.static(layout.updates[k][ii][jj].destination)
+            src = wp.static(layout.updates[k][ii][jj].source)
+            if ((wp.static(layout.updates[k][ii][jj].mask) >> lane) & 1) != 0:
               matrix_values[dst] -= v * matrix_values[src]
         for ci in range(wp.static(len(layout.row_chunks[k]))):
           c = wp.static(layout.row_chunks[k][ci])
@@ -417,6 +431,35 @@ def launch_rows(m, d, matrix, factor, diagonal):
     )
 
 
+@dataclasses.dataclass
+class _Section:
+  dofs: tuple[int, ...]
+  rowadr: tuple[int, ...]
+  colind: tuple[int, ...]
+  ancestor: int
+  depth: int
+  message_adr: int
+  children: list["_Section"] = dataclasses.field(default_factory=list)
+
+  @property
+  def rhs_adr(self):
+    return self.message_adr + self.rowadr[self.ancestor]
+
+  @property
+  def message_end(self):
+    return self.rhs_adr + self.ancestor
+
+
+class SectionGroup(NamedTuple):
+  dofs: list[tuple[int, ...]]
+  rowadr: tuple[int, ...]
+  colind: tuple[int, ...]
+  ancestor: int
+  update_adr: list[list[int]]
+  update_ind: list[int]
+  message_adr: list[int]
+
+
 def _partition_tree(rows):
   children = [[] for _ in rows]
   for i, row in enumerate(rows):
@@ -461,25 +504,21 @@ def section_layout(rowadr, rownnz, colind, trees):
       for row in csr:
         cols.extend(row)
         adr.append(len(cols))
-      next_count = count + adr[len(halo)] + len(halo)
-      if next_count > max_scratch:
-        break
       parent = owner[halo[-1]] if halo else -1
-      depth = tree[parent]["depth"] + 1 if parent >= 0 else 0
-      tree.append(
-        dict(
-          dofs=[i + start for i in dofs],
-          rowadr=tuple(adr),
-          colind=tuple(cols),
-          ancestor=len(halo),
-          depth=depth,
-          children=[],
-          message=total + count,
-        )
+      section = _Section(
+        dofs=tuple(i + start for i in dofs),
+        rowadr=tuple(adr),
+        colind=tuple(cols),
+        ancestor=len(halo),
+        depth=tree[parent].depth + 1 if parent >= 0 else 0,
+        message_adr=total + count,
       )
+      if section.message_end - total > max_scratch:
+        break
+      tree.append(section)
       if parent >= 0:
-        tree[parent]["children"].append(tree[-1])
-      count = next_count
+        tree[parent].children.append(section)
+      count = section.message_end - total
     if len(tree) != len(parts):
       continue
     descriptions.extend(tree)
@@ -488,20 +527,20 @@ def section_layout(rowadr, rownnz, colind, trees):
 
   groups = {}
   for desc in descriptions:
-    dofs, adr, cols = desc["dofs"], desc["rowadr"], desc["colind"]
+    dofs, adr, cols = desc.dofs, desc.rowadr, desc.colind
     local = {v: i for i, v in enumerate(dofs)}
     indices = {(i, cols[a]): a for i in range(len(dofs)) for a in range(adr[i], adr[i + 1])}
     contributions = [[] for _ in range(adr[-1] + len(dofs))]
-    for child in desc["children"]:
-      halo = child["ancestor"]
+    for child in desc.children:
+      halo = child.ancestor
       for i in range(halo):
-        ri = local[child["dofs"][i]]
-        for at in range(child["rowadr"][i], child["rowadr"][i + 1]):
-          rj = local[child["dofs"][child["colind"][at]]]
-          contributions[indices[ri, rj]].append(child["message"] + at)
-        contributions[adr[-1] + ri].append(child["message"] + child["rowadr"][halo] + i)
-    key = (desc["depth"], adr, cols, desc["ancestor"], bool(desc["children"]))
-    groups.setdefault(key, []).append((dofs, contributions, desc["message"]))
+        ri = local[child.dofs[i]]
+        for at in range(child.rowadr[i], child.rowadr[i + 1]):
+          rj = local[child.dofs[child.colind[at]]]
+          contributions[indices[ri, rj]].append(child.message_adr + at)
+        contributions[adr[-1] + ri].append(child.rhs_adr + i)
+    key = (desc.depth, adr, cols, desc.ancestor, bool(desc.children))
+    groups.setdefault(key, []).append((dofs, contributions, desc.message_adr))
   result = []
   for (depth, adr, cols, ancestor, _), group in sorted(groups.items(), key=lambda item: item[0][0]):
     dofs, starts, offsets, indices = [], [], [], []
@@ -513,9 +552,7 @@ def section_layout(rowadr, rownnz, colind, trees):
         indices.extend(entries)
         row.append(len(indices))
       offsets.append(row)
-    result.append(
-      dict(dofs=dofs, rowadr=adr, colind=cols, ancestor=ancestor, update_adr=offsets, update_ind=indices, message_adr=starts)
-    )
+    result.append(SectionGroup(dofs, adr, cols, ancestor, offsets, indices, starts))
   return result, total, accepted
 
 
