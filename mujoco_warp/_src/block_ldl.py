@@ -15,6 +15,9 @@
 
 """Reverse A = L.T D L for MuJoCo ancestor-pattern mass matrices.
 
+Descending elimination uses L[k,i] = A[k,i]/D[k] and A[i,j] -= L[k,i]*A[k,j].
+The solve applies L.T y = b in descending order, then L x = D^-1 y in ascending order.
+
 Ancestor rows are CSR prefixes of descendant rows, so reverse elimination introduces no fill.
 Sections place ancestor rows before owned rows. The upward pass eliminates owned rows and sends
 only their matrix/RHS contributions upward; original rows are loaded by their owning section.
@@ -122,91 +125,106 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
   row_size = max(map(len, layout.row_chunks[nancestor:nrows]))
   PivotRegisters = wp.types.vector(length=row_size + 1, dtype=wp.float32)
 
-  def make_rhs_update(k):
+  def make_transpose_update(k):
+    chunks = layout.row_chunks[k]
+    slots = tuple(layout.positions[k, c] for c in chunks)
+    masks = layout.lower_masks[k]
+
     @wp.func
-    def update_rhs(matrix_values: MatrixRegisters, rhs_in: RhsRegisters, value: float, lane: int):
+    def transpose_update(factor: MatrixRegisters, rhs_in: RhsRegisters, y_k: float, lane: int):
+      """Apply b[i] -= L[k,i] * y[k] for i < k."""
       rhs_values = rhs_in
-      for ci in range(wp.static(len(layout.row_chunks[k]))):
-        c = wp.static(layout.row_chunks[k][ci])
-        mask = wp.static(layout.lower_masks[k][ci])
-        if ((mask >> lane) & 1) != 0:
-          rhs_values[wp.static(c)] -= matrix_values[wp.static(layout.positions[k, c])] * value
+      for chunk in range(wp.static(len(chunks))):
+        rhs_slot = wp.static(chunks[chunk])
+        factor_slot = wp.static(slots[chunk])
+        if ((wp.static(masks[chunk]) >> lane) & 1) != 0:
+          rhs_values[rhs_slot] -= factor[factor_slot] * y_k
       return rhs_values
 
-    return update_rhs
+    return transpose_update
 
-  rhs_updates = tuple(make_rhs_update(k) for k in range(nancestor, nrows)) if solve else ()
+  transpose_updates = tuple(make_transpose_update(k) for k in range(nancestor, nrows)) if solve else ()
 
   # Function-local tiles let consecutive eliminations reuse shared scratch.
   def make_elimination(k):
+    chunks = layout.row_chunks[k]
+    slots = tuple(layout.positions[k, c] for c in chunks)
+    lower = layout.lower_entries[k]
+    updates = layout.updates[k]
+    diagonal_slot = layout.diagonal_slots[k]
+    diagonal_chunk = chunks.index(k // width)
+    lower_chunks = tuple(chunks.index(entry.column // width) for entry in lower)
+
     @wp.func
     def eliminate(matrix_in: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
       matrix_values = matrix_in
       rhs_values = rhs_in
       if wp.static(width == 1):
-        diag = matrix_values[wp.static(layout.diagonal_slots[k])]
+        d_k = matrix_values[wp.static(diagonal_slot)]
       else:
         row = PivotRegisters()
-        for ci in range(wp.static(len(layout.row_chunks[k]))):
-          c = wp.static(layout.row_chunks[k][ci])
-          row[ci] = matrix_values[wp.static(layout.positions[k, c])]
+        for chunk in range(wp.static(len(chunks))):
+          row[chunk] = matrix_values[wp.static(slots[chunk])]
         if wp.static(solve):
           row[wp.static(row_size)] = rhs_values[wp.static(k // width)]
         shared_row = wp.tile(row)
-        diag = wp.tile_extract(shared_row, wp.static(layout.row_chunks[k].index(k // width)), tid - lane + wp.static(k % width))
-      inv = 1.0 / diag
-      for ii in range(wp.static(len(layout.lower_entries[k]))):
-        i = wp.static(layout.lower_entries[k][ii].column)
+        d_k = wp.tile_extract(shared_row, wp.static(diagonal_chunk), tid - lane + wp.static(k % width))
+      inv_d = 1.0 / d_k
+      for neighbor in range(wp.static(len(lower))):
+        i = wp.static(lower[neighbor].column)
         if wp.static(width == 1):
-          v = matrix_values[wp.static(layout.lower_entries[k][ii].slot)] * inv
+          l_ki = matrix_values[wp.static(lower[neighbor].slot)] * inv_d
         else:
-          v = (
-            wp.tile_extract(shared_row, wp.static(layout.row_chunks[k].index(i // width)), tid - lane + wp.static(i % width))
-            * inv
-          )
-        for jj in range(wp.static(len(layout.updates[k][ii]))):
-          dst = wp.static(layout.updates[k][ii][jj].destination)
-          src = wp.static(layout.updates[k][ii][jj].source)
-          if ((wp.static(layout.updates[k][ii][jj].mask) >> lane) & 1) != 0:
-            matrix_values[dst] -= v * matrix_values[src]
-      for ci in range(wp.static(len(layout.row_chunks[k]))):
-        c = wp.static(layout.row_chunks[k][ci])
-        if lane + wp.static(c * width) < wp.static(k):
-          matrix_values[wp.static(layout.positions[k, c])] *= inv
+          l_ki = wp.tile_extract(shared_row, wp.static(lower_chunks[neighbor]), tid - lane + wp.static(i % width)) * inv_d
+        # Read unscaled A[k,j] until every Schur update using this row is complete.
+        for entry in range(wp.static(len(updates[neighbor]))):
+          a_ij = wp.static(updates[neighbor][entry].destination)
+          a_kj = wp.static(updates[neighbor][entry].source)
+          if ((wp.static(updates[neighbor][entry].mask) >> lane) & 1) != 0:
+            matrix_values[a_ij] -= l_ki * matrix_values[a_kj]
+      for chunk in range(wp.static(len(chunks))):
+        column = lane + wp.static(chunks[chunk] * width)
+        if column < wp.static(k):
+          matrix_values[wp.static(slots[chunk])] *= inv_d
       if wp.static(solve):
         if wp.static(width == 1):
-          value = rhs_values[wp.static(k // width)]
+          y_k = rhs_values[wp.static(k // width)]
         else:
-          value = wp.tile_extract(shared_row, wp.static(row_size), tid - lane + wp.static(k % width))
-        rhs_values = wp.static(rhs_updates[k - nancestor])(matrix_values, rhs_values, value, lane)
+          y_k = wp.tile_extract(shared_row, wp.static(row_size), tid - lane + wp.static(k % width))
+        rhs_values = wp.static(transpose_updates[k - nancestor])(matrix_values, rhs_values, y_k, lane)
         if wp.static(nancestor == 0):
           if lane == wp.static(k % width):
-            rhs_values[wp.static(k // width)] *= inv
-      return matrix_values, rhs_values, inv
+            rhs_values[wp.static(k // width)] *= inv_d
+      return matrix_values, rhs_values, inv_d
 
     return eliminate
 
   eliminations = tuple(make_elimination(k) for k in range(nancestor, nrows)) if factorize else ()
 
-  def make_substitution(k):
+  def make_forward_solve(k):
+    chunks = layout.row_chunks[k]
+    slots = tuple(layout.positions[k, c] for c in chunks)
+    masks = layout.lower_masks[k]
+
     @wp.func
-    def substitute(matrix_values: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
+    def forward_solve(factor: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
+      """Subtract dot(L[k,:k], x[:k]) from the scaled RHS at k."""
       rhs_values = rhs_in
-      value = float(0.0)
-      for ci in range(wp.static(len(layout.row_chunks[k]))):
-        c = wp.static(layout.row_chunks[k][ci])
-        mask = wp.static(layout.lower_masks[k][ci])
-        if ((mask >> lane) & 1) != 0:
-          value += matrix_values[wp.static(layout.positions[k, c])] * rhs_values[wp.static(c)]
+      dot_lx = float(0.0)
+      for chunk in range(wp.static(len(chunks))):
+        rhs_slot = wp.static(chunks[chunk])
+        factor_slot = wp.static(slots[chunk])
+        if ((wp.static(masks[chunk]) >> lane) & 1) != 0:
+          dot_lx += factor[factor_slot] * rhs_values[rhs_slot]
       for stage in range(wp.static(width.bit_length() - 1)):
-        value += _exchange(value, tid ^ wp.static(1 << stage))
+        dot_lx += _exchange(dot_lx, tid ^ wp.static(1 << stage))
       if lane == wp.static(k % width):
-        rhs_values[wp.static(k // width)] -= value
+        rhs_values[wp.static(k // width)] -= dot_lx
       return rhs_values
 
-    return substitute
+    return forward_solve
 
-  substitutions = tuple(make_substitution(k) for k in range(nancestor, nrows)) if solve and (nancestor == 0 or down) else ()
+  forward_steps = tuple(make_forward_solve(k) for k in range(nancestor, nrows)) if solve and (nancestor == 0 or down) else ()
 
   direct = nancestor == 0 and not has_children
 
@@ -310,7 +328,7 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
           value = rhs_values[wp.static(k // width)]
           if wp.static(width > 1):
             value = _exchange(value, tid - lane + wp.static(k % width))
-          rhs_values = wp.static(rhs_updates[k - nancestor])(matrix_values, rhs_values, value, lane)
+          rhs_values = wp.static(transpose_updates[k - nancestor])(matrix_values, rhs_values, value, lane)
           if wp.static(nancestor == 0):
             if enabled and lane == wp.static(k % width):
               rhs_values[wp.static(k // width)] *= matrix_values[wp.static(layout.diagonal_slots[k])]
@@ -320,7 +338,7 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
         if wp.static(down):
           if lane == wp.static(k % width):
             rhs_values[wp.static(k // width)] *= matrix_values[wp.static(layout.diagonal_slots[k])]
-        rhs_values = wp.static(substitutions[k - nancestor])(matrix_values, rhs_values, tid, lane)
+        rhs_values = wp.static(forward_steps[k - nancestor])(matrix_values, rhs_values, tid, lane)
     if wp.static(solve):
       for c in range(wp.static(rhs_chunks)):
         j = wp.static(c * width) + lane
