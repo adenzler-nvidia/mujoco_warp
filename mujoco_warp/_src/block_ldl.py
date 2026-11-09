@@ -201,6 +201,25 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
 
   eliminations = tuple(make_elimination(k) for k in range(nancestor, nrows)) if factorize else ()
 
+  def make_transpose_solve(k):
+    diagonal_slot = layout.diagonal_slots[k]
+
+    @wp.func
+    def transpose_solve(factor: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int, enabled: bool):
+      rhs_values = rhs_in
+      y_k = rhs_values[wp.static(k // width)]
+      if wp.static(width > 1):
+        y_k = _exchange(y_k, tid - lane + wp.static(k % width))
+      rhs_values = wp.static(transpose_updates[k - nancestor])(factor, rhs_values, y_k, lane)
+      if wp.static(nancestor == 0):
+        if enabled and lane == wp.static(k % width):
+          rhs_values[wp.static(k // width)] *= factor[wp.static(diagonal_slot)]
+      return rhs_values
+
+    return transpose_solve
+
+  transpose_steps = tuple(make_transpose_solve(k) for k in range(nancestor, nrows)) if not factorize and not down else ()
+
   def make_forward_solve(k):
     chunks = layout.row_chunks[k]
     slots = tuple(layout.positions[k, c] for c in chunks)
@@ -208,8 +227,11 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
 
     @wp.func
     def forward_solve(factor: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
-      """Subtract dot(L[k,:k], x[:k]) from the scaled RHS at k."""
+      """Finish row k of L x = D^-1 y; the root RHS is already scaled."""
       rhs_values = rhs_in
+      if wp.static(down):
+        if lane == wp.static(k % width):
+          rhs_values[wp.static(k // width)] *= factor[wp.static(layout.diagonal_slots[k])]
       dot_lx = float(0.0)
       for chunk in range(wp.static(len(chunks))):
         rhs_slot = wp.static(chunks[chunk])
@@ -321,23 +343,14 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
       for rev in range(wp.static(nrows - nancestor)):
         k = wp.static(nrows - 1 - rev)
         if wp.static(factorize):
-          matrix_values, rhs_values, inv = wp.static(eliminations[k - nancestor])(matrix_values, rhs_values, tid, lane)
+          matrix_values, rhs_values, inv_d = wp.static(eliminations[k - nancestor])(matrix_values, rhs_values, tid, lane)
           if enabled and lane == wp.static(k % width):
-            diagonal_out[world, dof(dofs, system, wp.static(k), dof_base)] = inv
+            diagonal_out[world, dof(dofs, system, wp.static(k), dof_base)] = inv_d
         else:
-          value = rhs_values[wp.static(k // width)]
-          if wp.static(width > 1):
-            value = _exchange(value, tid - lane + wp.static(k % width))
-          rhs_values = wp.static(transpose_updates[k - nancestor])(matrix_values, rhs_values, value, lane)
-          if wp.static(nancestor == 0):
-            if enabled and lane == wp.static(k % width):
-              rhs_values[wp.static(k // width)] *= matrix_values[wp.static(layout.diagonal_slots[k])]
+          rhs_values = wp.static(transpose_steps[k - nancestor])(matrix_values, rhs_values, tid, lane, enabled)
     if wp.static(solve and (nancestor == 0 or down)):
       for off in range(wp.static(nrows - nancestor)):
         k = wp.static(nancestor + off)
-        if wp.static(down):
-          if lane == wp.static(k % width):
-            rhs_values[wp.static(k // width)] *= matrix_values[wp.static(layout.diagonal_slots[k])]
         rhs_values = wp.static(forward_steps[k - nancestor])(matrix_values, rhs_values, tid, lane)
     if wp.static(solve):
       for c in range(wp.static(rhs_chunks)):
