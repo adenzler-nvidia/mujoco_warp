@@ -22,7 +22,6 @@ from mujoco_warp._src import block_ldl
 from mujoco_warp._src import math
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
-from mujoco_warp._src.types import FLEX_INTERP_PHYS_JAC
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import Q_LD_BLOCK_COMPACT
@@ -573,17 +572,16 @@ def _flex_face_kinematics(
       face_xpos_out[worldid, face_id, local_idx] = wp.vec3(0.0)
 
   normal_axis, _, _, _, _, _ = support.get_face_metadata(cx, cy, cz, face_elem_idx, order_abs)
-  if wp.static(FLEX_INTERP_PHYS_JAC):
-    axis0 = (normal_axis + 1) % 3
-    axis1 = (normal_axis + 2) % 3
-    if gidx0 != -1 and gidx1 != -1:
-      dref = flex_node0[gidx1] - flex_node0[gidx0]
-      d0 = dref[axis0]
-      d1 = dref[axis1]
-      if d0 > MJ_MINVAL:
-        t1 = t1 / d0
-      if d1 > MJ_MINVAL:
-        t2 = t2 / d1
+  axis0 = (normal_axis + 1) % 3
+  axis1 = (normal_axis + 2) % 3
+  if gidx0 != -1 and gidx1 != -1:
+    dref = flex_node0[gidx1] - flex_node0[gidx0]
+    d0 = dref[axis0]
+    d1 = dref[axis1]
+    if d0 > MJ_MINVAL:
+      t1 = t1 / d0
+    if d1 > MJ_MINVAL:
+      t2 = t2 / d1
 
   normal = wp.cross(t1, t2)
 
@@ -709,7 +707,7 @@ def _flex_rod_ref(
 
   nedge = flex_rod_edgenum[f]
   nhinge = nedge - 1
-  if wp.static(ROD_HINGE_SIZE != 10) or nhinge <= 0:
+  if nhinge <= 0:
     return
 
   hadr = flex_rod_hingeadr[f]
@@ -1337,7 +1335,6 @@ def crb(m: Model, d: Data):
   """
   wp.launch(_crb_subtree, dim=(d.nworld, m.nbody), inputs=[m.body_subtreenum, d.cinert], outputs=[d.crb])
 
-  d.M.zero_()
   wp.launch(
     _M,
     dim=(d.nworld, m.nv),
