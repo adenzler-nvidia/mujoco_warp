@@ -42,27 +42,17 @@ def _exchange(value: float, source: int):
   return wp.tile_extract(wp.tile(value), source)
 
 
-class _Update(NamedTuple):
-  destination: int
-  source: int
-  mask: int
-
-
-class _LowerEntry(NamedTuple):
-  column: int
-  slot: int
-
-
 class _RegisterLayout(NamedTuple):
   width: int
+  rows: tuple
   row_chunks: tuple
   slots: tuple
   csr_indices: tuple
-  diagonal_slots: tuple
-  lower_entries: tuple
   positions: dict
-  updates: tuple
-  lower_masks: tuple
+
+
+def _row_mask(columns, chunk, width, last):
+  return sum(1 << (j % width) for j in columns if j // width == chunk and j <= last)
 
 
 def _register_layout(rowadr, colind, factorize, block_dim, begin, children):
@@ -81,26 +71,7 @@ def _register_layout(rowadr, colind, factorize, block_dim, begin, children):
   slots = tuple((i, c) for i in range(0 if factorize else begin, n) for c in chunks[i])
   pos = {pair: s for s, pair in enumerate(slots)}
   mapping = tuple(tuple(indices.get((i, c * width + lane), -1) for lane in range(width)) for i, c in slots)
-  diagonal_slots = tuple(pos.get((k, k // width), -1) for k in range(n))
-  lower = tuple(tuple(_LowerEntry(i, pos[k, i // width]) for i in rows[k][:-1]) if begin <= k < n else () for k in range(n))
-  updates = tuple(
-    tuple(
-      tuple(
-        _Update(
-          pos[i, c], pos[k, c], sum(1 << lane for lane in range(width) if c * width + lane in rows[k] and c * width + lane <= i)
-        )
-        for c in chunks[i]
-        if c in chunks[k]
-      )
-      for i, _ in (lower[k] if factorize else ())
-    )
-    for k in range(n)
-  )
-  lower_masks = tuple(
-    tuple(sum(1 << lane for lane in range(width) if c * width + lane in row[:-1]) for c in chunks[k])
-    for k, row in enumerate(rows)
-  )
-  return _RegisterLayout(width, chunks, slots, mapping, diagonal_slots, lower, pos, updates, lower_masks)
+  return _RegisterLayout(width, rows, chunks, slots, mapping, pos)
 
 
 class _Operation(enum.Enum):
@@ -128,7 +99,6 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
   def make_transpose_update(k):
     chunks = layout.row_chunks[k]
     slots = tuple(layout.positions[k, c] for c in chunks)
-    masks = layout.lower_masks[k]
 
     @wp.func
     def transpose_update(factor: MatrixRegisters, rhs_in: RhsRegisters, y_k: float, lane: int):
@@ -137,7 +107,7 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
       for chunk in range(wp.static(len(chunks))):
         rhs_slot = wp.static(chunks[chunk])
         factor_slot = wp.static(slots[chunk])
-        if ((wp.static(masks[chunk]) >> lane) & 1) != 0:
+        if ((wp.static(_row_mask(layout.rows[k], chunks[chunk], width, k - 1)) >> lane) & 1) != 0:
           rhs_values[rhs_slot] -= factor[factor_slot] * y_k
       return rhs_values
 
@@ -149,11 +119,9 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
   def make_elimination(k):
     chunks = layout.row_chunks[k]
     slots = tuple(layout.positions[k, c] for c in chunks)
-    lower = layout.lower_entries[k]
-    updates = layout.updates[k]
-    diagonal_slot = layout.diagonal_slots[k]
+    lower = layout.rows[k][:-1]
+    diagonal_slot = layout.positions[k, k // width]
     diagonal_chunk = chunks.index(k // width)
-    lower_chunks = tuple(chunks.index(entry.column // width) for entry in lower)
 
     @wp.func
     def eliminate(matrix_in: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
@@ -171,17 +139,19 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
         d_k = wp.tile_extract(shared_row, wp.static(diagonal_chunk), tid - lane + wp.static(k % width))
       inv_d = 1.0 / d_k
       for neighbor in range(wp.static(len(lower))):
-        i = wp.static(lower[neighbor].column)
+        i = wp.static(lower[neighbor])
         if wp.static(width == 1):
-          l_ki = matrix_values[wp.static(lower[neighbor].slot)] * inv_d
+          l_ki = matrix_values[wp.static(layout.positions[k, i // width])] * inv_d
         else:
-          l_ki = wp.tile_extract(shared_row, wp.static(lower_chunks[neighbor]), tid - lane + wp.static(i % width)) * inv_d
+          l_ki = wp.tile_extract(shared_row, wp.static(chunks.index(i // width)), tid - lane + wp.static(i % width)) * inv_d
         # Read unscaled A[k,j] until every Schur update using this row is complete.
-        for entry in range(wp.static(len(updates[neighbor]))):
-          a_ij = wp.static(updates[neighbor][entry].destination)
-          a_kj = wp.static(updates[neighbor][entry].source)
-          if ((wp.static(updates[neighbor][entry].mask) >> lane) & 1) != 0:
-            matrix_values[a_ij] -= l_ki * matrix_values[a_kj]
+        for chunk in range(wp.static(len(layout.row_chunks[i]))):
+          column_chunk = wp.static(layout.row_chunks[i][chunk])
+          if wp.static((k, column_chunk) in layout.positions):
+            a_ij = wp.static(layout.positions[i, column_chunk])
+            a_kj = wp.static(layout.positions[k, column_chunk])
+            if ((wp.static(_row_mask(layout.rows[k], column_chunk, width, i)) >> lane) & 1) != 0:
+              matrix_values[a_ij] -= l_ki * matrix_values[a_kj]
       for chunk in range(wp.static(len(chunks))):
         column = lane + wp.static(chunks[chunk] * width)
         if column < wp.static(k):
@@ -202,7 +172,7 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
   eliminations = tuple(make_elimination(k) for k in range(nancestor, nrows)) if factorize else ()
 
   def make_transpose_solve(k):
-    diagonal_slot = layout.diagonal_slots[k]
+    diagonal_slot = layout.positions[k, k // width]
 
     @wp.func
     def transpose_solve(factor: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int, enabled: bool):
@@ -223,7 +193,6 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
   def make_forward_solve(k):
     chunks = layout.row_chunks[k]
     slots = tuple(layout.positions[k, c] for c in chunks)
-    masks = layout.lower_masks[k]
 
     @wp.func
     def forward_solve(factor: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
@@ -231,12 +200,12 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
       rhs_values = rhs_in
       if wp.static(down):
         if lane == wp.static(k % width):
-          rhs_values[wp.static(k // width)] *= factor[wp.static(layout.diagonal_slots[k])]
+          rhs_values[wp.static(k // width)] *= factor[wp.static(layout.positions[k, k // width])]
       dot_lx = float(0.0)
       for chunk in range(wp.static(len(chunks))):
         rhs_slot = wp.static(chunks[chunk])
         factor_slot = wp.static(slots[chunk])
-        if ((wp.static(masks[chunk]) >> lane) & 1) != 0:
+        if ((wp.static(_row_mask(layout.rows[k], chunks[chunk], width, k - 1)) >> lane) & 1) != 0:
           dot_lx += factor[factor_slot] * rhs_values[rhs_slot]
       for stage in range(wp.static(width.bit_length() - 1)):
         dot_lx += _exchange(dot_lx, tid ^ wp.static(1 << stage))
@@ -262,7 +231,7 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
       return base + csr_index
     return matrix_adr[dofs[system, ri]] + csr_index - offset
 
-  @wp.kernel(module="unique", module_options={"enable_backward": False, "max_unroll": 4096})
+  @wp.kernel(module="unique", module_options={"enable_backward": False})
   def kernel(
     # In:
     dofs: wp.array2d[int],
@@ -337,7 +306,7 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
       # Solve-up retains D; root/down substitution consumes 1/D.
       for k in range(wp.static(nancestor), wp.static(nrows)):
         if lane == wp.static(k % width):
-          slot = wp.static(layout.diagonal_slots[k])
+          slot = wp.static(layout.positions[k, k // width])
           matrix_values[slot] = 1.0 / matrix_values[slot]
     if wp.static(not down):
       for rev in range(wp.static(nrows - nancestor)):
