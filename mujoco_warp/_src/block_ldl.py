@@ -20,12 +20,10 @@ The solve applies L.T y = b in descending order, then L x = D^-1 y in ascending 
 
 Ancestor rows are CSR prefixes of descendant rows, so reverse elimination introduces no fill.
 Sections place ancestor rows before owned rows. The upward pass eliminates owned rows and sends
-only their matrix/RHS contributions upward; original rows are loaded by their owning section.
-The root completes its solve, then the downward pass substitutes solved ancestors into each section.
+only their matrix contributions upward; original rows are loaded by their owning section.
 """
 
 import dataclasses
-import enum
 import functools
 from typing import NamedTuple
 
@@ -74,18 +72,8 @@ def _register_layout(rowadr, colind, factorize, block_dim, begin, children):
   return _RegisterLayout(width, rows, chunks, slots, mapping, pos)
 
 
-class _Operation(enum.Enum):
-  FACTOR = enum.auto()
-  FACTOR_SOLVE = enum.auto()
-  SOLVE_UP = enum.auto()
-  SOLVE_DOWN = enum.auto()
-
-
 @functools.cache
-def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int, *, nancestor=0, has_children=False):
-  factorize = operation in (_Operation.FACTOR, _Operation.FACTOR_SOLVE)
-  solve = operation != _Operation.FACTOR
-  down = operation == _Operation.SOLVE_DOWN
+def _kernel(rowadr: tuple, colind: tuple, block_dim: int, *, factorize=True, solve=False, nancestor=0, has_children=False):
   layout = _register_layout(rowadr, colind, factorize, block_dim, nancestor, has_children)
   width = layout.width
   nrows = len(rowadr) - 1
@@ -162,9 +150,8 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
         else:
           y_k = wp.tile_extract(shared_row, wp.static(row_size), tid - lane + wp.static(k % width))
         rhs_values = wp.static(transpose_updates[k - nancestor])(matrix_values, rhs_values, y_k, lane)
-        if wp.static(nancestor == 0):
-          if lane == wp.static(k % width):
-            rhs_values[wp.static(k // width)] *= inv_d
+        if lane == wp.static(k % width):
+          rhs_values[wp.static(k // width)] *= inv_d
       return matrix_values, rhs_values, inv_d
 
     return eliminate
@@ -181,14 +168,13 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
       if wp.static(width > 1):
         y_k = _exchange(y_k, tid - lane + wp.static(k % width))
       rhs_values = wp.static(transpose_updates[k - nancestor])(factor, rhs_values, y_k, lane)
-      if wp.static(nancestor == 0):
-        if enabled and lane == wp.static(k % width):
-          rhs_values[wp.static(k // width)] *= factor[wp.static(diagonal_slot)]
+      if enabled and lane == wp.static(k % width):
+        rhs_values[wp.static(k // width)] *= factor[wp.static(diagonal_slot)]
       return rhs_values
 
     return transpose_solve
 
-  transpose_steps = tuple(make_transpose_solve(k) for k in range(nancestor, nrows)) if not factorize and not down else ()
+  transpose_steps = tuple(make_transpose_solve(k) for k in range(nancestor, nrows)) if not factorize else ()
 
   def make_forward_solve(k):
     chunks = layout.row_chunks[k]
@@ -196,11 +182,8 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
 
     @wp.func
     def forward_solve(factor: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
-      """Finish row k of L x = D^-1 y; the root RHS is already scaled."""
+      """Finish row k of L x = D^-1 y after diagonal scaling."""
       rhs_values = rhs_in
-      if wp.static(down):
-        if lane == wp.static(k % width):
-          rhs_values[wp.static(k // width)] *= factor[wp.static(layout.positions[k, k // width])]
       dot_lx = float(0.0)
       for chunk in range(wp.static(len(chunks))):
         rhs_slot = wp.static(chunks[chunk])
@@ -215,7 +198,7 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
 
     return forward_solve
 
-  forward_steps = tuple(make_forward_solve(k) for k in range(nancestor, nrows)) if solve and (nancestor == 0 or down) else ()
+  forward_steps = tuple(make_forward_solve(k) for k in range(nancestor, nrows)) if solve else ()
 
   direct = nancestor == 0 and not has_children
 
@@ -292,32 +275,21 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
         for c in range(wp.static(rhs_chunks)):
           j = wp.static(c * width) + lane
           if j < wp.static(nrows):
-            if wp.static(down):
-              rhs_values[c] = out[world, dof(dofs, system, j, dof_base)]
-            else:
-              if j >= wp.static(nancestor):
-                rhs_values[c] = rhs[world, dof(dofs, system, j, dof_base)]
-              if wp.static(has_children):
-                for u in range(
-                  contrib_adr[system, wp.static(rowadr[-1]) + j], contrib_adr[system, wp.static(rowadr[-1]) + j + 1]
-                ):
-                  rhs_values[c] += messages_out[world, contrib_ind[u]]
-    if wp.static(not factorize and (nancestor == 0 or down)):
-      # Solve-up retains D; root/down substitution consumes 1/D.
+            rhs_values[c] = rhs[world, dof_base + j]
+    if wp.static(not factorize):
       for k in range(wp.static(nancestor), wp.static(nrows)):
         if lane == wp.static(k % width):
           slot = wp.static(layout.positions[k, k // width])
           matrix_values[slot] = 1.0 / matrix_values[slot]
-    if wp.static(not down):
-      for rev in range(wp.static(nrows - nancestor)):
-        k = wp.static(nrows - 1 - rev)
-        if wp.static(factorize):
-          matrix_values, rhs_values, inv_d = wp.static(eliminations[k - nancestor])(matrix_values, rhs_values, tid, lane)
-          if enabled and lane == wp.static(k % width):
-            diagonal_out[world, dof(dofs, system, wp.static(k), dof_base)] = inv_d
-        else:
-          rhs_values = wp.static(transpose_steps[k - nancestor])(matrix_values, rhs_values, tid, lane, enabled)
-    if wp.static(solve and (nancestor == 0 or down)):
+    for rev in range(wp.static(nrows - nancestor)):
+      k = wp.static(nrows - 1 - rev)
+      if wp.static(factorize):
+        matrix_values, rhs_values, inv_d = wp.static(eliminations[k - nancestor])(matrix_values, rhs_values, tid, lane)
+        if enabled and lane == wp.static(k % width):
+          diagonal_out[world, dof(dofs, system, wp.static(k), dof_base)] = inv_d
+      else:
+        rhs_values = wp.static(transpose_steps[k - nancestor])(matrix_values, rhs_values, tid, lane, enabled)
+    if wp.static(solve):
       for off in range(wp.static(nrows - nancestor)):
         k = wp.static(nancestor + off)
         rhs_values = wp.static(forward_steps[k - nancestor])(matrix_values, rhs_values, tid, lane)
@@ -325,10 +297,7 @@ def _kernel(rowadr: tuple, colind: tuple, operation: _Operation, block_dim: int,
       for c in range(wp.static(rhs_chunks)):
         j = wp.static(c * width) + lane
         if enabled and j < wp.static(nrows):
-          if j >= wp.static(nancestor):
-            out[world, dof(dofs, system, j, dof_base)] = rhs_values[c]
-          elif wp.static(not down):
-            messages_out[world, message_adr[system] + wp.static(rowadr[nancestor]) + j] = rhs_values[c]
+          out[world, dof_base + j] = rhs_values[c]
     if wp.static(factorize):
       if enabled:
         for slot in range(wp.static(nslots)):
@@ -355,10 +324,7 @@ def launch(m, tile, worlds, matrix, factor, diagonal, rhs=None, out=None, *, fac
   block_dim = 32 if factor.device.is_cuda else 1
   rowadr = m.M_sparse_rowadr[tile.pattern_adr : tile.pattern_adr + tile.size + 1]
   colind = m.M_sparse_colind[rowadr[0] : rowadr[-1]]
-  operation = _Operation.FACTOR_SOLVE if rhs is not None else _Operation.FACTOR
-  if not factorize:
-    operation = _Operation.SOLVE_UP
-  kernel, width = _kernel(tuple(a - rowadr[0] for a in rowadr), colind, operation, block_dim)
+  kernel, width = _kernel(tuple(a - rowadr[0] for a in rowadr), colind, block_dim, factorize=factorize, solve=rhs is not None)
   groups = block_dim // width
   wp.launch_tiled(
     kernel,
@@ -455,12 +421,8 @@ class _Section:
   children: list["_Section"] = dataclasses.field(default_factory=list)
 
   @property
-  def rhs_adr(self):
-    return self.message_adr + self.rowadr[self.ancestor]
-
-  @property
   def message_end(self):
-    return self.rhs_adr + self.ancestor
+    return self.message_adr + self.rowadr[self.ancestor]
 
 
 class SectionGroup(NamedTuple):
@@ -543,7 +505,7 @@ def section_layout(rowadr, rownnz, colind, trees):
     dofs, adr, cols = desc.dofs, desc.rowadr, desc.colind
     local = {v: i for i, v in enumerate(dofs)}
     indices = {(i, cols[a]): a for i in range(len(dofs)) for a in range(adr[i], adr[i + 1])}
-    contributions = [[] for _ in range(adr[-1] + len(dofs))]
+    contributions = [[] for _ in range(adr[-1])]
     for child in desc.children:
       halo = child.ancestor
       for i in range(halo):
@@ -551,7 +513,6 @@ def section_layout(rowadr, rownnz, colind, trees):
         for at in range(child.rowadr[i], child.rowadr[i + 1]):
           rj = local[child.dofs[child.colind[at]]]
           contributions[indices[ri, rj]].append(child.message_adr + at)
-        contributions[adr[-1] + ri].append(child.rhs_adr + i)
     key = (desc.depth, adr, cols, desc.ancestor, bool(desc.children))
     groups.setdefault(key, []).append((dofs, contributions, desc.message_adr))
   result = []
@@ -569,43 +530,33 @@ def section_layout(rowadr, rownnz, colind, trees):
   return result, total, accepted
 
 
-def launch_sections(m, d, matrix, factor, diagonal, rhs=None, out=None, *, factorize=True):
+def launch_sections(m, d, matrix, factor, diagonal):
   block_dim = 32 if factor.device.is_cuda else 1
-  upward = _Operation.FACTOR_SOLVE if rhs is not None else _Operation.FACTOR
-  if not factorize:
-    upward = _Operation.SOLVE_UP
-  operations = (upward, _Operation.SOLVE_DOWN) if rhs is not None else (upward,)
-  for operation in operations:
-    down = operation == _Operation.SOLVE_DOWN
-    sections = m.M_sections if down else reversed(m.M_sections)
-    for section in sections:
-      if down and section.ancestor == 0:
-        continue
-      rowadr = m.M_sparse_rowadr[section.pattern_adr : section.pattern_adr + section.dofs.shape[1] + 1]
-      colind = m.M_sparse_colind[rowadr[0] : rowadr[-1]]
-      kernel, width = _kernel(
-        tuple(a - rowadr[0] for a in rowadr),
-        colind,
-        operation,
-        block_dim,
-        nancestor=section.ancestor,
-        has_children=section.update_ind.size > 0,
-      )
-      groups = block_dim // width
-      wp.launch_tiled(
-        kernel,
-        dim=((d.nworld * section.dofs.shape[0] + groups - 1) // groups,),
-        inputs=[
-          section.dofs,
-          section.update_adr,
-          section.update_ind,
-          section.message_adr,
-          m.M_rowadr,
-          m.M_rowadr,
-          d.nworld,
-          matrix,
-          rhs,
-        ],
-        outputs=[factor, diagonal, out, d.qLD_schur],
-        block_dim=block_dim,
-      )
+  for section in reversed(m.M_sections):
+    rowadr = m.M_sparse_rowadr[section.pattern_adr : section.pattern_adr + section.dofs.shape[1] + 1]
+    colind = m.M_sparse_colind[rowadr[0] : rowadr[-1]]
+    kernel, width = _kernel(
+      tuple(a - rowadr[0] for a in rowadr),
+      colind,
+      block_dim,
+      nancestor=section.ancestor,
+      has_children=section.update_ind.size > 0,
+    )
+    groups = block_dim // width
+    wp.launch_tiled(
+      kernel,
+      dim=((d.nworld * section.dofs.shape[0] + groups - 1) // groups,),
+      inputs=[
+        section.dofs,
+        section.update_adr,
+        section.update_ind,
+        section.message_adr,
+        m.M_rowadr,
+        m.M_rowadr,
+        d.nworld,
+        matrix,
+        None,
+      ],
+      outputs=[factor, diagonal, None, d.qLD_schur],
+      block_dim=block_dim,
+    )

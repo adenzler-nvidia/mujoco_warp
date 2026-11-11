@@ -1779,7 +1779,7 @@ class Model:
     weld_tactile_id: weld body to tactile weld index         (nbody,)
     taxel_vertadr: tactile sensor vertex address             (nsensortaxel,)
     taxel_sensorid: address for tactile sensors
-    nM_schur: scratch size for section matrix and right-hand-side updates
+    nM_schur: scratch size for section matrix updates
     M_sections: mass-factor sections in root-to-leaf order
     M_tiles: scalar, dense Cholesky and sparse LDL block-factorization groups
     M_sparse_rowadr: row offsets for static sparse mass-block patterns
@@ -2679,7 +2679,7 @@ class Data:
     cqfrc_constraint: compacted constraint force                (nworld, nvmax_pad)
 
   warp only fields:
-    qLD_schur: section matrix and right-hand-side scratch       (nworld, nM_schur)
+    qLD_schur: section matrix scratch       (nworld, nM_schur)
     nworld: number of worlds
     naconmax: maximum number of contacts (shared across all worlds)
     naccdmax: maximum number of contacts for CCD (all worlds)

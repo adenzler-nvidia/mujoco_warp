@@ -1626,7 +1626,7 @@ class SmoothTest(parameterized.TestCase):
     mjw.solve_m(m, d, result, rhs)
     _assert_eq(result.numpy()[0], expected, "heterogeneous factor + solve")
 
-  @parameterized.product(mode=("loaded", "separate", "fused", "aliased", "fused_aliased"), nworld=(1, 2, 5))
+  @parameterized.product(mode=("loaded", "separate", "fused", "aliased", "fused_aliased", "deterministic"), nworld=(1, 2, 5))
   def test_sparse_block_factor_solve(self, mode, nworld):
     """Mix packed and large CSR trees, partial groups and aliased padded vectors."""
     trees = []
@@ -1666,21 +1666,28 @@ class SmoothTest(parameterized.TestCase):
         dense[:, i, j] = dense[:, j, i] = values[:, a]
     expected = np.linalg.solve(dense, rhs[:, : m.nv, None])[..., 0]
     out.assign(rhs)
-    if mode == "aliased":
+    if mode == "deterministic":
+      m.opt.deterministic |= types.DeterminismType.ATOMICS
+    if mode in ("aliased", "deterministic"):
       mjw.factor_m(m, d)
+    scratch = wp.empty_like(out) if mode == "deterministic" else None
     with wp.ScopedCapture() as capture:
       if mode in ("fused", "fused_aliased"):
         mjw._src.smooth.factor_solve_i(m, d, d.M, d.qLD, d.qLDiagInv, out, out if mode == "fused_aliased" else b)
       else:
         if mode == "separate":
           mjw.factor_m(m, d)
-        mjw.solve_m(m, d, out, out if mode == "aliased" else b)
+        mjw.solve_m(m, d, out, out if mode in ("aliased", "deterministic") else b, x_scratch=scratch)
     for scale in (1.0, -2.0):
       b.assign(rhs * scale)
       out.assign(rhs * scale)
       d.qLD_schur.fill_(float("nan"))
       wp.capture_launch(capture.graph)
       actual = out.numpy()
+      if mode == "deterministic":
+        out.assign(rhs * scale)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(out.numpy(), actual)
       np.testing.assert_allclose(actual[:, : m.nv], expected * scale, rtol=2e-5, atol=2e-6)
       np.testing.assert_array_equal(actual[:, m.nv :], rhs[:, m.nv :] * scale)
       if nworld > 1:

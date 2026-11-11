@@ -40,6 +40,7 @@ class BlockLdlTest(parameterized.TestCase):
     owners, messages, consumers = {}, {}, {}
     for group_id, group in enumerate(groups):
       for dofs, message, offsets in zip(group.dofs, group.message_adr, group.update_adr):
+        self.assertLen(offsets, group.rowadr[-1] + 1)
         ancestors = dofs[: group.ancestor]
         for row in dofs[group.ancestor :]:
           self.assertNotIn(row, owners)
@@ -58,14 +59,6 @@ class BlockLdlTest(parameterized.TestCase):
               address = message + entry
               self.assertNotIn(address, messages)
               messages[address] = (group_id, key)
-          rhs_entry = group.rowadr[-1] + row
-          for source in group.update_ind[offsets[rhs_entry] : offsets[rhs_entry + 1]]:
-            self.assertNotIn(source, consumers)
-            consumers[source] = (group_id, (dof,))
-          if row < group.ancestor:
-            address = message + group.rowadr[group.ancestor] + row
-            self.assertNotIn(address, messages)
-            messages[address] = (group_id, (dof,))
     self.assertEqual(sorted(owners), list(range(size)))
     self.assertEqual(sorted(messages), list(range(scratch)))
     self.assertEqual(sorted(consumers), sorted(messages))

@@ -26,6 +26,7 @@ from mujoco_warp._src.types import FLEX_INTERP_PHYS_JAC
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import Q_LD_BLOCK_COMPACT
+from mujoco_warp._src.types import Q_LD_BLOCK_SECTION
 from mujoco_warp._src.types import Q_LD_BLOCK_SPARSE
 from mujoco_warp._src.types import ROD_HINGE_SIZE
 from mujoco_warp._src.types import CamLightType
@@ -3786,7 +3787,8 @@ def _solve_LD_sparse_copy_fn(
   # Out:
   x_out: wp.array2d[float],
 ):
-  if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+  adr = qLD_block_adr[dofid]
+  if adr == Q_LD_BLOCK_SPARSE or adr == Q_LD_BLOCK_SECTION:
     x_out[worldid, dofid] = y_in[worldid, dofid]
 
 
@@ -3802,7 +3804,8 @@ def _solve_LD_sparse_diag_fn(
   # Out:
   x_out: wp.array2d[float],
 ):
-  if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+  adr = qLD_block_adr[dofid]
+  if adr == Q_LD_BLOCK_SPARSE or adr == Q_LD_BLOCK_SECTION:
     x_out[worldid, dofid] = x_in[worldid, dofid] * D_in[worldid, dofid]
 
 
@@ -4123,9 +4126,7 @@ def solve_LD(
   if m.M_tiles:
     _solve_blocks(m, d, L, D, x, y)
   if L.shape[1] > m.qLD_block_total:
-    if m.qLD_row_tiles:
-      _solve_LD_sparse(m, d, L[:, m.qLD_block_total :], D, x, y, x_scratch=x_scratch)
-    block_ldl.launch_sections(m, d, None, L[:, m.qLD_block_total :], D, y, x, factorize=False)
+    _solve_LD_sparse(m, d, L[:, m.qLD_block_total :], D, x, y, x_scratch=x_scratch)
 
 
 def skip_qacc_smooth(m: Model, d: Data) -> bool:
@@ -4301,9 +4302,8 @@ def factor_solve_i(m, d, M, L, D, x, y):
   if L.shape[1] > m.qLD_block_total:
     L_ldl = L[:, m.qLD_block_total :]
     block_ldl.launch_rows(m, d, M, L_ldl, D)
-    if m.qLD_row_tiles:
-      _solve_LD_sparse(m, d, L_ldl, D, x, y)
-    block_ldl.launch_sections(m, d, M, L_ldl, D, y, x)
+    block_ldl.launch_sections(m, d, M, L_ldl, D)
+    _solve_LD_sparse(m, d, L_ldl, D, x, y)
 
 
 @cache_kernel

@@ -1295,7 +1295,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
     if mjm.M_rownnz[k] == 1:
       continue
     dof_depth[k] = dof_depth[mjm.dof_parentid[k]] + 1
-    if _lay["dof_adr"][k] != types.Q_LD_BLOCK_SPARSE:
+    if _lay["dof_adr"][k] not in (types.Q_LD_BLOCK_SPARSE, types.Q_LD_BLOCK_SECTION):
       continue
     i = mjm.dof_parentid[k]
     diag_k = mjm.M_rowadr[k] + mjm.M_rownnz[k] - 1
