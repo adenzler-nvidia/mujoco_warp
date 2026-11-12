@@ -161,48 +161,6 @@ def _kernel(rowadr: tuple, colind: tuple, block_dim: int, *, factorize=True, sol
 
   eliminations = tuple(make_elimination(k) for k in range(nancestor, nrows)) if factorize else ()
 
-  def make_transpose_solve(k):
-    diagonal_slot = layout.positions[k, k // width]
-
-    @wp.func
-    def transpose_solve(factor: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int, enabled: bool):
-      rhs_values = rhs_in
-      y_k = rhs_values[wp.static(k // width)]
-      if wp.static(width > 1):
-        y_k = _exchange(y_k, tid - lane + wp.static(k % width))
-      rhs_values = wp.static(transpose_updates[k - nancestor])(factor, rhs_values, y_k, lane)
-      if enabled and lane == wp.static(k % width):
-        rhs_values[wp.static(k // width)] *= factor[wp.static(diagonal_slot)]
-      return rhs_values
-
-    return transpose_solve
-
-  transpose_steps = tuple(make_transpose_solve(k) for k in range(nancestor, nrows)) if not factorize else ()
-
-  def make_forward_solve(k):
-    chunks = layout.row_chunks[k]
-    slots = tuple(layout.positions[k, c] for c in chunks)
-
-    @wp.func
-    def forward_solve(factor: MatrixRegisters, rhs_in: RhsRegisters, tid: int, lane: int):
-      """Finish row k of L x = D^-1 y after diagonal scaling."""
-      rhs_values = rhs_in
-      dot_lx = float(0.0)
-      for chunk in range(wp.static(len(chunks))):
-        rhs_slot = wp.static(chunks[chunk])
-        factor_slot = wp.static(slots[chunk])
-        if ((wp.static(_row_mask(layout.rows[k], chunks[chunk], width, k - 1)) >> lane) & 1) != 0:
-          dot_lx += factor[factor_slot] * rhs_values[rhs_slot]
-      for stage in range(wp.static(width.bit_length() - 1)):
-        dot_lx += _exchange(dot_lx, tid ^ wp.static(1 << stage))
-      if lane == wp.static(k % width):
-        rhs_values[wp.static(k // width)] -= dot_lx
-      return rhs_values
-
-    return forward_solve
-
-  forward_steps = tuple(make_forward_solve(k) for k in range(nancestor, nrows)) if solve else ()
-
   direct = nancestor == 0 and not has_children
 
   @wp.func
@@ -291,11 +249,24 @@ def _kernel(rowadr: tuple, colind: tuple, block_dim: int, *, factorize=True, sol
         if enabled and lane == wp.static(k % width):
           diagonal_out[world, dof(dofs, system, wp.static(k), dof_base)] = inv_d
       else:
-        rhs_values = wp.static(transpose_steps[k - nancestor])(matrix_values, rhs_values, tid, lane, enabled)
+        y_k = rhs_values[wp.static(k // width)]
+        if wp.static(width > 1):
+          y_k = _exchange(y_k, tid - lane + wp.static(k % width))
+        rhs_values = wp.static(transpose_updates[k])(matrix_values, rhs_values, y_k, lane)
+        if enabled and lane == wp.static(k % width):
+          rhs_values[wp.static(k // width)] *= matrix_values[wp.static(layout.positions[k, k // width])]
     if wp.static(solve):
-      for off in range(wp.static(nrows - nancestor)):
-        k = wp.static(nancestor + off)
-        rhs_values = wp.static(forward_steps[k - nancestor])(matrix_values, rhs_values, tid, lane)
+      for k in range(wp.static(nrows)):
+        dot_lx = float(0.0)
+        for chunk in range(wp.static(len(layout.row_chunks[k]))):
+          rhs_slot = wp.static(layout.row_chunks[k][chunk])
+          factor_slot = wp.static(layout.positions[k, rhs_slot])
+          if ((wp.static(_row_mask(layout.rows[k], rhs_slot, width, k - 1)) >> lane) & 1) != 0:
+            dot_lx += matrix_values[factor_slot] * rhs_values[rhs_slot]
+        for stage in range(wp.static(width.bit_length() - 1)):
+          dot_lx += _exchange(dot_lx, tid ^ wp.static(1 << stage))
+        if lane == wp.static(k % width):
+          rhs_values[wp.static(k // width)] -= dot_lx
     if wp.static(solve):
       for c in range(wp.static(rhs_chunks)):
         j = wp.static(c * width) + lane
