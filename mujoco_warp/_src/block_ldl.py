@@ -29,9 +29,9 @@ from typing import NamedTuple
 
 import warp as wp
 
-# Bounds on generated work; planning does not inspect compiled kernel resources.
+# Structural limits and lane-width targets; no compiled-resource queries.
 _FACTOR_SLOTS = 96
-_SOLVE_SLOTS = 192
+_SOLVE_SLOT_TARGET = 192
 _SECTION_ROWS = 64
 
 
@@ -53,20 +53,20 @@ def _row_mask(columns, chunk, width, last):
   return sum(1 << (j % width) for j in columns if j // width == chunk and j <= last)
 
 
-def _register_layout(rowadr, colind, factorize, block_dim, begin, children):
+def _register_layout(rowadr, colind, factorize, block_dim, section):
   rows = tuple(colind[rowadr[i] : rowadr[i + 1]] for i in range(len(rowadr) - 1))
   n = len(rows)
   width = min(4, block_dim)
-  if factorize and (begin or children):
+  if factorize and section:
     width = min(block_dim, 32, max(4, 1 << (max(map(len, rows)) - 1).bit_length()))
-  budget = _FACTOR_SLOTS if factorize else _SOLVE_SLOTS
+  budget = _FACTOR_SLOTS if factorize else _SOLVE_SLOT_TARGET
   limit = min(32 if factorize else 8, block_dim)
-  while width < limit and sum(len({j // width for j in row}) for row in (rows if factorize else rows[begin:n])) > budget:
+  while width < limit and sum(len({j // width for j in row}) for row in rows) > budget:
     width *= 2
   indices = {(i, j): s for s, (i, j) in enumerate((i, j) for i, row in enumerate(rows) for j in row)}
   # A register slot holds one aligned CSR row chunk across the lane group.
   chunks = tuple(tuple(sorted({j // width for j in row})) for row in rows)
-  slots = tuple((i, c) for i in range(0 if factorize else begin, n) for c in chunks[i])
+  slots = tuple((i, c) for i in range(n) for c in chunks[i])
   pos = {pair: s for s, pair in enumerate(slots)}
   mapping = tuple(tuple(indices.get((i, c * width + lane), -1) for lane in range(width)) for i, c in slots)
   return _RegisterLayout(width, rows, chunks, slots, mapping, pos)
@@ -74,7 +74,10 @@ def _register_layout(rowadr, colind, factorize, block_dim, begin, children):
 
 @functools.cache
 def _kernel(rowadr: tuple, colind: tuple, block_dim: int, *, factorize=True, solve=False, nancestor=0, has_children=False):
-  layout = _register_layout(rowadr, colind, factorize, block_dim, nancestor, has_children)
+  section = nancestor > 0 or has_children
+  assert factorize or solve
+  assert not section or (factorize and not solve)
+  layout = _register_layout(rowadr, colind, factorize, block_dim, section)
   width = layout.width
   nrows = len(rowadr) - 1
   nslots = len(layout.slots)
