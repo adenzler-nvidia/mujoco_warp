@@ -22,11 +22,11 @@ import mujoco
 import numpy as np
 import warp as wp
 
+from mujoco_warp._src import block_ldl
 from mujoco_warp._src import history
 from mujoco_warp._src import sleep
 from mujoco_warp._src import support
 from mujoco_warp._src import types
-from mujoco_warp._src import util_pkg
 from mujoco_warp._src import warp_util
 
 wp.set_module_options({"default_grid_stride": False})
@@ -250,8 +250,6 @@ def _eff_flex_stiff_possible(mjm: mujoco.MjModel, f: int) -> bool:
 
 def _is_open_rod_chain(mjm: mujoco.MjModel, fi: int) -> tuple[bool, int]:
   """Returns (is_open_chain, nhinge) for single-hinge open 1D rod flex `fi`."""
-  if types.ROD_HINGE_SIZE != 10:
-    return False, 0
   bendingadr = int(mjm.flex_bendingadr[fi])
   if mjm.flex_dim[fi] != 1 or mjm.flex_interp[fi] != 0 or bendingadr < 0:
     return False, 0
@@ -307,7 +305,7 @@ def _mjm_rod_vert_elems(mjm: mujoco.MjModel, fi: int) -> list[int]:
 
   chain = []
   bendingadr = int(mjm.flex_bendingadr[fi])
-  if bendingadr >= 0 and types.ROD_HINGE_SIZE == 10:
+  if bendingadr >= 0:
     nhinge = int(mjm.flex_bending[bendingadr])
     if nhinge > 0 and mjm.flex_bending[bendingadr + 1 + 3] < 0:
       chain = [int(mjm.flex_bending[bendingadr + 1 + 10 * h]) for h in range(nhinge)]
@@ -361,29 +359,19 @@ def is_sparse(mjm: mujoco.MjModel) -> bool:
     return bool(mujoco.mj_isSparse(mjm))
 
 
-def _m_blocks(mjm: mujoco.MjModel):
-  """The (start, size) diagonal blocks of M: the kinematic trees, each a contiguous dof range.
-
-  M couples a dof only with its tree ancestors, so its diagonal blocks are exactly the trees.
-  (dof_simplenum is not used to classify blocks: it is a contiguous-suffix run-length, so it
-  misses interspersed decoupled dofs; the M_rownnz coupling check in m_block_layout catches those.)
-  """
-  return [(int(adr), int(num)) for adr, num in zip(mjm.tree_dofadr, mjm.tree_dofnum) if num > 0]
-
-
-def m_block_layout(mjm: mujoco.MjModel) -> dict:
-  """Per-block dense/sparse layout for M's diagonal blocks.
-
-  Blocks use scalar Cholesky through six DOFs, tile Cholesky through M_BLOCK_DENSE_MAX, and sparse
-  LDL beyond that. Compact diagonal blocks also use the scalar path without allocating a factor.
-  """
+def _mass_factor_storage(mjm: mujoco.MjModel) -> dict:
+  """Choose factor storage without constructing the section schedule."""
   nv = mjm.nv
-  blocks = _m_blocks(mjm)
   dof_adr = np.full(nv, types.Q_LD_BLOCK_SPARSE, dtype=np.int32)
   scalar_tiles = {}
   gather_tiles = {}
+  sparse_tiles = []
+  section_trees = []
   off = 0
-  for start, size in blocks:
+  for start, size in zip(mjm.tree_dofadr, mjm.tree_dofnum):
+    start, size = int(start), int(size)
+    if size == 0:
+      continue
     last = start + size - 1
     madr = int(mjm.M_rowadr[start])
     nnz = int(mjm.M_rowadr[last] + mjm.M_rownnz[last] - madr)
@@ -397,10 +385,16 @@ def m_block_layout(mjm: mujoco.MjModel) -> dict:
       else:
         dof_adr[start : start + size] = off
         off += size * size
+    elif types.M_BLOCK_SCALAR_MAX < size <= types.M_BLOCK_DENSE_MAX and nnz <= size * (size + 1) // 3:
+      sparse_tiles.append((start, size))
+      dof_adr[start : start + size] = off
+      off += nnz
     elif size <= types.M_BLOCK_DENSE_MAX:
       gather_tiles.setdefault(size, []).append(start)
       dof_adr[start : start + size] = off
       off += size * size
+    elif nnz <= size * (size + 1) // 3:
+      section_trees.append((start, size))
   for starts in scalar_tiles.values():
     starts.sort(key=lambda start: dof_adr[start] >= 0)
   return {
@@ -408,8 +402,20 @@ def m_block_layout(mjm: mujoco.MjModel) -> dict:
     "dof_adr": dof_adr,
     "scalar_tiles": scalar_tiles,
     "gather_tiles": gather_tiles,
+    "sparse_tiles": sparse_tiles,
+    "section_trees": section_trees,
     "has_sparse": bool(np.any(dof_adr == types.Q_LD_BLOCK_SPARSE)),
   }
+
+
+def m_block_layout(mjm: mujoco.MjModel) -> dict:
+  """Add bounded sections while preserving the storage of rejected trees."""
+  layout = _mass_factor_storage(mjm)
+  sections, scratch, selected = block_ldl.section_layout(mjm.M_rowadr, mjm.M_rownnz, mjm.M_colind, layout.pop("section_trees"))
+  for start, size in selected:
+    layout["dof_adr"][start : start + size] = types.Q_LD_BLOCK_SECTION
+  layout.update(sections=sections, scratch=scratch)
+  return layout
 
 
 def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) -> types.Model:
@@ -587,31 +593,11 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
 
   # create model
   m = types.Model(**{f.name: getattr(mjm, f.name, None) for f in dataclasses.fields(types.Model)})
-  # TODO(team): remove version check once mujoco >= 3.16.1 is required.
-  if not util_pkg.check_version("mujoco>=3.16.1"):
-    m.eq_data = np.pad(mjm.eq_data, ((0, 0), (0, 1)))
-  if not util_pkg.check_version("mujoco>=3.17.1"):
-    if not hasattr(mjm, "nplastic"):
-      m.nplastic = 0
-    if not hasattr(mjm, "jnt_plasticadr"):
-      m.jnt_plasticadr = np.full(mjm.njnt, -1, dtype=np.int32)
-    if not hasattr(mjm, "tendon_plasticadr"):
-      m.tendon_plasticadr = np.full(mjm.ntendon, -1, dtype=np.int32)
-    if not hasattr(mjm, "flex_plasticadr"):
-      m.flex_plasticadr = np.full(mjm.nflex, -1, dtype=np.int32)
-    if not hasattr(mjm, "flex_plasticmode"):
-      m.flex_plasticmode = np.zeros(mjm.nflex, dtype=np.int32)
 
   m.opt = opt
   m.callback = types.Callback()
 
-  m.nv_pad = _get_padded_sizes(
-    mjm.nv,
-    0,
-    is_sparse(mjm),
-    types.TILE_SIZE_JTDAJ_SPARSE if is_sparse(mjm) else types.TILE_SIZE_JTDAJ_DENSE,
-    augment_cholesky=mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON and mjm.nv > 32,
-  )[1]
+  m.nv_pad = _get_padded_sizes(mjm, 0)[1]
   m.nacttrnbody = (mjm.actuator_trntype == mujoco.mjtTrn.mjTRN_BODY).sum()
   m.nsensortaxel = mjm.mesh_vertnum[mjm.sensor_objid[mjm.sensor_type == mujoco.mjtSensor.mjSENS_TACTILE]].sum()
   # rangefinder ray counts (1 per site sensor, width * height per camera sensor)
@@ -631,8 +617,6 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       raise NotImplementedError("Flex-SDF collision is not implemented.")
     if (mjm.geom_type == mujoco.mjtGeom.mjGEOM_HFIELD).any():
       raise NotImplementedError("Flex-HField collision is not implemented.")
-    if hasattr(mjm, "flex_internal") and (mjm.flex_internal != 0).any():
-      raise NotImplementedError("Flex internal collisions are not implemented.")
     if (mjm.flex_rigid != 0).any():
       raise NotImplementedError("Rigid flexes are not implemented.")
     # TODO(team): skip element pairs driven by a common grid node, as in mjc_ElemSharedNode
@@ -651,16 +635,13 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.has_flex_passive = bool(
     mjm.nflex > 0 and np.any((mjm.flex_passive != 0) & (mjm.flex_rigid == 0) & (mjm.flex_interp == 0) & (mjm.flex_dim >= 2))
   )
-  m.has_flex_snh = bool(
-    types.FLEX_STIFFNESS_3D == 24
-    and any(
-      mjm.flex_interp[f] == 0
-      and mjm.flex_dim[f] == 3
-      and mjm.flex_stiffnessadr[f] >= 0
-      and mjm.flex_elemnum[f] > 0
-      and mjm.flex_stiffness[mjm.flex_stiffnessadr[f] + 21] != 0
-      for f in range(mjm.nflex)
-    )
+  m.has_flex_snh = any(
+    mjm.flex_interp[f] == 0
+    and mjm.flex_dim[f] == 3
+    and mjm.flex_stiffnessadr[f] >= 0
+    and mjm.flex_elemnum[f] > 0
+    and mjm.flex_stiffness[mjm.flex_stiffnessadr[f] + 21] != 0
+    for f in range(mjm.nflex)
   )
   if m.has_flex_snh and mjm.opt.integrator != mujoco.mjtIntegrator.mjINT_DISCRETE:
     raise ValueError("stable Neo-Hookean elasticity requires integrator='discrete'")
@@ -1114,11 +1095,6 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
 
   m.nJfs = m.flexstrain_J_colind.size
 
-  # tendon type: older mujoco versions imply it from the first wrap object
-  if not util_pkg.check_version("mujoco>=3.17.1"):
-    is_fixed = mjm.wrap_type[mjm.tendon_adr] == mujoco.mjtWrap.mjWRAP_JOINT
-    m.tendon_type = np.where(is_fixed, types.TendonType.FIXED, types.TendonType.SPATIAL)
-
   # fixed tendon
   m.tendon_jnt_adr, m.wrap_jnt_adr = [], []
   for i in range(mjm.ntendon):
@@ -1263,8 +1239,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
 
   # Per-block scalar/tile/sparse layout (see m_block_layout).
   _lay = m_block_layout(mjm)
-  m.qLD_block_total = _lay["total"]  # packed dense region length / offset of the LDL region
+  m.qLD_block_total = _lay["total"]  # packed block region length / offset of the LDL region
   m.qLD_block_adr = _lay["dof_adr"]
+  m.nM_schur = _lay["scratch"]
 
   scalar_tiles = [
     types.TileSet(
@@ -1276,7 +1253,6 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   gather_tiles = [
     types.TileSet(adr=wp.array(_lay["gather_tiles"][size], dtype=int), size=size) for size in sorted(_lay["gather_tiles"])
   ]
-  m.M_tiles = tuple(scalar_tiles + gather_tiles)
 
   # Group sparse LDL updates by tree depth. Block-path DOFs never touch the LDL region.
   sparse_updates, dof_depth = {}, np.zeros(mjm.nv, dtype=int) - 1
@@ -1286,7 +1262,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
     if mjm.M_rownnz[k] == 1:
       continue
     dof_depth[k] = dof_depth[mjm.dof_parentid[k]] + 1
-    if _lay["dof_adr"][k] != types.Q_LD_BLOCK_SPARSE:
+    if _lay["dof_adr"][k] not in (types.Q_LD_BLOCK_SPARSE, types.Q_LD_BLOCK_SECTION):
       continue
     i = mjm.dof_parentid[k]
     diag_k = mjm.M_rowadr[k] + mjm.M_rownnz[k] - 1
@@ -1296,6 +1272,13 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       i = mjm.dof_parentid[i]
       Madr_ki -= 1
   m.qLD_updates = tuple(wp.array(sparse_updates[i], dtype=wp.vec3i) for i in sorted(sparse_updates))
+  sparse_rows = {}
+  for i in range(mjm.nv):
+    if _lay["dof_adr"][i] == types.Q_LD_BLOCK_SPARSE:
+      sparse_rows.setdefault(dof_depth[i], []).append(i)
+  m.qLD_row_tiles = tuple(
+    types.TileSet(adr=wp.array(rows, dtype=int), size=int(max(mjm.M_rownnz[rows]))) for _, rows in sorted(sparse_rows.items())
+  )
 
   # Build concatenated updates for fused kernel
   all_updates_flat = []
@@ -1323,6 +1306,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   # M_hinit_i: row index of each CSR entry (its madr is the flat index). The dense Newton H-init
   # uses (M_hinit_i, M_colind) to scatter M's upper triangle into the dense H tile from CSR.
   M_hinit_i = np.zeros(mjm.nC, dtype=np.int32)
+  row_elements = [[] for _ in range(mjm.nv)]
   for i in range(mjm.nv):
     rowadr = mjm.M_rowadr[i]
     rownnz = mjm.M_rownnz[i]
@@ -1331,8 +1315,40 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       col = int(mjm.M_colind[madr])
       M_elemid[i, col] = madr
       M_hinit_i[madr] = i
+      row_elements[i].append((col, madr))
+      if i != col:
+        row_elements[col].append((i, madr))
   m.M_elemid = M_elemid
   m.M_hinit_i = M_hinit_i
+
+  sparse_patterns = {}
+  for start, size in _lay["sparse_tiles"]:
+    rows = tuple(tuple(j - start for j, _ in row_elements[i] if j <= i) for i in range(start, start + size))
+    sparse_patterns.setdefault(rows, []).append(start)
+  sparse_tiles, rowadr, colind = [], [], []
+  for rows, starts in sparse_patterns.items():
+    sparse_tiles.append(types.TileSet(adr=wp.array(starts, dtype=int), size=len(rows), pattern_adr=len(rowadr)))
+    rowadr.append(len(colind))
+    for row in rows:
+      colind.extend(row)
+      rowadr.append(len(colind))
+  sections = []
+  for section in _lay["sections"]:
+    sections.append(
+      types.MassSection(
+        dofs=wp.array(section.dofs, dtype=int),
+        pattern_adr=len(rowadr),
+        ancestor=section.ancestor,
+        update_adr=wp.array(section.update_adr, dtype=int),
+        update_ind=wp.array(section.update_ind, dtype=int),
+        message_adr=wp.array(section.message_adr, dtype=int),
+      )
+    )
+    rowadr.extend(len(colind) + a for a in section.rowadr)
+    colind.extend(section.colind)
+  m.M_sections = tuple(sections)
+  m.M_sparse_rowadr, m.M_sparse_colind = tuple(rowadr), tuple(colind)
+  m.M_tiles = tuple(scalar_tiles + gather_tiles + sparse_tiles)
 
   # Precompute per-block gather indices for the dense-block densify (tile_load_indexed). For each
   # dense block and flat slot (row, col), store the CSR address of M[max(i,j), min(i,j)], or nC
@@ -1359,20 +1375,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       m.qD_fullm_j.append(int(mjm.D_colind[rowadr + k]))
   m.nD = mjm.nD
 
-  # Gather-based sparse mul_m: for each row, all (col, madr) including diagonal
-  row_elements = [[] for _ in range(mjm.nv)]
-
-  for i in range(mjm.nv):
-    rowadr = mjm.M_rowadr[i]
-    rownnz = mjm.M_rownnz[i]
-    for k in range(rownnz):
-      madr = rowadr + k
-      col = int(mjm.M_colind[madr])
-      row_elements[i].append((col, madr))  # row i gathers M[i,col] * vec[col]
-      if i != col:
-        row_elements[col].append((i, madr))  # row col gathers M[i,col] * vec[i]
-
-  # Flatten into CSR-like arrays
+  # Gather-based sparse mul_m includes both triangles.
   m.M_mulm_rowadr = [0]
   m.M_mulm_col = []
   m.M_mulm_madr = []
@@ -1507,7 +1510,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       flex_vert_rodelem[va : va + int(mjm.flex_vertnum[fi])] = _mjm_rod_vert_elems(mjm, fi)
 
     bendingadr = int(mjm.flex_bendingadr[fi])
-    if mjm.flex_dim[fi] == 1 and bendingadr >= 0 and types.ROD_HINGE_SIZE == 10:
+    if mjm.flex_dim[fi] == 1 and bendingadr >= 0:
       nhinge_raw = int(mjm.flex_bending[bendingadr])
       if nhinge_raw > 0:
         h0 = mjm.flex_bending[bendingadr + 1 : bendingadr + 1 + 10]
@@ -1690,18 +1693,28 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   return m
 
 
-def _get_padded_sizes(nv: int, njmax: int, is_sparse: bool, tile_size: int, augment_cholesky: bool = False):
+def _get_padded_sizes(mjm: mujoco.MjModel, njmax: int):
   def round_up(x, multiple):
     return ((x + multiple - 1) // multiple) * multiple
 
+  tile_size = types.TILE_SIZE_JTDAJ_SPARSE if is_sparse(mjm) else types.TILE_SIZE_JTDAJ_DENSE
   njmax_padded = round_up(njmax, tile_size)
-  nv_padded = round_up(nv + int(augment_cholesky), tile_size) if (is_sparse or nv > 32) else round_up(nv, 4)
+  nv = mjm.nv
+  if nv > types.H_ONE_TILE_MAX:
+    # the blocked Cholesky's tiles, and its augmented row for Newton
+    nv_padded = round_up(nv + int(mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON), tile_size)
+  else:
+    # the one-tile Cholesky factors the padded tile: rows of whole 16-byte vectors
+    nv_padded = round_up(nv, 4)
 
   return njmax_padded, nv_padded
 
 
 def _nvmax_pad(nvmax: int) -> int:
-  """Reserve an augmented column and round nvmax up to the dense tile size."""
+  """Reserve an augmented column and round nvmax up to the dense tile size.
+
+  The compact smooth solve factors M with the blocked Cholesky, whatever the size.
+  """
   t = types.TILE_SIZE_JTDAJ_DENSE
   return ((max(nvmax, 1) + t) // t) * t
 
@@ -2342,25 +2355,14 @@ def make_data(
 
   sizes = dict(
     {"*": 1},
-    **{
-      f.name: (getattr(mjm, f.name, 0) if f.name == "nplastic" else getattr(mjm, f.name, None))
-      for f in dataclasses.fields(types.Model)
-      if f.type is int
-    },
+    **{f.name: getattr(mjm, f.name, None) for f in dataclasses.fields(types.Model) if f.type is int},
   )
   condim_arrays = [np.array([0]), mjm.geom_condim, mjm.pair_dim]
   if mjm.nflex > 0:
     condim_arrays.append(mjm.flex_condim)
   sizes["nmaxcondim"] = np.concatenate(condim_arrays).max()
   sizes["nmaxpyramid"] = np.maximum(1, 2 * (sizes["nmaxcondim"] - 1))
-  tile_size = types.TILE_SIZE_JTDAJ_SPARSE if is_sparse(mjm) else types.TILE_SIZE_JTDAJ_DENSE
-  sizes["njmax_pad"], sizes["nv_pad"] = _get_padded_sizes(
-    mjm.nv,
-    njmax,
-    is_sparse(mjm),
-    tile_size,
-    augment_cholesky=mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON and mjm.nv > 32,
-  )
+  sizes["njmax_pad"], sizes["nv_pad"] = _get_padded_sizes(mjm, njmax)
   sizes["nworld"] = nworld
   sizes["naconmax"] = naconmax
   sizes["njmax"] = njmax
@@ -2373,12 +2375,11 @@ def make_data(
   efm_d = _get_efm_data(mjm)
   sizes["nefmK"] = int(efm_d.nefmK) if efm_d else 0
 
-  # qLD holds the factor: a packed dense region for dense blocks followed
-  # by an nC-length LDL region for sparse blocks (present only when some block is sparse). Either
-  # region may be empty (pure dense / pure sparse).
+  # Packed small-block factors precede the optional nC-length level-scheduled LDL region.
   _lay = m_block_layout(mjm)
   qld_total = _lay["total"] + (mjm.nC if _lay["has_sparse"] else 0)
   sizes["qld_total"] = qld_total
+  sizes["nM_schur"] = _lay["scratch"]
 
   if njmax_nnz is None:
     if is_sparse(mjm):
@@ -2453,7 +2454,7 @@ def make_data(
     # plastic
     "plastic": (
       wp.array(np.tile(mjd.plastic, (nworld, 1)), shape=(nworld, mjm.nplastic), dtype=float)
-      if getattr(mjm, "nplastic", 0) > 0
+      if mjm.nplastic > 0
       else wp.zeros((nworld, 0), dtype=float)
     ),
     # island arrays
@@ -2590,25 +2591,14 @@ def put_data(
 
   sizes = dict(
     {"*": 1},
-    **{
-      f.name: (getattr(mjm, f.name, 0) if f.name == "nplastic" else getattr(mjm, f.name, None))
-      for f in dataclasses.fields(types.Model)
-      if f.type is int
-    },
+    **{f.name: getattr(mjm, f.name, None) for f in dataclasses.fields(types.Model) if f.type is int},
   )
   condim_arrays = [np.array([0]), mjm.geom_condim, mjm.pair_dim]
   if mjm.nflex > 0:
     condim_arrays.append(mjm.flex_condim)
   sizes["nmaxcondim"] = np.concatenate(condim_arrays).max()
   sizes["nmaxpyramid"] = np.maximum(1, 2 * (sizes["nmaxcondim"] - 1))
-  tile_size = types.TILE_SIZE_JTDAJ_SPARSE if is_sparse(mjm) else types.TILE_SIZE_JTDAJ_DENSE
-  sizes["njmax_pad"], sizes["nv_pad"] = _get_padded_sizes(
-    mjm.nv,
-    njmax,
-    is_sparse(mjm),
-    tile_size,
-    augment_cholesky=mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON and mjm.nv > 32,
-  )
+  sizes["njmax_pad"], sizes["nv_pad"] = _get_padded_sizes(mjm, njmax)
   sizes["nworld"] = nworld
   sizes["naconmax"] = naconmax
   sizes["njmax"] = njmax
@@ -2622,6 +2612,7 @@ def put_data(
   lay = m_block_layout(mjm)
   qld_total = lay["total"] + (mjm.nC if lay["has_sparse"] else 0)
   sizes["qld_total"] = qld_total
+  sizes["nM_schur"] = lay["scratch"]
 
   if njmax_nnz is None:
     if is_sparse(mjm):
@@ -2652,34 +2643,6 @@ def put_data(
       continue
     if f.name in ["flex", "elem", "vert"] and mjm.nflex == 0:
       contact_kwargs[f.name] = wp.empty(0, dtype=wp.vec2i)
-      continue
-    if f.name == "surfacevel" and not util_pkg.check_version("mujoco>=3.17.1"):
-      val = None
-      if mjm.flg_surfacevel and mjd.ncon > 0:
-        svel = np.zeros((mjd.ncon, 3))
-        sang = np.zeros((mjd.ncon, 3))
-        for side, sgn in ((0, -1.0), (1, 1.0)):
-          geom = mjd.contact.geom[: mjd.ncon, side]
-          valid = geom >= 0
-          g = geom[valid]
-          sv = mjm.geom_surfacevel[g]
-          xmat = mjd.geom_xmat[g].reshape((-1, 3, 3))
-          ang = np.einsum("nij,nj->ni", xmat, sv[:, 3:])
-          lin = np.einsum("nij,nj->ni", xmat, sv[:, :3]) + np.cross(ang, mjd.contact.pos[: mjd.ncon][valid] - mjd.geom_xpos[g])
-          svel[valid] += sgn * lin
-          sang[valid] += sgn * ang
-        frame = mjd.contact.frame[: mjd.ncon].reshape((-1, 3, 3))
-        val = np.stack(
-          (
-            np.einsum("ni,ni->n", frame[:, 1], svel),
-            np.einsum("ni,ni->n", frame[:, 2], svel),
-            np.einsum("ni,ni->n", frame[:, 0], sang),
-          ),
-          axis=-1,
-        )
-        val = np.tile(val, (nworld, 1))
-        val = np.pad(val, ((0, naconmax - val.shape[0]), (0, 0)))
-      contact_kwargs[f.name] = _create_array(val, f.type, sizes)
       continue
     val = getattr(mjd.contact, f.name)
     val = np.tile(val, (nworld,) + (1,) * (val.ndim - 1))
@@ -2805,8 +2768,8 @@ def put_data(
     "body_awake": wp.array(np.tile(body_awake_init.astype(np.int32), (nworld, 1)), dtype=int),
     # plastic
     "plastic": (
-      wp.array(np.tile(mjd.plastic, (nworld, 1)), shape=(nworld, getattr(mjm, "nplastic", 0)), dtype=float)
-      if getattr(mjm, "nplastic", 0) > 0 and hasattr(mjd, "plastic")
+      wp.array(np.tile(mjd.plastic, (nworld, 1)), shape=(nworld, mjm.nplastic), dtype=float)
+      if mjm.nplastic > 0
       else wp.zeros((nworld, 0), dtype=float)
     ),
   }
@@ -2834,11 +2797,9 @@ def put_data(
   d = types.Data(**d_kwargs)
   d.solver_niter = wp.full((nworld,), mjd.solver_niter[0], dtype=int)
 
-  # qLD = [packed block Cholesky | nC LDL region]. Block factors store their upper Cholesky
-  # packed; the LDL region (present iff some block is sparse) holds MuJoCo's full L'DL factor (only
-  # its sparse-block entries are read by the solve).
+  # Packed factors are Cholesky or CSR LDL; the trailing LDL region retains MuJoCo indices.
   qLD = np.zeros(qld_total, dtype=np.float32)
-  if lay["total"]:
+  if lay["scalar_tiles"] or lay["gather_tiles"]:
     Mfull = np.zeros((mjm.nv, mjm.nv))
     mujoco.mju_sym2dense(Mfull, mjd.M, mjm.M_rownnz, mjm.M_rowadr, mjm.M_colind)
     for size, starts in list(lay["scalar_tiles"].items()) + list(lay["gather_tiles"].items()):
@@ -2849,6 +2810,11 @@ def put_data(
         blk = Mfull[start : start + size, start : start + size]
         if blk.any():
           qLD[off : off + size * size] = np.linalg.cholesky(blk).T.reshape(-1)
+  for start, size in lay["sparse_tiles"]:
+    off, madr = lay["dof_adr"][start], mjm.M_rowadr[start]
+    last = start + size - 1
+    nnz = mjm.M_rowadr[last] + mjm.M_rownnz[last] - madr
+    qLD[off : off + nnz] = mjd.qLD[madr : madr + nnz]
   if lay["has_sparse"]:
     qLD[lay["total"] :] = mjd.qLD
   d.qLD = wp.array(np.full((nworld, qld_total), qLD), dtype=float)
@@ -2982,7 +2948,7 @@ def get_data_into(
     result.flexedge_J[:] = d.flexedge_J.numpy()[world_id].reshape(-1)
   result.flexedge_length[:] = d.flexedge_length.numpy()[world_id]
   result.flexedge_velocity[:] = d.flexedge_velocity.numpy()[world_id]
-  if mjm.nflex > 0 and util_pkg.check_version("mujoco>=3.14.1.dev990351372"):
+  if mjm.nflex > 0:
     result.flex_hessian_valid[:] = d.flex_hessian_valid.numpy()[world_id]
     result.flexvert_hessian[:] = d.flexvert_hessian.numpy()[world_id]
     result.flexedge_hessian[:] = d.flexedge_hessian.numpy()[world_id].reshape((-1, 9))
@@ -3017,7 +2983,7 @@ def get_data_into(
   if mjm.nhistory > 0:
     result.history[:] = d.history.numpy()[world_id]
 
-  if getattr(mjm, "nplastic", 0) > 0:
+  if mjm.nplastic > 0:
     result.plastic[:] = d.plastic.numpy()[world_id]
 
   if mjm.nuserdata > 0:
@@ -3033,8 +2999,7 @@ def get_data_into(
   result.contact.solreffriction[:ncon] = d.contact.solreffriction.numpy()[ncon_filter]
   result.contact.solimp[:ncon] = d.contact.solimp.numpy()[ncon_filter]
   result.contact.adhesion[:ncon] = d.contact.adhesion.numpy()[ncon_filter]
-  if util_pkg.check_version("mujoco>=3.17.1"):
-    result.contact.surfacevel[:ncon] = d.contact.surfacevel.numpy()[ncon_filter]
+  result.contact.surfacevel[:ncon] = d.contact.surfacevel.numpy()[ncon_filter]
   result.contact.dim[:ncon] = d.contact.dim.numpy()[ncon_filter]
   result.contact.geom[:ncon] = d.contact.geom.numpy()[ncon_filter]
   is_passive = (contact_type[ncon_filter] & types.ContactType.PASSIVE) != 0
@@ -3046,9 +3011,9 @@ def get_data_into(
   result.contact.efc_address[:ncon] = contact_efc_address_ordered[:ncon]
 
   result.M[:] = d.M.numpy()[world_id]
-  _lay = m_block_layout(mjm)
-  if _lay["scalar_tiles"] or _lay["gather_tiles"]:
-    # Block factors do not use MuJoCo's LDL representation.
+  _lay = _mass_factor_storage(mjm)
+  if _lay["total"] or _lay["scalar_tiles"]:
+    # Rebuild MuJoCo's factor because packed blocks use a different layout.
     if not np.all(result.M == 0):
       mujoco.mj_factorM(mjm, result)
   else:

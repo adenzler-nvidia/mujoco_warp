@@ -38,7 +38,6 @@ from mujoco_warp._src import collision_driver
 from mujoco_warp._src import constraint
 from mujoco_warp._src import render_util
 from mujoco_warp._src import set_const
-from mujoco_warp._src import util_pkg
 from mujoco_warp._src import warp_util
 from mujoco_warp._src.io import override_model
 from mujoco_warp._src.types import DeterminismType
@@ -230,7 +229,6 @@ _TREE_CASES = (
     covers=(
       "forward._qfrc_actuator",
       "forward._tendon_actuator_force",
-      "passive._gravity_force",
       "passive._spring_damper_tendon_passive",
       "sensor._energy_pos_gravity",
       "sensor._energy_pos_passive_joint",
@@ -254,6 +252,7 @@ _TREE_CASES = (
       "solver._update_constraint_init_qfrc_constraint_sparse",
       "solver._update_gradient_grad",
       "solver._update_gradient_h_incremental_sparse",
+      "support._apply_ft_scatter",
     ),
   ),
   dict(
@@ -283,11 +282,15 @@ _TREE_CASES = (
       "solver._add_tendon_metric_dense",
     ),
   ),
-  dict(testcase_name="discrete_cg", overrides={"opt.integrator": "DISCRETE", "opt.solver": "CG"}, covers=()),
+  dict(
+    testcase_name="discrete_cg",
+    overrides={"opt.integrator": "DISCRETE", "opt.solver": "CG", "opt.tolerance": "1e-10"},
+    covers=(),
+  ),
   dict(
     testcase_name="dense_blocks",
     overrides={"opt.jacobian": "DENSE"},
-    covers=("smooth._qLD_acc", "smooth._solve_LD_sparse_level"),
+    covers=("smooth._solve_LD_sparse_level",),
     sparse_blocks=True,
   ),
 )
@@ -331,7 +334,7 @@ _FLEX_SHELL_CASES = (dict(testcase_name="euler", overrides={}, covers=("passive.
 
 _FLEX_CONTACT_CASES = (
   dict(testcase_name="sparse", overrides={"opt.jacobian": "SPARSE"}, covers=()),
-  dict(testcase_name="dense", overrides={"opt.jacobian": "DENSE"}, covers=("constraint._efc_contact_jac_dense_flex",)),
+  dict(testcase_name="dense", overrides={"opt.jacobian": "DENSE"}, covers=()),
 )
 
 _FLEX_PASSIVE_CASES = (
@@ -362,7 +365,7 @@ _CONTACT_CASES = (
       "smooth._transmission_body_moment",
     ),
   ),
-  dict(testcase_name="dense", overrides={"opt.jacobian": "DENSE"}, covers=("constraint._efc_contact_jac_dense",)),
+  dict(testcase_name="dense", overrides={"opt.jacobian": "DENSE"}, covers=()),
   dict(
     testcase_name="elliptic_dense",
     overrides={"opt.jacobian": "DENSE", "opt.cone": "ELLIPTIC"},
@@ -545,6 +548,12 @@ class DeterminismTest(parameterized.TestCase):
         ctrl_noise=0.5,
       )
 
+    # wrenches on bodies with shared ancestor dofs: the applied-force scatter has colliding atomics
+    xfrc = np.zeros((d.nworld, mjm.nbody, 6), dtype=np.float32)
+    for name in ("arm2", "arm3", "leg2"):
+      xfrc[:, mjm.body(name).id] = np.linspace(-0.3, 0.4, 6)
+    d.xfrc_applied.assign(xfrc)
+
     def extra(m, d):
       set_const.set_const(m, d)
       mjw.inverse(m, d)
@@ -591,11 +600,6 @@ class DeterminismTest(parameterized.TestCase):
       nworld=2,
       qvel_noise=0.1,
     )
-    # TODO(team): remove version check once mujoco >= 3.16.1 is required.
-    if not util_pkg.check_version("mujoco>=3.16.1"):
-      covers = tuple(
-        c for c in covers if c not in ("derivative._eff_flex_rod_stiff", "passive._flex_rod_bending", "passive._flex_rod_mul")
-      )
     with _record_launches() as launches:
       rc = render_util.create_render_context(mjm, nworld=2, cam_res=(8, 8), deterministic=True)
     if not overrides:

@@ -21,8 +21,6 @@ import mujoco
 import numpy as np
 import warp as wp
 
-from mujoco_warp._src import util_pkg
-
 MJ_MINVAL = mujoco.mjMINVAL
 MJ_MAXVAL = mujoco.mjMAXVAL
 MJ_MINIMP = mujoco.mjMINIMP  # minimum constraint impedance
@@ -30,50 +28,8 @@ MJ_MAXIMP = mujoco.mjMAXIMP  # maximum constraint impedance
 MJ_MAXCONPAIR = mujoco.mjMAXCONPAIR
 MJ_MINMU = mujoco.mjMINMU  # minimum friction
 MJ_MINAWAKE = mujoco.mjMINAWAKE  # minimum number of timesteps before sleeping
-FLEX_STIFFNESS_3D = 24 if util_pkg.check_version("mujoco>=3.14.1.dev989511280") else 21
-# TODO(team): remove version check once mujoco >= 4.0.0 is required.
-FLEX_INTERP_PHYS_JAC = util_pkg.check_version("mujoco>=3.17.1.dev1010658301")
-
-
-# TODO(team): Remove dynamic version probe once minimum MuJoCo version
-# supports curved rod references and set ROD_HINGE_SIZE = 10 directly.
-def _rod_hinge_size() -> int:
-  """Size of a 1D rod bending record in flex_bending of the installed MuJoCo.
-
-  Records have 10 values since MuJoCo supports curved rod references: a single hinge
-  [v0, v1, v2, -1, k, 0, kb0, 0, 0, 0] or a hinge pair [v0, v1, v2, v3, w0, w1, om0 (4)], see
-  passive.rod_stencil; before, they were [v0, v1, v2, k]. The size is read from a compiled rod,
-  because the first MuJoCo build with the larger record is not known when this code is written.
-
-  Returns:
-    The record size, 4 or 10.
-
-  Raises:
-    NotImplementedError: If the installed MuJoCo uses another record size.
-  """
-  xml = """
-  <mujoco>
-    <worldbody>
-      <flexcomp name="rod" type="grid" count="3 1 1" spacing="1 1 1" radius="0.1" dim="1">
-        <elasticity young="1"/>
-      </flexcomp>
-    </worldbody>
-  </mujoco>
-  """
-  try:
-    nflexbending = mujoco.MjModel.from_xml_string(xml).nflexbending
-  except ValueError:  # MuJoCo without 1D flex elasticity
-    return 4
-  if not isinstance(nflexbending, int):
-    return 4
-  # one hinge: nflexbending = 1 + record size, or 0 if 1D young is ignored
-  size = nflexbending - 1 if nflexbending else 4
-  if size not in (4, 10):
-    raise NotImplementedError(f"unsupported 1D rod record size {size} in flex_bending")
-  return size
-
-
-ROD_HINGE_SIZE = _rod_hinge_size()
+FLEX_STIFFNESS_3D = 24  # flex_stiffness values per 3D element
+ROD_HINGE_SIZE = 10  # flex_bending values per 1D rod hinge record
 
 # maximum size (by number of edges) of an horizon in EPA algorithm
 MJ_MAX_EPAHORIZON = 24
@@ -82,6 +38,9 @@ MJ_MAX_EPAFACES = 5
 
 TILE_SIZE_JTDAJ_SPARSE = 16
 TILE_SIZE_JTDAJ_DENSE = 16
+# max Newton Hessian size factored as one tile; past it the blocked path's factor reuse wins on
+# Blackwell (Ada keeps one tile ahead to 64)
+H_ONE_TILE_MAX = 48
 
 # max M block size where dense tile-Cholesky beats sparse LDL (wins to ~64, degrades past ~80)
 M_BLOCK_DENSE_MAX = 64
@@ -89,7 +48,8 @@ M_BLOCK_DENSE_MAX = 64
 # max M block size where scalar Cholesky beats dense tile-Cholesky
 M_BLOCK_SCALAR_MAX = 6
 
-# qLD_block_adr sentinels for factorless block layouts
+# qLD_block_adr sentinels for unpacked or factorless blocks
+Q_LD_BLOCK_SECTION = -3
 Q_LD_BLOCK_COMPACT = -2
 Q_LD_BLOCK_SPARSE = -1
 
@@ -153,7 +113,7 @@ class BlockDim:
   small_cholesky: int = 64
   solve_LD_sparse_fused: int = 128
   # solver
-  update_gradient_cholesky: int = 64
+  update_gradient_cholesky: int = 32
   update_gradient_cholesky_blocked: int = 32
   update_gradient_JTDAJ_sparse: int = 128
   update_gradient_JTDAJ_dense: int = 128
@@ -872,9 +832,8 @@ class TendonType(enum.IntEnum):
     SPATIAL: path through sites, around geoms
   """
 
-  # TODO(team): use mujoco.mjtTendon when mujoco>=3.17.1 is required
-  FIXED = 0
-  SPATIAL = 1
+  FIXED = mujoco.mjtTendon.mjTENDON_FIXED
+  SPATIAL = mujoco.mjtTendon.mjTENDON_SPATIAL
 
 
 class WrapType(enum.IntEnum):
@@ -935,7 +894,7 @@ class State(enum.IntEnum):
   MOCAP_QUAT = mujoco.mjtState.mjSTATE_MOCAP_QUAT
   USERDATA = mujoco.mjtState.mjSTATE_USERDATA
   # unsupported: PLUGIN
-  PLASTIC = getattr(mujoco.mjtState, "mjSTATE_PLASTIC", 1 << 14)
+  PLASTIC = mujoco.mjtState.mjSTATE_PLASTIC
   NSTATE = mujoco.mjtState.mjNSTATE
   PHYSICS = mujoco.mjtState.mjSTATE_PHYSICS  # includes HISTORY and PLASTIC
   FULLPHYSICS = mujoco.mjtState.mjSTATE_FULLPHYSICS
@@ -1192,6 +1151,18 @@ class Option:
 
 
 @dataclasses.dataclass
+class MassSection:
+  """A mass-factor section with ancestor rows preceding its eliminated rows."""
+
+  dofs: wp.array2d[int]
+  pattern_adr: int
+  ancestor: int
+  update_adr: wp.array2d[int]
+  update_ind: wp.array[int]
+  message_adr: wp.array[int]
+
+
+@dataclasses.dataclass
 class TileSet:
   """Tiling configuration for decomposable block diagonal matrix.
 
@@ -1200,21 +1171,25 @@ class TileSet:
   Attributes:
     adr: address of each tile in the set
     size: size of all the tiles in this set
-    elemid: flat CSR gather indices for tiled blocks; empty selects the native-layout scalar path
+    elemid: flat CSR gather indices for dense tiled blocks
+    pattern_adr: sparse row-pattern offset in Model.M_sparse_rowadr; -1 otherwise
   """
 
   adr: wp.array[int]
   size: int
   elemid: wp.array[int] = dataclasses.field(default_factory=lambda: wp.array([], dtype=int))
+  pattern_adr: int = -1
 
   def __eq__(self, other) -> bool:
     if self.__class__ is not other.__class__:
       return NotImplemented
-    return self.size == other.size and np.array_equal(np.asarray(self.adr.numpy()), np.asarray(other.adr.numpy()))
+    return (
+      self.size == other.size and self.pattern_adr == other.pattern_adr and np.array_equal(self.adr.numpy(), other.adr.numpy())
+    )
 
   def __hash__(self) -> int:
     adr = np.asarray(self.adr.numpy())
-    return hash((self.size, adr.dtype.str, adr.shape, adr.tobytes()))
+    return hash((self.size, self.pattern_adr, adr.dtype.str, adr.shape, adr.tobytes()))
 
 
 @dataclasses.dataclass
@@ -1662,7 +1637,7 @@ class Model:
     nflexintcell: total interp cells (non-strain) for passive forces
     is_sparse: constraint Jacobian/Hessian layout (sparse vs dense). Does not affect M, whose
       factorization is a per-block decision -- see M_tiles and m_block_layout
-    qLD_block_total: packed length of the dense region per world (also the offset of the LDL region)
+    qLD_block_total: packed block-factor length per world; offset of the LDL region
     qLD_block_adr: packed factor offset; Q_LD_BLOCK_* sentinel otherwise (nv,)
     flg_adhesion: flag indicating if model has passive adhesion
     has_fluid: True if wind, density, or viscosity are non-zero at put_model time
@@ -1762,8 +1737,13 @@ class Model:
     weld_tactile_id: weld body to tactile weld index         (nbody,)
     taxel_vertadr: tactile sensor vertex address             (nsensortaxel,)
     taxel_sensorid: address for tactile sensors
-    M_tiles: scalar and tiled block-factorization groups
-    qLD_updates: sparse factor updates grouped by tree level
+    nM_schur: scratch size for section matrix updates
+    M_sections: mass-factor sections in root-to-leaf order
+    M_tiles: scalar, dense Cholesky and sparse LDL block-factorization groups
+    M_sparse_rowadr: row offsets for static sparse mass-block patterns
+    M_sparse_colind: local column indices for static sparse mass-block patterns
+    qLD_row_tiles: sparse factor rows by tree level; size is maximum row nnz
+    qLD_updates: sparse solve updates grouped by tree level
     qLD_all_updates: tuple of all levels concatenated
     qLD_level_offsets: tuple of start offsets for each level
     M_fullm_i: sparse mass matrix addressing
@@ -2327,7 +2307,12 @@ class Model:
   weld_tactile_id: array("nbody", int)
   taxel_vertadr: array("nsensortaxel", int)
   taxel_sensorid: array("nsensortaxel", int)
+  nM_schur: int
+  M_sections: tuple[MassSection, ...]
   M_tiles: tuple[TileSet, ...]
+  M_sparse_rowadr: tuple[int, ...]
+  M_sparse_colind: tuple[int, ...]
+  qLD_row_tiles: tuple[TileSet, ...]
   qLD_updates: tuple[array("nqLD_all_updates", wp.vec3i), ...]
   qLD_all_updates: array("nqLD_all_updates", wp.vec3i)
   qLD_level_offsets: array("nqLD_level_offsets", int)
@@ -2573,7 +2558,7 @@ class Data:
     actuator_moment: actuator moments                           (nworld, nJmom)
     crb: com-based composite inertia and mass                   (nworld, nbody, 10)
     M: total inertia, CSR                                       (nworld, nC)
-    qLD: per-block factor: packed dense region, then the nC     (nworld, qLD_block_total + nC)
+    qLD: per-block factor: packed block region, then the nC     (nworld, qLD_block_total + nC)
          L'*D*L region at offset qLD_block_total (nC=0 if no sparse block)
     qLDiagInv: reciprocal diagonal for compact and sparse blocks (nworld, nv)
     tree_awake: is tree awake; 0: asleep; 1: awake              (nworld, ntree)
@@ -2652,6 +2637,7 @@ class Data:
     cqfrc_constraint: compacted constraint force                (nworld, nvmax_pad)
 
   warp only fields:
+    qLD_schur: section matrix scratch       (nworld, nM_schur)
     nworld: number of worlds
     naconmax: maximum number of contacts (shared across all worlds)
     naccdmax: maximum number of contacts for CCD (all worlds)
@@ -2830,6 +2816,7 @@ class Data:
   cqfrc_constraint: array("nworld", "nvmax_pad", float)
 
   # warp only fields:
+  qLD_schur: array("nworld", "nM_schur", float)
   nworld: int
   naconmax: int
   naccdmax: int
